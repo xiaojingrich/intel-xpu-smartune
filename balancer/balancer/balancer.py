@@ -684,8 +684,8 @@ class DynamicBalancer:
         monitor_apps = app_utils.get_controlled_apps()
 
         if monitor_apps:
-            # 将受控应用添加到BPF监控列表
-            monitored_names = [app["app_name"] for app in monitor_apps]
+            # 将受控应用添加到BPF监控列表（过滤掉空名称）
+            monitored_names = [app["app_name"] for app in monitor_apps if app.get("app_name") and app["app_name"].strip()]
             self.bpf_monitor.add_to_monitorlist(monitored_names)
             logger.info(f"Monitoring execve() for: {', '.join(monitored_names)}")
 

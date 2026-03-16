@@ -1,13 +1,15 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import hashlib
+import queue as _queue
 import signal
 from datetime import datetime
 from threading import Lock
 
-from flask import Flask, request
+from flask import Flask, request, Response, stream_with_context
 
 from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
@@ -340,13 +342,16 @@ def set_to_control():
         _service.add_control(app_name)
 
         # 更新或创建数据库记录
-        result = AIAppPriority.update_record(
-            id=app_id,
+        update_fields = dict(
             controlled=controlled,
             priority=priority,
             cgroup=cgroup,
             remark=remark,
         )
+        # Only persist name when a valid value was provided; never overwrite with an empty string
+        if app_name and app_name.strip():
+            update_fields["name"] = app_name
+        result = AIAppPriority.update_record(id=app_id, **update_fields)
 
         if result == DBStatus.NOT_FOUND:
             AIAppPriority.insert_record(
@@ -443,12 +448,16 @@ def get_controlled_app():
                 data=[]
             )
 
-        # 处理结果并添加到服务监控
+        # Build a lookup map from config/system apps so we can fill in blank names
+        config_name_map = {a["app_id"]: a.get("app_name") or a.get("name") for a in fetch_all_apps()}
+
         result_data = []
         for app in controlled_apps:
+            # Prefer the DB name, or fall back to the config-derived human-readable name
+            app_name = app.name if app.name and app.name.strip() else config_name_map.get(app.app_id, "")
             result_data.append({
                 "app_id": app.app_id,
-                "app_name": app.name,
+                "app_name": app_name,
                 "controlled": app.controlled,
                 "priority": app.priority,
                 "oom_score": app.oom_score,
@@ -675,6 +684,41 @@ def app_resource_restore():
             retcode=RetCode.EXCEPTION_ERROR,
             retmsg=str(e)
         )
+
+
+_SSE_HEARTBEAT_TIMEOUT = 30  # seconds between keep-alive comments when no events arrive
+
+
+@app.route('/app/events', methods=['GET'])
+def app_events():
+    """Server-Sent Events stream for app status changes."""
+    q = _queue.Queue()
+    callback_manager.add_sse_client(q)
+
+    def generate():
+        try:
+            yield "data: {\"type\": \"connected\"}\n\n"
+            while True:
+                try:
+                    data = q.get(timeout=_SSE_HEARTBEAT_TIMEOUT)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except _queue.Empty:
+                    # Keep-alive comment
+                    yield ": heartbeat\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            callback_manager.remove_sse_client(q)
+
+    response = Response(
+        stream_with_context(generate()),
+        content_type='text/event-stream',
+    )
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection'] = 'keep-alive'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 
 @app.route('/app/register_callback', methods=['POST'])

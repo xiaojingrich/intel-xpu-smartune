@@ -1,0 +1,139 @@
+import React, { useState, useCallback } from 'react'
+import { Tabs, Layout, Typography, Space, Badge } from 'antd'
+import {
+  DashboardOutlined,
+  AppstoreOutlined,
+  NodeIndexOutlined,
+  AlertOutlined,
+  ControlOutlined,
+} from '@ant-design/icons'
+import SystemOverview from './components/SystemOverview'
+import AppResources from './components/AppResources'
+import ProcessResources from './components/ProcessResources'
+import PressureDashboard from './components/PressureDashboard'
+import AppManagement from './components/AppManagement'
+import { COLORS } from './styles/theme'
+
+const { Header, Content } = Layout
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('1')
+
+  const tabs = [
+    {
+      key: '1',
+      label: (
+        <Space>
+          <DashboardOutlined />
+          System Overview
+        </Space>
+      ),
+      children: <SystemOverview active={activeTab === '1'} />,
+    },
+    {
+      key: '2',
+      label: (
+        <Space>
+          <AppstoreOutlined />
+          App Resources
+        </Space>
+      ),
+      children: <AppResources active={activeTab === '2'} />,
+    },
+    {
+      key: '3',
+      label: (
+        <Space>
+          <NodeIndexOutlined />
+          Process Resources
+        </Space>
+      ),
+      children: <ProcessResources active={activeTab === '3'} />,
+    },
+    {
+      key: '4',
+      label: (
+        <Space>
+          <AlertOutlined />
+          Pressure
+        </Space>
+      ),
+      children: <PressureDashboard active={activeTab === '4'} />,
+    },
+    {
+      key: '5',
+      label: (
+        <Space>
+          <ControlOutlined />
+          App Management
+        </Space>
+      ),
+      children: <AppManagement active={activeTab === '5'} />,
+    },
+  ]
+
+  return (
+    <Layout style={{ minHeight: '100vh', background: COLORS.bg }}>
+      <Header
+        style={{
+          background: COLORS.headerBg,
+          borderBottom: `1px solid ${COLORS.border}`,
+          padding: '0 24px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 16,
+          position: 'sticky',
+          top: 0,
+          zIndex: 100,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div
+            style={{
+              width: 32,
+              height: 32,
+              background: `linear-gradient(135deg, ${COLORS.accent} 0%, #3a6fd8 100%)`,
+              borderRadius: 6,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <DashboardOutlined style={{ color: '#fff', fontSize: 16 }} />
+          </div>
+          <Typography.Title
+            level={4}
+            style={{ color: COLORS.text, margin: 0, fontWeight: 600 }}
+          >
+            Intel Resource Balancer
+          </Typography.Title>
+        </div>
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Badge status="processing" color={COLORS.green} />
+          <Typography.Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+            Live
+          </Typography.Text>
+        </div>
+      </Header>
+
+      <Content style={{ padding: '0 16px 16px', background: COLORS.bg }}>
+        <Tabs
+          activeKey={activeTab}
+          onChange={setActiveTab}
+          items={tabs}
+          size="large"
+          style={{ color: COLORS.text }}
+          tabBarStyle={{
+            marginBottom: 0,
+            paddingTop: 8,
+            background: COLORS.bg,
+            borderBottom: `1px solid ${COLORS.border}`,
+            position: 'sticky',
+            top: 64,
+            zIndex: 99,
+          }}
+        />
+      </Content>
+    </Layout>
+  )
+}

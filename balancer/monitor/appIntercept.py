@@ -47,7 +47,9 @@ class AppIntercept(metaclass=SingletonMeta):
 
     def _rebuild_index(self):
         self._app_map_index = {
-            app["app_name"].lower(): app for app in (self.controlled_app_map or [])
+            app["app_name"].lower(): app
+            for app in (self.controlled_app_map or [])
+            if app.get("app_name") and app["app_name"].strip()
         }
 
     def trace_print(self) -> None:
@@ -241,6 +243,9 @@ class AppIntercept(metaclass=SingletonMeta):
 
         added_count = 0
         for name in names:
+            if not name or not name.strip():
+                logger.debug(f"Skipping empty app name in monitor list")
+                continue
             if name.lower() not in existing_lower:
                 self.monitored_apps.add(name)
                 existing_lower.add(name.lower())  # 更新检查集

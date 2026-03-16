@@ -35,7 +35,8 @@ It uses cgroups v2 to manage resources like CPU, memory, and I/O.
     ├── monitor/                 # App monitoring components
     ├── test/                    # Some feature tests
     ├── utils/                   # Some utility functions
-    ├── web/                     # Web interface for monitoring and control
+    ├── web/                     # Streamlit web interface (app management)
+    ├── dashboard/               # React/TypeScript Grafana-style dashboard (5-tab UI)
     └── requirements.txt      # Dependencies
 ```
 
@@ -234,10 +235,17 @@ separated from the system resource management logic. The main mechanisms are as 
             vendor: "generic" -> bash start_balancer.sh
             If you are in "admin" permission, config/config.yaml # vendor: "admin" -> python BalanceService.py
 
-    2. client:
+    2. client (Streamlit web UI):
         cd web
         ./start_webui.sh mt_py312 OR:
         ./start_webui_env.sh (w/o conda)
+
+    3. client (React dashboard – Grafana-style 5-tab UI):
+        # Node.js 20.19+ is required. The script auto-installs/upgrades it on Ubuntu/Debian
+        # if missing or outdated. See dashboard/README.md for full setup instructions.
+        cd dashboard
+        ./start_dashboard.sh
+        # Opens http://localhost:3000
         
         
 

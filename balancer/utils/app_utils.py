@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import queue as _queue
 import re
 import requests
 # [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
@@ -9,6 +10,7 @@ import requests
 # concatenation is performed. All inputs are internally validated.
 import subprocess # nosec
 import psutil
+import threading
 from getpass import getuser
 from pwd import getpwnam
 from datetime import datetime
@@ -35,7 +37,11 @@ class ClientCallbackManager:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            instance = super().__new__(cls)
+            # Initialize SSE state once inside __new__ to avoid races
+            instance._sse_queues: List[_queue.Queue] = []
+            instance._sse_lock = threading.Lock()
+            cls._instance = instance
         return cls._instance
 
     @property
@@ -76,8 +82,29 @@ class ClientCallbackManager:
 
         return session
 
+    def add_sse_client(self, q: _queue.Queue) -> None:
+        """Register an SSE client queue."""
+        with self._sse_lock:
+            self._sse_queues.append(q)
+
+    def remove_sse_client(self, q: _queue.Queue) -> None:
+        """Unregister an SSE client queue."""
+        with self._sse_lock:
+            try:
+                self._sse_queues.remove(q)
+            except ValueError:
+                pass
+
     def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
         """发送回调通知（线程安全）"""
+        # Notify SSE clients first (always, regardless of registered URL)
+        with self._sse_lock:
+            for q in list(self._sse_queues):
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    pass
+
         if not self._registered_url:
             print("No callback URL registered.")
             return False
@@ -671,7 +698,8 @@ def fetch_all_apps():
         apps = b_config.all_apps
         for app in apps:
             app_data = {
-                "name": app["name"],
+                "name": app["name"],       # legacy key used by other callers
+                "app_name": app["name"],   # normalized key expected by the React dashboard
                 "app_id": app["id"],
                 "cmdline": app["commandline"],
                 "display_name": app["name"]
@@ -681,7 +709,8 @@ def fetch_all_apps():
         apps = Gio.AppInfo.get_all()
         for app in apps:
             app_data = {
-                "name": app.get_name(),  # Calculator
+                "name": app.get_name(),    # legacy key used by other callers
+                "app_name": app.get_name(),  # normalized key expected by the React dashboard
                 "app_id": app.get_id(),  # org.gnome.Calculator.desktop
                 "cmdline": app.get_commandline() or "",  # gnome-calculator
                 "display_name": app.get_display_name()
