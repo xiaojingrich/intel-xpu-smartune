@@ -114,7 +114,10 @@ export default function AppManagement({ active }: Props) {
         setControlledApps(ctrl)
         const priorities: Record<string, string> = {}
         ctrl.forEach((a: AppInfo) => {
-          priorities[a.app_id] = a.priority ?? 'medium'
+          // Normalise to lowercase so comparisons are case-insensitive.
+          // The Python Streamlit side stores "Critical"/"High"/… (title-case);
+          // the dashboard stores "critical"/"high"/… (lowercase).
+          priorities[a.app_id] = (a.priority ?? 'medium').toLowerCase()
         })
         setRowPriorities((prev) => ({ ...prev, ...priorities }))
       }
@@ -137,13 +140,57 @@ export default function AppManagement({ active }: Props) {
   useAppEvents(
     useCallback((event) => {
       if (event.purpose === 'app' && event.app_id) {
+        // Update the app's status in the controlled list
         setControlledApps((prev) =>
           prev.map((app) =>
             app.app_id === event.app_id ? { ...app, status: event.status } : app
           )
         )
+
+        // Show a toast that mirrors the Python register_notification() logic:
+        //   - limited/a_limited → resource-limit warning
+        //   - any other status change → generic status-updated info
+        if (event.status === APP_STATUS.LIMITED || event.status === APP_STATUS.A_LIMITED) {
+          messageApi.warning(
+            `System busy: ${event.app_name} resource usage has been temporarily limited. It will be restored when resources become available.`
+          )
+        } else {
+          const statusLabel: Record<string, string> = {
+            running: 'Running',
+            stopped: 'Stopped',
+            pending: 'Pending',
+          }
+          const label = statusLabel[event.status] ?? event.status
+          messageApi.info(`App ${event.app_name} status updated: ${label}`)
+        }
+
+        // When an app transitions away from pending (e.g. running, stopped, limited),
+        // remove it from the pending queue immediately without waiting for fetchData()
+        // to complete.  This prevents the card from showing a stale entry during the
+        // async round-trip.
+        // Note: the reverse (status === PENDING) is intentionally handled only by the
+        // fetchData() call below, because adding to pendingApps requires a full AppInfo
+        // object that the SSE payload does not carry.
+        if (event.status !== APP_STATUS.PENDING) {
+          setPendingApps((prev) => prev.filter((app) => app.app_id !== event.app_id))
+        }
+
+        // Full server sync – also re-fetches controlled and pending lists so any
+        // remaining pending apps (or a newly pending app) are shown correctly.
+        fetchData()
+      } else if (event.purpose === 'notify') {
+        // System-level notifications (no specific app_id)
+        if (event.status === 'manual_app_limit_by_user') {
+          messageApi.warning(
+            'System busy: a critical app is running. Consider manually adjusting resource allocation.'
+          )
+        } else if (event.status === 'high_usage_by_multiple_instances') {
+          messageApi.warning(
+            'System busy: multiple apps are consuming high resources. Consider reducing the number of running apps.'
+          )
+        }
       }
-    }, []),
+    }, [messageApi, fetchData]),
     active
   )
 
@@ -299,7 +346,7 @@ export default function AppManagement({ active }: Props) {
       render: (_: unknown, record: AppInfo) => {
         const isPending = record.status === APP_STATUS.PENDING
         const isRunning = record.status === APP_STATUS.RUNNING
-        const isCritical = (rowPriorities[record.app_id] ?? record.priority) === 'critical'
+        const isCritical = (rowPriorities[record.app_id] ?? record.priority ?? '').toLowerCase() === 'critical'
         const isLimited = record.status === APP_STATUS.LIMITED || record.status === APP_STATUS.A_LIMITED
 
         return (
@@ -353,19 +400,18 @@ export default function AppManagement({ active }: Props) {
               </Tooltip>
             )}
 
-            {isCritical && isRunning && (
-              <Tooltip title="Keep Alive (OOM protect)">
-                <Button
-                  size="small"
-                  icon={<HeartOutlined />}
-                  loading={actionLoading[`keepalive-${record.app_id}`]}
-                  onClick={() => handleKeepAlive(record)}
-                  style={{ borderColor: COLORS.red, color: COLORS.red }}
-                >
-                  Keep Alive
-                </Button>
-              </Tooltip>
-            )}
+            <Tooltip title={isCritical && isRunning ? 'Keep Alive (OOM protect)' : 'Only available for Critical apps that are Running'}>
+              <Button
+                size="small"
+                icon={<HeartOutlined />}
+                disabled={!isCritical || !isRunning}
+                loading={actionLoading[`keepalive-${record.app_id}`]}
+                onClick={() => handleKeepAlive(record)}
+                style={isCritical && isRunning ? { borderColor: COLORS.red, color: COLORS.red } : {}}
+              >
+                Keep Alive
+              </Button>
+            </Tooltip>
 
             <Tooltip title="Remove from Control">
               <Button
@@ -562,26 +608,30 @@ export default function AppManagement({ active }: Props) {
         />
       </Card>
 
-      {/* Pending Queue */}
-      {pendingApps.length > 0 && (
-        <Card
-          title={
-            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-              <ThunderboltOutlined style={{ marginRight: 8, color: COLORS.yellow }} />
-              Pending Queue
-              <Tag color="processing" style={{ marginLeft: 8 }}>
-                {pendingApps.length}
-              </Tag>
-            </Text>
-          }
-          style={{
-            background: COLORS.panelBg,
-            border: `1px solid ${COLORS.yellow}44`,
-            borderRadius: 6,
-          }}
-          headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
-          bodyStyle={{ padding: '0' }}
-        >
+      {/* Pending Queue – always shown so users can see the empty state (mirrors Python's pending_queue_holder) */}
+      <Card
+        title={
+          <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
+            <ThunderboltOutlined style={{ marginRight: 8, color: COLORS.yellow }} />
+            Pending Queue
+            <Tag color="processing" style={{ marginLeft: 8 }}>
+              {pendingApps.length}
+            </Tag>
+          </Text>
+        }
+        style={{
+          background: COLORS.panelBg,
+          border: `1px solid ${COLORS.yellow}44`,
+          borderRadius: 6,
+        }}
+        headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
+        bodyStyle={{ padding: '0' }}
+      >
+        {pendingApps.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: COLORS.textMuted, fontStyle: 'italic' }}>
+            🕊️ Pending queue is empty
+          </div>
+        ) : (
           <Table
             columns={pendingColumns}
             dataSource={pendingApps.map((a) => ({ ...a, key: a.app_id }))}
@@ -589,8 +639,8 @@ export default function AppManagement({ active }: Props) {
             pagination={false}
             rowClassName={(_, idx) => (idx % 2 === 1 ? 'table-row-alt' : '')}
           />
-        </Card>
-      )}
+        )}
+      </Card>
 
       <style>{`
         .table-row-alt td { background: ${COLORS.rowAlt} !important; }

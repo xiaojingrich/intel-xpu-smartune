@@ -24,24 +24,6 @@ class BAL_retcode(IntEnum):
 
 class MABridge:
 
-    def register_callback(self, register_url: str, callback_url: str, session) -> bool:
-        """向Multi-Apps服务注册回调地址（业务逻辑层）"""
-        try:
-            response = session.post(
-                register_url,
-                json={"callback_url": callback_url},
-                timeout=5
-            )
-            response.raise_for_status()
-
-            response_data = response.json()
-            if "retcode" in response_data and response_data["retcode"] == BAL_retcode.SUCCESS:
-                return True
-            return False
-        except Exception as e:
-            print(f"Callback registration failed: {e}")
-            return False
-
     def get_controlled_apps(self, url, session):
         """ Get controlled apps from multi-apps service.
 

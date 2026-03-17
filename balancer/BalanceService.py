@@ -721,32 +721,6 @@ def app_events():
     return response
 
 
-@app.route('/app/register_callback', methods=['POST'])
-def register_callback():
-    """注册全局回调地址"""
-    try:
-        data = request.get_json()
-        callback_url = data.get('callback_url')
-
-        if not callback_url:
-            return construct_response(
-                retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="callback_url is required"
-            )
-
-        callback_manager.register_callback_url(callback_url)
-        return construct_response(
-            data={"callback_url": callback_url},
-            retmsg="Global callback URL registered"
-        )
-
-    except Exception as e:
-        return construct_response(
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
 def main():
     logger.info("Starting Balance Service...")
     # 检查证书文件是否存在

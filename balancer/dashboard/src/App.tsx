@@ -65,7 +65,7 @@ export default function App() {
       label: (
         <Space>
           <ControlOutlined />
-          App Management
+          Balancer
         </Space>
       ),
       children: <AppManagement active={activeTab === '5'} />,
@@ -105,7 +105,7 @@ export default function App() {
             level={4}
             style={{ color: COLORS.text, margin: 0, fontWeight: 600 }}
           >
-            Intel Resource Balancer
+            Intel XPU SmarTune
           </Typography.Title>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>

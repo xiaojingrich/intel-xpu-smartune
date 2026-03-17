@@ -1,11 +1,12 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import requests
 import threading
+import time
 from typing import Optional, Dict, Any
-from flask import Flask, request, jsonify
 
 from apis.multiapps_bridge import MABridge
 from apis.systools import SingletonMeta
@@ -17,10 +18,6 @@ import urllib3
 MULTIAPPS_URL = "https://127.0.0.1:9001"
 B_CERT_FILE = os.getenv('B_CERT_FILE')
 B_CERT_KEY = os.getenv('B_CERT_KEY')
-
-CLIENT_URL = "https://127.0.0.1:8656"
-
-client_app = Flask(__name__)
 
 
 # 全局共享状态
@@ -48,23 +45,14 @@ class CallbackManager(metaclass=SingletonMeta):
 
 callback_manager = CallbackManager()
 
-# 回调处理路由
-@client_app.route('/callback', methods=['POST'])
-def handle_callback():
-    try:
-        data = request.get_json()
-        print(f"[Client] Received callback: {data}")
-        callback_manager.handle_callback(data)
-        return jsonify({"status": "ok"}), 200  # 显式返回200
-    except Exception as e:
-        return jsonify({"status": str(e)}), 500
+
+_SSE_EVENT_TYPE_CONNECTED = "connected"
 
 
 class Client_multiapps_api(metaclass=SingletonMeta):
     def __init__(self):
         self.ma_bridge = MABridge()
         self._callback_thread = None
-        self._port = 8656  # Client回调用端口
 
         # Multi-Apps Startup
         self.app_get_controlled_url = MULTIAPPS_URL + '/app/get_controlled_app'
@@ -79,7 +67,7 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_get_pending_url = MULTIAPPS_URL + '/app/get_pending_app'
         self.app_obtain_url = MULTIAPPS_URL + '/app/get_apps'
         self.app_workload_url = MULTIAPPS_URL + '/task/add_workload'
-        self.app_register_callback_url = MULTIAPPS_URL + '/app/register_callback'
+        self.app_events_url = MULTIAPPS_URL + '/app/events'
 
         self.session = self._create_session()
 
@@ -113,13 +101,6 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         return session
 
 # Multi-apps API:
-    def register_callback(self):
-        """
-        :param app_name:
-        :return:
-        """
-        return self.ma_bridge.register_callback(self.app_register_callback_url, f"{CLIENT_URL}/callback", self.session)
-
     def get_controlled_apps(self):
         """
         :return: Get all the controlled apps.
@@ -199,24 +180,42 @@ class Client_multiapps_api(metaclass=SingletonMeta):
 
 
     def start_client_callback(self) -> bool:
-        """启动回调服务（确保线程单例）"""
-        # 检查线程是否已存在且存活
+        """启动SSE客户端（确保线程单例）"""
         if self._callback_thread is not None and self._callback_thread.is_alive():
-            print("[Callback] Server is already running")
+            print("[Callback] SSE client is already running")
             return True
 
-        # 启动线程
         try:
-            c_ssl_context = (B_CERT_FILE, B_CERT_KEY)
             self._callback_thread = threading.Thread(
-                target=client_app.run,
-                kwargs={"host": "127.0.0.1", "port": self._port, "debug": False, "ssl_context": c_ssl_context},
+                target=self._run_sse_client,
                 daemon=True
             )
             self._callback_thread.start()
-            print(f"[Callback] Server started on port {self._port}, and registered callback method to server")
-            res = self.register_callback()
-            return res
+            print("[Callback] SSE client started")
+            return True
         except Exception as e:
-            print(f"[Callback] Failed to start server: {str(e)}")
+            print(f"[Callback] Failed to start SSE client: {str(e)}")
             return False
+
+    def _run_sse_client(self):
+        """连接SSE服务器并处理事件"""
+        retry_delay = 5
+        max_retry_delay = 60
+        while True:
+            try:
+                response = self.session.get(self.app_events_url, stream=True, timeout=(10, None))
+                retry_delay = 5  # reset on successful connection
+                for line in response.iter_lines():
+                    if line:
+                        decoded = line.decode('utf-8') if isinstance(line, bytes) else line
+                        if decoded.startswith('data: '):
+                            try:
+                                data = json.loads(decoded[6:])
+                                if data.get('type') != _SSE_EVENT_TYPE_CONNECTED:
+                                    callback_manager.handle_callback(data)
+                            except Exception as e:
+                                print(f"[Callback] Error parsing SSE data: {e}")
+            except Exception as e:
+                print(f"[Callback] SSE connection error ({self.app_events_url}): {e}, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)

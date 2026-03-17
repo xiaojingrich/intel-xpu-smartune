@@ -34,7 +34,9 @@ export function useAppEvents(onEvent: EventCallback, enabled = true) {
       es.onmessage = (e) => {
         try {
           const data: AppStatusEvent = JSON.parse(e.data)
-          if (data.app_id) {
+          // Forward any event that has a purpose field (app or notify).
+          // Events without purpose (e.g. the initial {type:'connected'} heartbeat) are ignored.
+          if (data.purpose) {
             callbackRef.current(data)
           }
         } catch {

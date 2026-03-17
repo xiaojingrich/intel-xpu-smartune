@@ -4,11 +4,7 @@
 import os
 import queue as _queue
 import re
-import requests
-# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
-# with shell=False (default). No untrusted shell execution or string 
-# concatenation is performed. All inputs are internally validated.
-import subprocess # nosec
+import subprocess
 import psutil
 import threading
 from getpass import getuser
@@ -17,23 +13,15 @@ from datetime import datetime
 
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 from config.config import b_config
 from gi.repository import Gio
 
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import urllib3
-
 _original_oom_scores: dict[str, str] = {}
-
-B_CERT_FILE = os.getenv('CERT_FILE')
 
 class ClientCallbackManager:
     """管理客户端回调的全局状态和操作"""
     _instance = None
-    _registered_url: Optional[str] = None
-    _session = False
 
     def __new__(cls):
         if cls._instance is None:
@@ -43,44 +31,6 @@ class ClientCallbackManager:
             instance._sse_lock = threading.Lock()
             cls._instance = instance
         return cls._instance
-
-    @property
-    def callback_url(self) -> Optional[str]:
-        return self._registered_url
-
-    def register_callback_url(self, url: str) -> None:
-        """注册全局回调地址"""
-        self._registered_url = url
-        self._session = self._create_session()
-
-    def _create_session(self):
-        """Create a requests session with retry strategy and SSL configuration."""
-        session = requests.Session()
-
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["POST", "GET"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-
-        if not B_CERT_FILE:
-            raise EnvironmentError(
-                "CERT_FILE environment variable is not set. "
-                "TLS certificate verification cannot be enabled."
-            )
-        if not os.path.exists(B_CERT_FILE):
-            raise FileNotFoundError(
-                f"Certificate file '{B_CERT_FILE}' not found. "
-                "TLS certificate verification cannot be enabled. "
-                "Please check 'start_balancer.sh' to generate and export the certificate."
-            )
-        session.verify = B_CERT_FILE
-        logger.info(f"TLS certificate verification enabled using: {B_CERT_FILE}")
-
-        return session
 
     def add_sse_client(self, q: _queue.Queue) -> None:
         """Register an SSE client queue."""
@@ -97,18 +47,6 @@ class ClientCallbackManager:
 
     def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
         """发送回调通知（线程安全）"""
-        # Notify SSE clients first (always, regardless of registered URL)
-        with self._sse_lock:
-            for q in list(self._sse_queues):
-                try:
-                    q.put_nowait(data)
-                except Exception:
-                    pass
-
-        if not self._registered_url:
-            print("No callback URL registered.")
-            return False
-
         if store:
             try:
                 result = AIAppPriority.update_record(
@@ -121,19 +59,14 @@ class ClientCallbackManager:
             except Exception as db_error:
                 print(f"Database update error: {db_error}")
 
-        try:
-            logger.info("Send a notification to client.")
-            response = self._session.post(
-                self._registered_url,
-                json=data,
-                timeout=5
-            )
-            response.raise_for_status()
+        with self._sse_lock:
+            for q in list(self._sse_queues):
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    pass
 
-            return response.status_code == 200 and response.json().get("status") == "ok"
-        except Exception as e:
-            print(f"Callback notification failed: {str(e)}")
-            return False
+        return True
 
 
 # 单例实例
