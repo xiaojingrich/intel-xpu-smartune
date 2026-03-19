@@ -1,423 +1,2282 @@
-import React, { useState, useCallback } from 'react'
-import { Row, Col, Card, Typography, Progress, Tag, Spin, Alert } from 'antd'
+import React, { useCallback, useEffect, useId, useMemo, useState } from 'react'
 import {
-  WifiOutlined,
-  HddOutlined,
-  ApiOutlined,
+  Row,
+  Col,
+  Card,
+  Typography,
+  Tag,
+  Spin,
+  Alert,
+  Segmented,
+  Space,
+  Badge,
+  Button,
+} from 'antd'
+import {
   ThunderboltOutlined,
-  RobotOutlined,
-  DeploymentUnitOutlined,
+  AlertOutlined,
+  PartitionOutlined,
+  ReloadOutlined,
+  DownOutlined,
+  UpOutlined,
 } from '@ant-design/icons'
-import { COLORS } from '../styles/theme'
+import {
+  RadialBarChart,
+  RadialBar,
+  ResponsiveContainer,
+  PolarAngleAxis,
+} from 'recharts'
+import { COLORS, getPressureColor, getPressureLabel } from '../styles/theme'
 import { api } from '../api/client'
-import type { CpuData, MemoryData, DiskData, NetworkData } from '../api/types'
+import type {
+  StaticInfoData,
+  DynamicInfoData,
+  PackageInfo,
+  QmassaDevice,
+  QmassaFreq,
+} from '../api/types'
 import { usePolling } from '../hooks/usePolling'
+import '../styles/performance.css'
 
-const { Text } = Typography
+const { Text, Title } = Typography
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+const REFRESH_INTERVAL_OPTIONS: Array<{ label: string; value: number }> = [
+  { label: '1s', value: 1000 },
+  { label: '2s', value: 2000 },
+  { label: '3s', value: 3000 },
+  { label: '5s', value: 5000 },
+]
+const DEFAULT_REFRESH_INTERVAL_MS = 3000
+const MIN_REFRESH_INTERVAL_MS = Math.min(...REFRESH_INTERVAL_OPTIONS.map((option) => option.value))
+const TREND_STORAGE_MAX_POINTS = Math.round((5 * 60 * 1000) / MIN_REFRESH_INTERVAL_MS)
+const ENGINE_ORDER = ['ccs', 'rcs', 'bcs', 'vcs', 'vecs'] as const
 
-function usageColor(ratio: number): string {
-  if (ratio > 0.8) return COLORS.red
-  if (ratio > 0.6) return COLORS.orange
-  if (ratio > 0.3) return COLORS.yellow
-  return COLORS.green
+const PERF_COLORS = {
+  cpu: '#4cc9f0',
+  memory: '#f9c74f',
+  disk: '#ff6b6b',
+  network: '#2dd4bf',
+  gpu: '#5aa9ff',
+  npu: '#7ae582',
+  pressure: '#ff9f1c',
 }
 
-// ─── Sub-components ──────────────────────────────────────────────────────────
+const GPU_UTIL_COLORS = [PERF_COLORS.gpu, PERF_COLORS.memory, PERF_COLORS.cpu, PERF_COLORS.network, PERF_COLORS.npu] as const
 
-/** Circular gauge used in the top summary row */
-function SummaryGauge({
-  label,
-  icon,
-  value,
-  unit = '%',
-  color,
-}: {
+type TrendSeries = Record<string, Array<number | null>>
+type EngineKey = (typeof ENGINE_ORDER)[number]
+type SparkMode = 'compact' | 'axis' | 'points'
+type DataSourceKind = 'static' | 'dynamic'
+
+type GpuStatus = 'OK' | 'Busy' | 'Throttle' | 'Offline'
+
+const ENGINE_COLORS: Record<EngineKey, string> = {
+  ccs: PERF_COLORS.gpu,
+  rcs: PERF_COLORS.cpu,
+  bcs: PERF_COLORS.network,
+  vcs: PERF_COLORS.memory,
+  vecs: PERF_COLORS.pressure,
+}
+
+interface GpuDeviceView {
+  id: string
   label: string
-  icon: React.ReactNode
-  value: number | null
-  unit?: string
-  color: string
-}) {
-  const pct = value !== null ? Math.round(value * 100) : null
-  return (
-    <div style={{ textAlign: 'center' }}>
-      <Progress
-        type="dashboard"
-        percent={pct ?? 0}
-        strokeColor={color}
-        trailColor={COLORS.border}
-        size={80}
-        format={() =>
-          pct !== null ? (
-            <span style={{ color, fontSize: 14, fontWeight: 700 }}>
-              {pct}
-              <span style={{ fontSize: 10, fontWeight: 400 }}>{unit}</span>
-            </span>
-          ) : (
-            <span style={{ color: COLORS.textMuted, fontSize: 11 }}>—</span>
-          )
-        }
-      />
-      <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
-        <span style={{ color: COLORS.textMuted, fontSize: 13 }}>{icon}</span>
-        <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>{label}</Text>
-      </div>
-    </div>
-  )
+  index: number
+  cardKey: string
+  available: boolean
+  status: GpuStatus
+  statusColor: string
+  name: string
+  devType: string
+  pci: string
+  driver: string
+  utilization: number | null
+  frequencies: {
+    gt0?: QmassaFreq
+    gt1?: QmassaFreq
+  }
+  freqBounds: {
+    min_mhz: number | null
+    max_mhz: number | null
+  }
+  powerGpu: number | null
+  powerPkg: number | null
+  vramUsage: number | null
+  engines: EngineKey[]
+  engineUtil: Record<EngineKey, number | null>
 }
-
-function MetricRow({ label, value, unit }: { label: string; value: React.ReactNode; unit?: string }) {
-  return (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        padding: '4px 0',
-        borderBottom: `1px solid ${COLORS.border}22`,
-      }}
-    >
-      <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>{label}</Text>
-      <Text style={{ color: COLORS.text, fontSize: 12, fontWeight: 500 }}>
-        {value}
-        {unit && <span style={{ color: COLORS.textMuted, marginLeft: 2 }}>{unit}</span>}
-      </Text>
-    </div>
-  )
-}
-
-function UsageBar({ value, label }: { value: number; label?: string }) {
-  const pct = Math.round(value * 100)
-  const color = usageColor(value)
-  return (
-    <div style={{ marginBottom: 6 }}>
-      {label && (
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-          <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>{label}</Text>
-          <Text style={{ color, fontSize: 11, fontWeight: 600 }}>{pct}%</Text>
-        </div>
-      )}
-      <Progress
-        percent={pct}
-        showInfo={!label}
-        strokeColor={color}
-        trailColor={COLORS.border}
-        size="small"
-        style={{ margin: 0 }}
-        format={(p) => <span style={{ color, fontSize: 11 }}>{p}%</span>}
-      />
-    </div>
-  )
-}
-
-function PanelCard({
-  title,
-  icon,
-  children,
-  loading,
-  error,
-  extra,
-}: {
-  title: string
-  icon?: React.ReactNode
-  children: React.ReactNode
-  loading?: boolean
-  error?: string | null
-  extra?: React.ReactNode
-}) {
-  return (
-    <Card
-      title={
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {icon}
-          <span style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>{title}</span>
-        </div>
-      }
-      extra={extra}
-      style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, height: '100%' }}
-      headStyle={{ borderBottom: `1px solid ${COLORS.border}`, padding: '8px 16px', minHeight: 40 }}
-      bodyStyle={{ padding: '12px 16px' }}
-    >
-      {loading ? (
-        <div style={{ textAlign: 'center', padding: 20 }}>
-          <Spin size="small" />
-        </div>
-      ) : error ? (
-        <Alert message="Connection Error" description={error} type="error" showIcon style={{ fontSize: 12 }} />
-      ) : (
-        children
-      )}
-    </Card>
-  )
-}
-
-function UnavailableCard({ title, icon, rows }: { title: string; icon: React.ReactNode; rows: string[] }) {
-  return (
-    <PanelCard title={title} icon={icon} extra={<Tag style={{ fontSize: 10 }}>N/A</Tag>}>
-      <div style={{ textAlign: 'center', padding: '8px 0 12px' }}>
-        <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
-          Hardware monitoring data not available
-        </Text>
-      </div>
-      {rows.map((r) => (
-        <MetricRow key={r} label={r} value="N/A" />
-      ))}
-    </PanelCard>
-  )
-}
-
-// ─── Main component ───────────────────────────────────────────────────────────
 
 interface Props {
   active: boolean
 }
 
-export default function SystemOverview({ active }: Props) {
-  const [cpu, setCpu] = useState<CpuData | null>(null)
-  const [memory, setMemory] = useState<MemoryData | null>(null)
-  const [disk, setDisk] = useState<DiskData | null>(null)
-  const [network, setNetwork] = useState<NetworkData | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [errors, setErrors] = useState<Record<string, string>>({})
+function isNumber(value: number | null | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
 
-  const fetchAll = useCallback(async () => {
-    const results = await Promise.allSettled([
-      api.getCpu(),
-      api.getMemory(),
-      api.getDisk(),
-      api.getNetwork(),
-    ])
+function normalizePercent(value?: number | null): number | null {
+  if (!isNumber(value)) return null
+  return value <= 1 ? value * 100 : value
+}
 
-    const errs: Record<string, string> = {}
+function formatNumber(value: number | null, decimals = 1): string {
+  if (!isNumber(value)) return 'N/A'
+  return value.toFixed(decimals)
+}
 
-    if (results[0].status === 'fulfilled') setCpu(results[0].value)
-    else errs.cpu = results[0].reason?.message ?? 'Failed'
+function formatPercent(value?: number | null, decimals = 1): string {
+  if (!isNumber(value)) return 'N/A'
+  const normalized = value <= 1 ? value * 100 : value
+  return `${normalized.toFixed(decimals)}%`
+}
 
-    if (results[1].status === 'fulfilled') setMemory(results[1].value)
-    else errs.memory = results[1].reason?.message ?? 'Failed'
+function formatMetric(value?: number | null, unit?: string, decimals = 1): string {
+  if (!isNumber(value)) return 'N/A'
+  return `${value.toFixed(decimals)}${unit ? ` ${unit}` : ''}`
+}
 
-    if (results[2].status === 'fulfilled') setDisk(results[2].value)
-    else errs.disk = results[2].reason?.message ?? 'Failed'
+function formatPlain(value: unknown): string {
+  if (value === null || value === undefined || value === '') return 'N/A'
+  if (Array.isArray(value)) return value.length ? value.join(', ') : 'N/A'
+  return `${value}`
+}
 
-    if (results[3].status === 'fulfilled') setNetwork(results[3].value)
-    else errs.network = results[3].reason?.message ?? 'Failed'
+function getGpuStatus(available: boolean, throttled: boolean, utilization: number | null): { status: GpuStatus; color: string } {
+  if (!available) return { status: 'Offline', color: COLORS.textMuted }
+  if (throttled) return { status: 'Throttle', color: COLORS.orange }
+  if (isNumber(utilization) && utilization >= 75) return { status: 'Busy', color: COLORS.red }
+  return { status: 'OK', color: COLORS.green }
+}
 
-    setErrors(errs)
-    setLoading(false)
-  }, [])
+function formatPackageText(pkg?: PackageInfo | null): string {
+  if (!pkg?.installed) return 'Not Installed'
+  return pkg.version || pkg.raw || 'Installed'
+}
 
-  usePolling(fetchAll, 3000, active)
+function formatFreqRange(min?: number | null, max?: number | null): string {
+  if (isNumber(min) && isNumber(max)) return `${Math.round(min)}-${Math.round(max)} MHz`
+  if (isNumber(min)) return `min ${Math.round(min)} MHz`
+  if (isNumber(max)) return `max ${Math.round(max)} MHz`
+  return 'N/A'
+}
 
-  const diskDevices = disk?.disk_io ? Object.entries(disk.disk_io) : []
-  const maxDiskUtil = diskDevices.length
-    ? Math.max(...diskDevices.map(([, d]) => d.utilization))
-    : null
-  const avgNetwork = network ? (network.rx + network.tx) / 2 : null
+function summarizeFreqBounds(bounds?: Record<string, { min_mhz: number | null; max_mhz: number | null }>): string {
+  const entries = Object.entries(bounds || {})
+  if (!entries.length) return 'N/A'
+  return entries
+    .map(([name, range]) => `${name}: ${formatFreqRange(range.min_mhz, range.max_mhz)}`)
+    .join(' | ')
+}
+
+function formatNetworkSpeed(value?: number | null): string {
+  if (!isNumber(value) || value <= 0) return 'N/A'
+  return `${Math.round(value)} Mbps`
+}
+
+function summarizeNetworkSpeeds(speeds?: Record<string, number>): string {
+  const entries = Object.entries(speeds || {})
+  if (!entries.length) return 'N/A'
+  return entries
+    .map(([name, speed]) => `${name}: ${formatNetworkSpeed(speed)}`)
+    .join(' | ')
+}
+
+function normalizeEngineName(name?: string | null): EngineKey | null {
+  const lowered = `${name || ''}`.toLowerCase()
+  if (!lowered) return null
+  if (lowered.includes('vecs') || lowered.includes('video-enhance')) return 'vecs'
+  if (lowered.includes('vcs') || lowered.includes('video')) return 'vcs'
+  if (lowered.includes('ccs') || lowered.includes('compute')) return 'ccs'
+  if (lowered.includes('rcs') || lowered.includes('render')) return 'rcs'
+  if (lowered.includes('bcs') || lowered.includes('copy') || lowered.includes('blt')) return 'bcs'
+  return null
+}
+
+function bytesPerSecToMbps(value?: number | null): number | null {
+  if (!isNumber(value)) return null
+  return (value * 8) / 1_000_000
+}
+
+function calcBandwidthUtilization(rateBytesPerSec: number | null, totalBandwidthMbps: number | null): number | null {
+  const rateMbps = bytesPerSecToMbps(rateBytesPerSec)
+  if (!isNumber(rateMbps) || !isNumber(totalBandwidthMbps) || totalBandwidthMbps <= 0) return null
+  return Math.max(0, Math.min((rateMbps / totalBandwidthMbps) * 100, 100))
+}
+
+function summarizeDiskSizes(devices?: Array<{ name: string; size_gb: number | null }>): string {
+  if (!devices?.length) return 'N/A'
+  return devices
+    .map((disk) => `${disk.name}: ${isNumber(disk.size_gb) ? `${disk.size_gb.toFixed(2)} GB` : 'N/A'}`)
+    .join(' | ')
+}
+
+function getAdaptiveAxis(
+  values: Array<number | null>,
+  current: number | null,
+  options: { lower: number; upper: number; minRange: number; padding: number; step: number }
+): { min: number; max: number } {
+  const { lower, upper, minRange, padding, step } = options
+  const numeric = values.filter(isNumber).concat(isNumber(current) ? [current] : [])
+  if (!numeric.length) {
+    return { min: lower, max: upper }
+  }
+
+  const rawMin = Math.max(lower, Math.min(...numeric) - padding)
+  const rawMax = Math.min(upper, Math.max(...numeric) + padding)
+  let min = rawMin
+  let max = rawMax
+
+  if (max - min < minRange) {
+    const center = (max + min) / 2
+    min = Math.max(lower, center - minRange / 2)
+    max = Math.min(upper, center + minRange / 2)
+    if (max - min < minRange) {
+      if (min <= lower) {
+        max = Math.min(upper, min + minRange)
+      } else {
+        min = Math.max(lower, max - minRange)
+      }
+    }
+  }
+
+  const snappedMin = Math.max(lower, Math.floor(min / step) * step)
+  const snappedMax = Math.min(upper, Math.ceil(max / step) * step)
+  if (snappedMax <= snappedMin) {
+    return { min: snappedMin, max: Math.min(upper, snappedMin + Math.max(step, minRange)) }
+  }
+  return { min: snappedMin, max: snappedMax }
+}
+
+function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: DynamicInfoData | null): GpuDeviceView[] {
+  const qmassaAvailable = Boolean(dynamicInfo?.gpu.qmassa.available)
+  const qmassaDevices: QmassaDevice[] = dynamicInfo?.gpu.qmassa.parsed?.devices || []
+  const dynamicVramEntries = Object.entries(dynamicInfo?.gpu.vram || {})
+  const staticVramEntries = Object.entries(staticInfo?.gpu.vram || {})
+
+  const cardKeySet = new Set<string>()
+  Object.keys(staticInfo?.gpu.vram || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticInfo?.gpu.freq_bounds_mhz || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticInfo?.gpu.pcie || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticInfo?.gpu.engines || {}).forEach((k) => cardKeySet.add(k))
+
+  const staticCardKeys = Array.from(cardKeySet).sort()
+  const total = Math.max(
+    qmassaDevices.length,
+    dynamicVramEntries.length,
+    staticVramEntries.length,
+    staticCardKeys.length,
+    staticInfo?.gpu.count || 0,
+  )
+
+  const devices: GpuDeviceView[] = []
+  let dgpuCounter = 0
+
+  for (let index = 0; index < total; index += 1) {
+    const qdev = qmassaDevices[index]
+    const hasStaticCard = Boolean(staticCardKeys[index])
+    const hasDynamicCard = Boolean(dynamicVramEntries[index]?.[0] || staticVramEntries[index]?.[0])
+    const withinStaticCount = Boolean((staticInfo?.gpu.count || 0) > index)
+    const hasEvidence = Boolean(qdev || hasStaticCard || hasDynamicCard || withinStaticCount)
+    if (!hasEvidence) continue
+
+    const cardKey = staticCardKeys[index] || dynamicVramEntries[index]?.[0] || staticVramEntries[index]?.[0] || `card${index}`
+
+    const vramDyn = dynamicInfo?.gpu.vram?.[cardKey] || dynamicVramEntries[index]?.[1]
+    const vramStatic = staticInfo?.gpu.vram?.[cardKey] || staticVramEntries[index]?.[1]
+    const vramUsage = normalizePercent(vramDyn?.usage_percent ?? vramStatic?.usage_percent ?? null)
+
+    const typeRaw = (qdev?.dev_type || '').toLowerCase()
+    let label: string
+    if (typeRaw.includes('integrated') || typeRaw.includes('igpu')) {
+      label = 'iGPU'
+    } else if (typeRaw.includes('discrete') || typeRaw.includes('dgpu')) {
+      label = `dGPU${dgpuCounter++}`
+    } else if (index === 0) {
+      label = 'iGPU'
+    } else {
+      label = `dGPU${dgpuCounter++}`
+    }
+
+    const freqs = qdev?.freqs || []
+    const gt0 = freqs.find((f) => f.name === 'gt0') || freqs[0]
+    const gt1 = freqs.find((f) => f.name === 'gt1') || freqs[1]
+
+    const engineSet = new Set<EngineKey>()
+    ;[...(qdev?.engines || []), ...((staticInfo?.gpu.engines?.[cardKey] || []) as string[])].forEach((name) => {
+      const normalized = normalizeEngineName(name)
+      if (normalized) engineSet.add(normalized)
+    })
+    ENGINE_ORDER.forEach((engine) => {
+      if (Object.prototype.hasOwnProperty.call(qdev?.engine_util || {}, engine)) {
+        engineSet.add(engine)
+      }
+    })
+    const engines = ENGINE_ORDER.filter((engine) => engineSet.has(engine))
+
+    const engineUtil = ENGINE_ORDER.reduce<Record<EngineKey, number | null>>((acc, key) => {
+      acc[key] = normalizePercent(qdev?.engine_util?.[key] as number | null | undefined)
+      return acc
+    }, {} as Record<EngineKey, number | null>)
+
+    const engineValues = Object.values(engineUtil).filter(isNumber)
+    const utilization = engineValues.length ? Math.max(...engineValues) : vramUsage
+
+    const throttle = Boolean(gt0?.throttled || gt1?.throttled || freqs.some((f) => f.throttled))
+    const available = Boolean(qdev) && qmassaAvailable
+    const { status, color } = getGpuStatus(available, throttle, utilization)
+
+    const id = qdev?.pci_dev || `${cardKey}-${index}`
+    const staticName = staticInfo?.gpu.names[index]
+
+    devices.push({
+      id,
+      label,
+      index,
+      cardKey,
+      available,
+      status,
+      statusColor: color,
+      name: staticName || qdev?.drv_name || cardKey,
+      devType: qdev?.dev_type || 'unknown',
+      pci: qdev?.pci_dev || staticInfo?.gpu.pcie?.[cardKey]?.current_speed || 'N/A',
+      driver: qdev?.drv_name || 'N/A',
+      utilization,
+      frequencies: { gt0, gt1 },
+      freqBounds: {
+        min_mhz: staticInfo?.gpu.freq_bounds_mhz?.[cardKey]?.min_mhz ?? null,
+        max_mhz: staticInfo?.gpu.freq_bounds_mhz?.[cardKey]?.max_mhz ?? null,
+      },
+      powerGpu: qdev?.power_w?.gpu ?? null,
+      powerPkg: qdev?.power_w?.pkg ?? null,
+      vramUsage,
+      engines,
+      engineUtil,
+    })
+  }
+
+  return devices
+}
+
+function Sparkline({
+  data,
+  width = 160,
+  height = 40,
+  stroke,
+  responsive = false,
+  mode = 'compact',
+  xStartLabel,
+  xEndLabel,
+  yMin,
+  yMax,
+  yTickCount = 3,
+}: {
+  data: Array<number | null>
+  width?: number
+  height?: number
+  stroke: string
+  responsive?: boolean
+  mode?: SparkMode
+  xStartLabel?: string
+  xEndLabel?: string
+  yMin?: number
+  yMax?: number
+  yTickCount?: number
+}) {
+  const id = useId()
+  const cleaned = data.map((value) => (isNumber(value) ? value : null))
+  const numeric = cleaned.filter(isNumber)
+  const hasAxis = mode === 'axis' || mode === 'points'
+  const padding = hasAxis
+    ? { top: 8, right: 8, bottom: 14, left: 30 }
+    : { top: 0, right: 0, bottom: 0, left: 0 }
+  const chartWidth = Math.max(1, width - padding.left - padding.right)
+  const chartHeight = Math.max(1, height - padding.top - padding.bottom)
+  const chartLeft = padding.left
+  const chartTop = padding.top
+  const chartBottom = chartTop + chartHeight
+  const chartRight = chartLeft + chartWidth
+  const axisMin = isNumber(yMin) ? yMin : 0
+  const axisMax = isNumber(yMax) ? yMax : 100
+  const tickCount = Math.max(2, Math.round(yTickCount))
+
+  const buildTicks = (minVal: number, maxVal: number) => {
+    const safeMax = maxVal <= minVal ? minVal + 1 : maxVal
+    return Array.from({ length: tickCount }, (_, i) => {
+      const ratio = i / (tickCount - 1)
+      const y = chartTop + ratio * chartHeight
+      const value = safeMax - ratio * (safeMax - minVal)
+      return { y, value, index: i }
+    })
+  }
+
+  if (numeric.length === 0) {
+    const ticks = buildTicks(axisMin, axisMax)
+    return (
+      <svg
+        width={responsive ? '100%' : width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        className="perf-sparkline"
+      >
+        {hasAxis && (
+          <>
+            <line x1={chartLeft} y1={chartTop} x2={chartLeft} y2={chartBottom} stroke={COLORS.border} strokeWidth="1" />
+            {ticks.map((tick) => (
+              <g key={`tick-empty-${tick.index}`}>
+                <line
+                  x1={chartLeft}
+                  y1={tick.y}
+                  x2={chartRight}
+                  y2={tick.y}
+                  stroke={tick.index === 0 || tick.index === tickCount - 1 ? COLORS.border : `${COLORS.border}88`}
+                  strokeWidth="1"
+                />
+                <text
+                  x={chartLeft - 2}
+                  y={tick.y}
+                  textAnchor="end"
+                  dominantBaseline="middle"
+                  className="perf-spark-axis"
+                >
+                  {tick.value.toFixed(0)}
+                </text>
+              </g>
+            ))}
+            <text x={chartLeft} y={height - 2} textAnchor="start" className="perf-spark-axis">{xStartLabel || ''}</text>
+            <text x={chartRight} y={height - 2} textAnchor="end" className="perf-spark-axis">{xEndLabel || ''}</text>
+          </>
+        )}
+      </svg>
+    )
+  }
+
+  let lastValue = numeric[0]
+  const normalized = cleaned.map((value) => {
+    if (!isNumber(value)) return lastValue
+    lastValue = value
+    return value
+  })
+
+  const computedMin = Math.min(...normalized)
+  const computedMax = Math.max(...normalized)
+  const min = isNumber(yMin) ? yMin : computedMin
+  const max = isNumber(yMax) ? yMax : computedMax
+  const clampedMax = max <= min ? min + 1 : max
+  const ticks = buildTicks(min, clampedMax)
+  const range = clampedMax - min
+  const denominator = Math.max(1, normalized.length - 1)
+
+  const pointCoords = normalized.map((value, index) => {
+    const plottedValue = Math.max(min, Math.min(value, clampedMax))
+    const x = chartLeft + (index / denominator) * chartWidth
+    const y = chartTop + chartHeight - ((plottedValue - min) / range) * chartHeight
+    return { x, y, value, index }
+  })
+
+  const points = pointCoords.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+
+  const linePath = `M ${points.join(' L ')}`
+  const areaPath = `${linePath} L ${chartRight} ${chartBottom} L ${chartLeft} ${chartBottom} Z`
+  const labelStep = pointCoords.length <= 20 ? 1 : pointCoords.length <= 40 ? 2 : 4
 
   return (
-    <div style={{ padding: '16px 0' }}>
+    <svg
+      width={responsive ? '100%' : width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className="perf-sparkline"
+    >
+      <defs>
+        <linearGradient id={`spark-${id}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={stroke} stopOpacity="0.4" />
+          <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {hasAxis && (
+        <>
+          <line x1={chartLeft} y1={chartTop} x2={chartLeft} y2={chartBottom} stroke={COLORS.border} strokeWidth="1" />
+          {ticks.map((tick) => (
+            <g key={`tick-${tick.index}`}>
+              <line
+                x1={chartLeft}
+                y1={tick.y}
+                x2={chartRight}
+                y2={tick.y}
+                stroke={tick.index === 0 || tick.index === tickCount - 1 ? COLORS.border : `${COLORS.border}88`}
+                strokeWidth="1"
+              />
+              <text
+                x={chartLeft - 2}
+                y={tick.y}
+                textAnchor="end"
+                dominantBaseline="middle"
+                className="perf-spark-axis"
+              >
+                {tick.value.toFixed(0)}
+              </text>
+            </g>
+          ))}
+          <text x={chartLeft} y={height - 2} textAnchor="start" className="perf-spark-axis">{xStartLabel || ''}</text>
+          <text x={chartRight} y={height - 2} textAnchor="end" className="perf-spark-axis">{xEndLabel || ''}</text>
+        </>
+      )}
+      <path d={areaPath} fill={`url(#spark-${id})`} />
+      <path d={linePath} fill="none" stroke={stroke} strokeWidth="2" />
+      {(mode === 'points' || pointCoords.length <= 12) &&
+        pointCoords.map((point) => (
+          <g key={`point-${point.index}`}>
+            <circle cx={point.x} cy={point.y} r="2" fill={stroke} opacity="0.9">
+              <title>{point.value.toFixed(2)}</title>
+            </circle>
+            {mode === 'points' && point.index % labelStep === 0 && (
+              <text x={point.x} y={Math.max(chartTop + 9, point.y - 6)} textAnchor="middle" className="perf-spark-point-label">
+                {point.value.toFixed(0)}
+              </text>
+            )}
+          </g>
+        ))}
+    </svg>
+  )
+}
 
-      {/* ── Summary row ─────────────────────────────────────────────────── */}
-      <Card
-        style={{
-          background: COLORS.panelBg,
-          border: `1px solid ${COLORS.border}`,
-          borderRadius: 6,
-          marginBottom: 12,
-        }}
-        bodyStyle={{ padding: '16px 24px' }}
+function MultiLineSparkline({
+  series,
+  width = 240,
+  height = 56,
+  responsive = false,
+  mode = 'compact',
+  xStartLabel,
+  xEndLabel,
+  yMin,
+  yMax,
+  yTickCount = 4,
+}: {
+  series: Array<{ key: string; label: string; data: Array<number | null>; stroke: string }>
+  width?: number
+  height?: number
+  responsive?: boolean
+  mode?: SparkMode
+  xStartLabel?: string
+  xEndLabel?: string
+  yMin?: number
+  yMax?: number
+  yTickCount?: number
+}) {
+  const hasAxis = mode === 'axis' || mode === 'points'
+  const padding = hasAxis
+    ? { top: 8, right: 8, bottom: 14, left: 30 }
+    : { top: 0, right: 0, bottom: 0, left: 0 }
+  const chartWidth = Math.max(1, width - padding.left - padding.right)
+  const chartHeight = Math.max(1, height - padding.top - padding.bottom)
+  const chartLeft = padding.left
+  const chartTop = padding.top
+  const chartBottom = chartTop + chartHeight
+  const chartRight = chartLeft + chartWidth
+  const tickCount = Math.max(2, Math.round(yTickCount))
+
+  const preparedSeries = series.filter((item) => item.data.length > 0)
+  const maxLen = preparedSeries.length
+    ? Math.max(...preparedSeries.map((item) => item.data.length))
+    : 0
+
+  const normalizedSeries = preparedSeries.map((item) => {
+    const padded = item.data.length >= maxLen
+      ? item.data
+      : Array(maxLen - item.data.length).fill(null).concat(item.data)
+    const cleaned = padded.map((value) => (isNumber(value) ? value : null))
+    const seed = cleaned.find(isNumber)
+    if (!isNumber(seed)) {
+      return { ...item, values: [] as number[] }
+    }
+    let lastValue = seed
+    const values = cleaned.map((value) => {
+      if (!isNumber(value)) return lastValue
+      lastValue = value
+      return value
+    })
+    return { ...item, values }
+  })
+
+  const allValues = normalizedSeries.flatMap((item) => item.values)
+  const numeric = allValues.filter(isNumber)
+  const axisMin = isNumber(yMin) ? yMin : (numeric.length ? Math.min(...numeric) : 0)
+  const axisMaxRaw = isNumber(yMax) ? yMax : (numeric.length ? Math.max(...numeric) : 100)
+  const axisMax = axisMaxRaw <= axisMin ? axisMin + 1 : axisMaxRaw
+
+  const buildTicks = (minVal: number, maxVal: number) => {
+    const safeMax = maxVal <= minVal ? minVal + 1 : maxVal
+    return Array.from({ length: tickCount }, (_, i) => {
+      const ratio = i / (tickCount - 1)
+      const y = chartTop + ratio * chartHeight
+      const value = safeMax - ratio * (safeMax - minVal)
+      return { y, value, index: i }
+    })
+  }
+
+  const ticks = buildTicks(axisMin, axisMax)
+
+  if (!preparedSeries.length || !numeric.length) {
+    return (
+      <svg
+        width={responsive ? '100%' : width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        className="perf-sparkline"
       >
-        <Row justify="space-around" align="middle" gutter={[16, 16]}>
-          <Col>
-            <SummaryGauge
-              label="CPU"
-              icon={<ThunderboltOutlined />}
-              value={cpu?.usage ?? null}
-              color={usageColor(cpu?.usage ?? 0)}
+        {hasAxis && (
+          <>
+            <line x1={chartLeft} y1={chartTop} x2={chartLeft} y2={chartBottom} stroke={COLORS.border} strokeWidth="1" />
+            {ticks.map((tick) => (
+              <g key={`multi-empty-${tick.index}`}>
+                <line
+                  x1={chartLeft}
+                  y1={tick.y}
+                  x2={chartRight}
+                  y2={tick.y}
+                  stroke={tick.index === 0 || tick.index === tickCount - 1 ? COLORS.border : `${COLORS.border}88`}
+                  strokeWidth="1"
+                />
+                <text
+                  x={chartLeft - 2}
+                  y={tick.y}
+                  textAnchor="end"
+                  dominantBaseline="middle"
+                  className="perf-spark-axis"
+                >
+                  {tick.value.toFixed(0)}
+                </text>
+              </g>
+            ))}
+            <text x={chartLeft} y={height - 2} textAnchor="start" className="perf-spark-axis">{xStartLabel || ''}</text>
+            <text x={chartRight} y={height - 2} textAnchor="end" className="perf-spark-axis">{xEndLabel || ''}</text>
+          </>
+        )}
+      </svg>
+    )
+  }
+
+  const range = axisMax - axisMin
+  const denominator = Math.max(1, maxLen - 1)
+
+  const pathBySeries = normalizedSeries.map((item) => {
+    const points = item.values.map((value, index) => {
+      const plotted = Math.max(axisMin, Math.min(value, axisMax))
+      const x = chartLeft + (index / denominator) * chartWidth
+      const y = chartTop + chartHeight - ((plotted - axisMin) / range) * chartHeight
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    return {
+      key: item.key,
+      stroke: item.stroke,
+      path: points.length ? `M ${points.join(' L ')}` : '',
+    }
+  })
+
+  return (
+    <svg
+      width={responsive ? '100%' : width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className="perf-sparkline"
+    >
+      {hasAxis && (
+        <>
+          <line x1={chartLeft} y1={chartTop} x2={chartLeft} y2={chartBottom} stroke={COLORS.border} strokeWidth="1" />
+          {ticks.map((tick) => (
+            <g key={`multi-tick-${tick.index}`}>
+              <line
+                x1={chartLeft}
+                y1={tick.y}
+                x2={chartRight}
+                y2={tick.y}
+                stroke={tick.index === 0 || tick.index === tickCount - 1 ? COLORS.border : `${COLORS.border}88`}
+                strokeWidth="1"
+              />
+              <text
+                x={chartLeft - 2}
+                y={tick.y}
+                textAnchor="end"
+                dominantBaseline="middle"
+                className="perf-spark-axis"
+              >
+                {tick.value.toFixed(0)}
+              </text>
+            </g>
+          ))}
+          <text x={chartLeft} y={height - 2} textAnchor="start" className="perf-spark-axis">{xStartLabel || ''}</text>
+          <text x={chartRight} y={height - 2} textAnchor="end" className="perf-spark-axis">{xEndLabel || ''}</text>
+        </>
+      )}
+
+      {pathBySeries.map((item) =>
+        item.path ? <path key={item.key} d={item.path} fill="none" stroke={item.stroke} strokeWidth="1.8" /> : null
+      )}
+    </svg>
+  )
+}
+
+function DualAxisSparkline({
+  utilData,
+  freqData,
+  width = 220,
+  height = 58,
+  utilStroke,
+  freqStroke,
+  responsive = false,
+  xStartLabel,
+  xEndLabel,
+  utilAxis,
+  freqAxis,
+  utilTickCount = 5,
+  freqTickCount = 4,
+}: {
+  utilData: Array<number | null>
+  freqData: Array<number | null>
+  width?: number
+  height?: number
+  utilStroke: string
+  freqStroke: string
+  responsive?: boolean
+  xStartLabel?: string
+  xEndLabel?: string
+  utilAxis: { min: number; max: number }
+  freqAxis: { min: number; max: number }
+  utilTickCount?: number
+  freqTickCount?: number
+}) {
+  const id = useId()
+  const padding = { top: 8, right: 34, bottom: 14, left: 30 }
+  const chartWidth = Math.max(1, width - padding.left - padding.right)
+  const chartHeight = Math.max(1, height - padding.top - padding.bottom)
+  const chartLeft = padding.left
+  const chartTop = padding.top
+  const chartBottom = chartTop + chartHeight
+  const chartRight = chartLeft + chartWidth
+
+  const maxLen = Math.max(utilData.length, freqData.length)
+  const padSeries = (series: Array<number | null>) => {
+    if (series.length >= maxLen) return series
+    return Array(maxLen - series.length).fill(null).concat(series)
+  }
+
+  const utilSeries = padSeries(utilData).map((value) => (isNumber(value) ? value : null))
+  const freqSeries = padSeries(freqData).map((value) => (isNumber(value) ? value : null))
+  const hasAnyPoint = utilSeries.some(isNumber) || freqSeries.some(isNumber)
+
+  const utilMin = utilAxis.min
+  const utilMax = utilAxis.max <= utilAxis.min ? utilAxis.min + 1 : utilAxis.max
+  const freqMin = freqAxis.min
+  const freqMax = freqAxis.max <= freqAxis.min ? freqAxis.min + 1 : freqAxis.max
+
+  const buildTicks = (tickCount: number, minVal: number, maxVal: number) => {
+    const safeCount = Math.max(2, Math.round(tickCount))
+    return Array.from({ length: safeCount }, (_, i) => {
+      const ratio = i / (safeCount - 1)
+      const y = chartTop + ratio * chartHeight
+      const value = maxVal - ratio * (maxVal - minVal)
+      return { y, value, index: i, isEdge: i === 0 || i === safeCount - 1 }
+    })
+  }
+
+  const utilTicks = buildTicks(utilTickCount, utilMin, utilMax)
+  const freqTicks = buildTicks(freqTickCount, freqMin, freqMax)
+
+  const buildPath = (series: Array<number | null>, minVal: number, maxVal: number) => {
+    const seed = series.find(isNumber) ?? minVal
+    let lastValue = seed
+    const range = maxVal - minVal
+    const denominator = Math.max(1, maxLen - 1)
+
+    const points = series.map((value, index) => {
+      const nextValue = isNumber(value) ? value : lastValue
+      lastValue = nextValue
+      const plotted = Math.max(minVal, Math.min(nextValue, maxVal))
+      const x = chartLeft + (index / denominator) * chartWidth
+      const y = chartTop + chartHeight - ((plotted - minVal) / range) * chartHeight
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+
+    return points.length ? `M ${points.join(' L ')}` : ''
+  }
+
+  const utilPath = hasAnyPoint ? buildPath(utilSeries, utilMin, utilMax) : ''
+  const freqPath = hasAnyPoint ? buildPath(freqSeries, freqMin, freqMax) : ''
+
+  return (
+    <svg
+      width={responsive ? '100%' : width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className="perf-sparkline"
+    >
+      <defs>
+        <linearGradient id={`spark-dual-util-${id}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={utilStroke} stopOpacity="0.4" />
+          <stop offset="100%" stopColor={utilStroke} stopOpacity="0" />
+        </linearGradient>
+        <linearGradient id={`spark-dual-freq-${id}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={freqStroke} stopOpacity="0.4" />
+          <stop offset="100%" stopColor={freqStroke} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+
+      <line x1={chartLeft} y1={chartTop} x2={chartLeft} y2={chartBottom} stroke={COLORS.border} strokeWidth="1" />
+      <line x1={chartRight} y1={chartTop} x2={chartRight} y2={chartBottom} stroke={COLORS.border} strokeWidth="1" />
+
+      {utilTicks.map((tick) => (
+        <g key={`dual-util-tick-${tick.index}`}>
+          <line
+            x1={chartLeft}
+            y1={tick.y}
+            x2={chartRight}
+            y2={tick.y}
+            stroke={tick.isEdge ? COLORS.border : `${COLORS.border}88`}
+            strokeWidth="1"
+          />
+          <text
+            x={chartLeft - 2}
+            y={tick.y}
+            textAnchor="end"
+            dominantBaseline="middle"
+            className="perf-spark-axis"
+          >
+            {tick.value.toFixed(0)}
+          </text>
+        </g>
+      ))}
+
+      {freqTicks.map((tick) => (
+        <text
+          key={`dual-freq-tick-${tick.index}`}
+          x={chartRight + 2}
+          y={tick.y}
+          textAnchor="start"
+          dominantBaseline="middle"
+          className="perf-spark-axis"
+        >
+          {tick.value.toFixed(0)}
+        </text>
+      ))}
+
+      <text x={chartLeft} y={height - 2} textAnchor="start" className="perf-spark-axis">{xStartLabel || ''}</text>
+      <text x={chartRight} y={height - 2} textAnchor="end" className="perf-spark-axis">{xEndLabel || ''}</text>
+
+      {utilPath && <path d={utilPath} fill="none" stroke={utilStroke} strokeWidth="1.8" />}
+      {freqPath && <path d={freqPath} fill="none" stroke={freqStroke} strokeWidth="1.8" />}
+    </svg>
+  )
+}
+
+function SectionTitle({
+  title,
+  subtitle,
+  action,
+}: {
+  title: string
+  subtitle?: string
+  action?: React.ReactNode
+}) {
+  return (
+    <div className="perf-section-title">
+      <div>
+        <Text className="perf-section-eyebrow">{title}</Text>
+        {subtitle && (
+          <Text className="perf-section-subtitle">
+            {subtitle}
+          </Text>
+        )}
+      </div>
+      {action}
+    </div>
+  )
+}
+
+function PressurePointerGauge({
+  title,
+  valuePct,
+  subtitle,
+  description,
+}: {
+  title: string
+  valuePct: number | null
+  subtitle?: string
+  description?: string
+}) {
+  const hasValue = isNumber(valuePct)
+  const pct = hasValue ? Math.max(0, Math.min(valuePct, 100)) : 0
+  const normalized = pct / 100
+  const color = getPressureColor(normalized)
+  const pointerColor = COLORS.text
+  const label = hasValue ? getPressureLabel(normalized) : '0%'
+  const needleAngle = 180 - (pct * 180) / 100
+  const gaugeData = [{ value: pct, fill: color }]
+
+  return (
+    <div className="perf-pressure-pointer-card">
+      <Text className="perf-pressure-pointer-title">{title}</Text>
+
+      <div className="perf-pressure-pointer-wrap">
+        <ResponsiveContainer width="100%" height="100%">
+          <RadialBarChart
+            cx="50%"
+            cy="64%"
+            innerRadius="56%"
+            outerRadius="80%"
+            startAngle={180}
+            endAngle={0}
+            data={gaugeData}
+          >
+            <PolarAngleAxis type="number" domain={[0, 100]} tick={false} />
+            <RadialBar
+              background={{ fill: `${COLORS.border}aa` }}
+              dataKey="value"
+              cornerRadius={4}
+              fill={color}
+              stroke="none"
             />
-          </Col>
-          <Col>
-            <SummaryGauge
-              label="Memory"
-              icon={<ApiOutlined />}
-              value={memory?.usage ?? null}
-              color={usageColor(memory?.usage ?? 0)}
-            />
-          </Col>
-          <Col>
-            <SummaryGauge
-              label="Disk IO"
-              icon={<HddOutlined />}
-              value={maxDiskUtil}
-              color={usageColor(maxDiskUtil ?? 0)}
-            />
-          </Col>
-          <Col>
-            <SummaryGauge
-              label="Network"
-              icon={<WifiOutlined />}
-              value={avgNetwork}
-              color={usageColor(avgNetwork ?? 0)}
-            />
-          </Col>
-          {cpu && (
-            <Col>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 22, fontWeight: 700, color: COLORS.text, lineHeight: 1 }}>
-                  {cpu.count}
-                </div>
-                <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>CPU Cores</Text>
-              </div>
-            </Col>
+          </RadialBarChart>
+        </ResponsiveContainer>
+
+        <svg className="perf-pressure-needle" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+          <line
+            x1="50"
+            y1="64"
+            x2="73"
+            y2="64"
+            stroke={pointerColor}
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            transform={`rotate(${needleAngle} 50 64)`}
+          />
+          <circle cx="50" cy="64" r="2.6" fill={pointerColor} />
+        </svg>
+
+        <div className="perf-pressure-pointer-value" style={{ color }}>
+          {`${Math.round(pct)}%`}
+        </div>
+      </div>
+
+      <Tag
+        style={{
+          color,
+          borderColor: color,
+          background: `${color}20`,
+          fontSize: 11,
+          letterSpacing: 1,
+          fontWeight: 700,
+          marginTop: 6,
+        }}
+      >
+        {label}
+      </Tag>
+
+      {subtitle && <Text className="perf-pressure-pointer-subtitle">{subtitle}</Text>}
+      {description && <Text className="perf-pressure-pointer-description">{description}</Text>}
+    </div>
+  )
+}
+
+function DetailItem({
+  label,
+  value,
+  source,
+}: {
+  label: string
+  value: string
+  source?: DataSourceKind
+}) {
+  return (
+    <div className="perf-detail-item">
+      <div className="perf-detail-label-row">
+        <Text className="perf-detail-label">{label}</Text>
+        {source && (
+          <span className={`perf-detail-source perf-detail-source--${source}`}>
+            {source === 'static' ? 'Static' : 'Dynamic'}
+          </span>
+        )}
+      </div>
+      <Text className="perf-detail-value" title={value}>
+        {value}
+      </Text>
+    </div>
+  )
+}
+
+function TrendPanel({
+  title,
+  accent,
+  value,
+  unit,
+  status,
+  statusColor,
+  series,
+  details,
+  subtitle,
+  sparkMode,
+  trendWindow,
+  multiSeries,
+  splitBars,
+}: {
+  title: string
+  accent: string
+  value: number | null
+  unit?: string
+  status?: string
+  statusColor?: string
+  series: Array<number | null>
+  details: Array<{ label: string; value: string; source?: DataSourceKind }>
+  subtitle?: string
+  sparkMode?: SparkMode
+  trendWindow?: '1m' | '5m'
+  multiSeries?: Array<{ key: string; label: string; data: Array<number | null>; stroke: string }>
+  splitBars?: Array<{ key: string; label: string; value: number | null; color: string }>
+}) {
+  const gaugeValue = isNumber(value) ? Math.max(0, Math.min(value, 100)) : 0
+  const hasValue = isNumber(value)
+  const gaugeColor = statusColor || accent
+  const suffix = unit || '%'
+  const valueText = hasValue ? `${formatNumber(gaugeValue, 1)}${suffix}` : 'N/A'
+  const showMultiSeries = Boolean(multiSeries && multiSeries.length > 1)
+
+  return (
+    <Card className="perf-card perf-rise perf-trend-card" bodyStyle={{ padding: 16 }}>
+      <div className="perf-trend-head">
+        <Space size={8}>
+          <span className="perf-trend-dot" style={{ background: accent }} />
+          <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>{title}</Text>
+        </Space>
+        <Space size={6}>
+          {status && (
+            <Tag
+              style={{
+                color: statusColor || accent,
+                borderColor: statusColor || accent,
+                background: `${statusColor || accent}22`,
+                fontSize: 10,
+                letterSpacing: 1,
+              }}
+            >
+              {status}
+            </Tag>
           )}
-          {memory && (
-            <Col>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 22, fontWeight: 700, color: COLORS.text, lineHeight: 1 }}>
-                  {memory.total_gb.toFixed(0)}
-                  <span style={{ fontSize: 12, fontWeight: 400, color: COLORS.textMuted }}> GB</span>
-                </div>
-                <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>System RAM</Text>
+        </Space>
+      </div>
+      <div className="perf-trend-body">
+        <div className="perf-trend-main">
+          <div className="perf-insight-metric">
+            <div className="perf-insight-value-row">
+              <Text className="perf-insight-value">{valueText}</Text>
+            </div>
+            <div className="perf-insight-bar-track">
+              <div
+                className="perf-insight-bar-fill"
+                style={{
+                  width: `${Math.round(gaugeValue)}%`,
+                  background: `linear-gradient(90deg, ${gaugeColor}66, ${gaugeColor})`,
+                  boxShadow: `0 0 14px ${gaugeColor}66`,
+                }}
+              />
+            </div>
+            <div className="perf-insight-scale">
+              <span>0</span>
+              <span>50</span>
+              <span>100</span>
+            </div>
+            {splitBars && splitBars.length > 0 && (
+              <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+                {splitBars.map((bar) => {
+                  const splitGauge = isNumber(bar.value) ? Math.max(0, Math.min(bar.value, 100)) : 0
+                  return (
+                    <div key={`${title}-${bar.key}`}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                        <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{bar.label}</Text>
+                        <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{formatPercent(bar.value, 1)}</Text>
+                      </div>
+                      <div className="perf-insight-bar-track" style={{ height: 6 }}>
+                        <div
+                          className="perf-insight-bar-fill"
+                          style={{
+                            width: `${Math.round(splitGauge)}%`,
+                            background: `linear-gradient(90deg, ${bar.color}66, ${bar.color})`,
+                            boxShadow: `0 0 10px ${bar.color}55`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
-            </Col>
+            )}
+          </div>
+          {subtitle && (
+            <Text className="perf-trend-subtitle">
+              {subtitle}
+            </Text>
           )}
+        </div>
+        <div className="perf-trend-chart">
+          {showMultiSeries && multiSeries ? (
+            <>
+              <div className="perf-series-legend">
+                {multiSeries.map((item) => (
+                  <span className="perf-series-legend-item" key={`${title}-${item.key}`}>
+                    <span className="perf-series-legend-dot" style={{ background: item.stroke }} />
+                    {item.label}
+                  </span>
+                ))}
+              </div>
+              <MultiLineSparkline
+                series={multiSeries}
+                width={320}
+                height={80}
+                responsive
+                mode={sparkMode === 'compact' ? 'compact' : 'axis'}
+                xStartLabel={trendWindow ? `-${trendWindow}` : ''}
+                xEndLabel="now"
+                yMin={0}
+                yMax={100}
+                yTickCount={4}
+              />
+            </>
+          ) : (
+            <Sparkline
+              data={series}
+              width={320}
+              height={80}
+              stroke={accent}
+              responsive
+              mode={sparkMode || 'compact'}
+              xStartLabel={trendWindow ? `-${trendWindow}` : ''}
+              xEndLabel="now"
+            />
+          )}
+        </div>
+      </div>
+      <div className="perf-detail-grid" style={{ marginTop: 12 }}>
+        {details.map((item) => (
+          <DetailItem key={`${title}-${item.label}`} label={item.label} value={item.value} source={item.source} />
+        ))}
+      </div>
+    </Card>
+  )
+}
+
+function CoreCell({
+  index,
+  usage,
+  freq,
+  type,
+  trend,
+  freqTrend,
+  trendWindow,
+  utilAxis,
+  freqAxis,
+}: {
+  index: number
+  usage: number | null
+  freq: number | null
+  type: 'P' | 'E' | 'Core'
+  trend: Array<number | null>
+  freqTrend: Array<number | null>
+  trendWindow: '1m' | '5m'
+  utilAxis: { min: number; max: number }
+  freqAxis: { min: number; max: number }
+}) {
+  const normalized = isNumber(usage) ? Math.max(0, Math.min(usage, 100)) : 0
+  const barColor = normalized >= 80 ? COLORS.red : normalized >= 60 ? COLORS.orange : COLORS.accent
+  const freqColor = PERF_COLORS.memory
+
+  return (
+    <div className="perf-core-item">
+      <div className="perf-core-head">
+        <Text style={{ color: COLORS.text, fontSize: 12 }}>Core {index}</Text>
+        <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>{formatPercent(usage)}</Text>
+      </div>
+      <div className="perf-core-bar-track">
+        <div className="perf-core-bar-fill" style={{ width: `${normalized}%`, background: barColor }} />
+      </div>
+      <div className="perf-core-meta">
+        <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{type}</Text>
+        <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{formatMetric(freq, 'MHz', 0)}</Text>
+      </div>
+
+      <div className="perf-core-trend-legend">
+        <span className="perf-core-legend-item">
+          <span className="perf-core-legend-dot" style={{ background: barColor }} />
+          Util %
+        </span>
+        <span className="perf-core-legend-item">
+          <span className="perf-core-legend-dot" style={{ background: freqColor }} />
+          Freq MHz
+        </span>
+      </div>
+
+      <div className="perf-core-trend-row">
+        <Text className="perf-core-trend-title">util / freq</Text>
+        <DualAxisSparkline
+          utilData={trend}
+          freqData={freqTrend}
+          width={220}
+          height={58}
+          utilStroke={barColor}
+          freqStroke={freqColor}
+          responsive
+          xStartLabel={`-${trendWindow}`}
+          xEndLabel="now"
+          utilAxis={utilAxis}
+          freqAxis={freqAxis}
+          utilTickCount={5}
+          freqTickCount={4}
+        />
+      </div>
+    </div>
+  )
+}
+
+function GpuDeviceCard({
+  device,
+  trendWindow,
+  getSeries,
+  sparkMode,
+}: {
+  device: GpuDeviceView
+  trendWindow: '1m' | '5m'
+  getSeries: (key: string) => Array<number | null>
+  sparkMode: SparkMode
+}) {
+  const utilSeries = getSeries(`gpu:${device.id}:util`)
+  const gt0FreqSeries = getSeries(`gpu:${device.id}:freq:gt0:cur_mhz`)
+  const gt1FreqSeries = getSeries(`gpu:${device.id}:freq:gt1:cur_mhz`)
+  const enginesToShow = device.engines.length
+    ? device.engines
+    : ENGINE_ORDER.filter((engine) => isNumber(device.engineUtil[engine]))
+
+  const freqSeries = [
+    { key: `${device.id}-gt0-act`, label: 'GT0 Actual', data: gt0FreqSeries, stroke: PERF_COLORS.gpu },
+    { key: `${device.id}-gt1-act`, label: 'GT1 Actual', data: gt1FreqSeries, stroke: PERF_COLORS.memory },
+  ]
+
+  const engineSeries = enginesToShow.map((engine) => ({
+    key: `${device.id}-engine-${engine}`,
+    label: engine.toUpperCase(),
+    data: getSeries(`gpu:${device.id}:engine:${engine}`),
+    stroke: ENGINE_COLORS[engine],
+  }))
+
+  return (
+    <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
+      <div className="perf-gpu-head">
+        <div>
+          <Space size={8}>
+            <PartitionOutlined style={{ color: PERF_COLORS.gpu }} />
+            <Text style={{ color: COLORS.text, fontSize: 14, fontWeight: 600 }}>{device.label}</Text>
+            <Tag
+              style={{
+                color: device.statusColor,
+                borderColor: device.statusColor,
+                background: `${device.statusColor}22`,
+                fontSize: 10,
+                letterSpacing: 1,
+              }}
+            >
+              {device.status}
+            </Tag>
+          </Space>
+          <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginTop: 4 }}>
+            {device.name}
+          </Text>
+          <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block' }}>
+            PCI: {device.pci} | Driver: {device.driver} | Type: {device.devType}
+          </Text>
+        </div>
+        <div className="perf-gpu-util">
+          <Text style={{ color: COLORS.text, fontSize: 22, fontWeight: 700 }}>
+            {formatNumber(device.utilization)}
+            <span style={{ color: COLORS.textMuted, fontSize: 12, marginLeft: 6 }}>%</span>
+          </Text>
+          <Text style={{ color: COLORS.textMuted, fontSize: 10, textAlign: 'right' }}>{trendWindow.toUpperCase()} trend</Text>
+        </div>
+      </div>
+
+      <div className="perf-gpu-chart">
+        <Sparkline
+          data={utilSeries}
+          width={640}
+          height={72}
+          stroke={PERF_COLORS.gpu}
+          responsive
+          mode={sparkMode === 'compact' ? 'compact' : 'axis'}
+          xStartLabel={`-${trendWindow}`}
+          xEndLabel="now"
+        />
+      </div>
+
+      <div className="perf-detail-grid" style={{ marginTop: 12 }}>
+        <DetailItem
+          label="Static Freq Range"
+          value={formatFreqRange(device.freqBounds.min_mhz, device.freqBounds.max_mhz)}
+          source="static"
+        />
+        <DetailItem
+          label="GT0 Actual"
+          value={formatMetric(device.frequencies.gt0?.act_mhz, 'MHz', 0)}
+          source="dynamic"
+        />
+        <DetailItem
+          label="GT1 Actual"
+          value={formatMetric(device.frequencies.gt1?.act_mhz, 'MHz', 0)}
+          source="dynamic"
+        />
+        <DetailItem label="GPU Power" value={formatMetric(device.powerGpu, 'W', 2)} source="dynamic" />
+        <DetailItem label="Package Power" value={formatMetric(device.powerPkg, 'W', 2)} source="dynamic" />
+        <DetailItem label="VRAM Usage" value={formatPercent(device.vramUsage)} source="dynamic" />
+      </div>
+
+      <div className="perf-gpu-mini-trend" style={{ marginTop: 10 }}>
+        <Text className="perf-detail-label">GT0 / GT1 Actual Frequency Trend</Text>
+        <div className="perf-series-legend">
+          {freqSeries.map((item) => (
+            <span className="perf-series-legend-item" key={item.key}>
+              <span className="perf-series-legend-dot" style={{ background: item.stroke }} />
+              {item.label}
+            </span>
+          ))}
+        </div>
+        <MultiLineSparkline
+          series={freqSeries}
+          width={460}
+          height={56}
+          responsive
+          mode={sparkMode === 'compact' ? 'compact' : 'axis'}
+          xStartLabel={`-${trendWindow}`}
+          xEndLabel="now"
+        />
+      </div>
+
+      <div style={{ marginTop: 14 }}>
+        <Text className="perf-detail-label">Engine Utilization</Text>
+        <div className="perf-engine-current-grid">
+          {enginesToShow.length === 0 ? (
+            <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>No active engine data</Text>
+          ) : (
+            enginesToShow.map((engine) => (
+              <div className="perf-engine-current-item" key={`${device.id}-${engine}`}>
+                <Text style={{ color: COLORS.text, fontSize: 11, textTransform: 'uppercase' }}>{engine}</Text>
+                <Text style={{ color: ENGINE_COLORS[engine], fontSize: 11 }}>{formatPercent(device.engineUtil[engine])}</Text>
+              </div>
+            ))
+          )}
+        </div>
+        <div className="perf-gpu-mini-trend" style={{ marginTop: 10 }}>
+          <Text className="perf-detail-label">Engine Utilization Trend</Text>
+          <div className="perf-series-legend">
+            {engineSeries.map((item) => (
+              <span className="perf-series-legend-item" key={item.key}>
+                <span className="perf-series-legend-dot" style={{ background: item.stroke }} />
+                {item.label}
+              </span>
+            ))}
+          </div>
+          <MultiLineSparkline
+            series={engineSeries}
+            width={460}
+            height={56}
+            responsive
+            mode={sparkMode === 'compact' ? 'compact' : 'axis'}
+            xStartLabel={`-${trendWindow}`}
+            xEndLabel="now"
+            yMin={0}
+            yMax={100}
+            yTickCount={4}
+          />
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+export default function SystemOverview({ active }: Props) {
+  const [staticInfo, setStaticInfo] = useState<StaticInfoData | null>(null)
+  const [dynamicInfo, setDynamicInfo] = useState<DynamicInfoData | null>(null)
+  const [loadingStatic, setLoadingStatic] = useState(false)
+  const [loadingDynamic, setLoadingDynamic] = useState(false)
+  const [errorStatic, setErrorStatic] = useState<string | null>(null)
+  const [errorDynamic, setErrorDynamic] = useState<string | null>(null)
+
+  const [refreshIntervalMs, setRefreshIntervalMs] = useState<number>(DEFAULT_REFRESH_INTERVAL_MS)
+  const [trendWindow, setTrendWindow] = useState<'1m' | '5m'>('1m')
+  const [gpuFilter, setGpuFilter] = useState<string>('all')
+  const [sparkMode, setSparkMode] = useState<SparkMode>('compact')
+  const [showCpuDetails, setShowCpuDetails] = useState(true)
+  const [showGpuDetails, setShowGpuDetails] = useState(true)
+  const [trends, setTrends] = useState<TrendSeries>({})
+
+  const pushTrendPoints = useCallback((updates: Record<string, number | null>) => {
+    setTrends((prev) => {
+      const next: TrendSeries = { ...prev }
+      Object.entries(updates).forEach(([key, value]) => {
+        const current = prev[key] || []
+        const updated = [...current, value]
+        if (updated.length > TREND_STORAGE_MAX_POINTS) {
+          updated.splice(0, updated.length - TREND_STORAGE_MAX_POINTS)
+        }
+        next[key] = updated
+      })
+      return next
+    })
+  }, [])
+
+  const fetchStatic = useCallback(async () => {
+    if (!active) return
+    setLoadingStatic(true)
+    try {
+      const data = await api.getStaticInfo()
+      setStaticInfo(data)
+      setErrorStatic(null)
+    } catch (e: unknown) {
+      setErrorStatic(e instanceof Error ? e.message : 'Failed to fetch static info')
+    } finally {
+      setLoadingStatic(false)
+    }
+  }, [active])
+
+  const refreshStatic = useCallback(async () => {
+    if (!active) return
+    setLoadingStatic(true)
+    try {
+      const data = await api.refreshStaticInfo()
+      setStaticInfo(data)
+      setErrorStatic(null)
+    } catch (e: unknown) {
+      setErrorStatic(e instanceof Error ? e.message : 'Failed to refresh info')
+    } finally {
+      setLoadingStatic(false)
+    }
+  }, [active])
+
+  const fetchDynamic = useCallback(async () => {
+    if (!active) return
+    setLoadingDynamic(true)
+    try {
+      const data = await api.getDynamicInfo()
+      setDynamicInfo(data)
+      setErrorDynamic(null)
+
+      const updates: Record<string, number | null> = {
+        'pressure:cpu': normalizePercent(data.pressure?.cpu),
+        'pressure:memory': normalizePercent(data.pressure?.memory),
+        'pressure:io': normalizePercent(data.pressure?.io),
+        'npu:availability': data.npu.npu_smi.available ? 100 : 0,
+        'cpu:p': normalizePercent(data.cpu.p_core_usage),
+        'cpu:e': normalizePercent(data.cpu.e_core_usage),
+        'util:cpu': normalizePercent(data.cpu.usage_total),
+        'util:memory': normalizePercent(data.memory.usage_percent),
+      }
+
+      const pressureValues = [updates['pressure:cpu'], updates['pressure:memory'], updates['pressure:io']].filter(isNumber)
+      updates['pressure:peak'] = pressureValues.length ? Math.max(...pressureValues) : null
+
+      data.cpu.per_core_usage.forEach((value, index) => {
+        updates[`cpu:core:${index}`] = normalizePercent(value)
+        updates[`cpu:core_freq:${index}`] = isNumber(data.cpu.per_core_freq_mhz?.[index])
+          ? data.cpu.per_core_freq_mhz[index]
+          : null
+      })
+
+      const dynamicDiskDevices = Object.values(data.disk?.disk_io || {})
+      updates['util:disk'] = dynamicDiskDevices.length
+        ? Math.max(...dynamicDiskDevices.map((disk) => normalizePercent(disk.utilization) || 0))
+        : null
+
+      const primaryInterface = typeof staticInfo?.io.primary_interface === 'string'
+        ? staticInfo.io.primary_interface
+        : null
+      const selectedNetwork = primaryInterface && data.network?.interfaces?.[primaryInterface]
+        ? data.network.interfaces[primaryInterface]
+        : data.network?.total
+      const selectedRx = isNumber(selectedNetwork?.rx_bytes_per_sec) ? selectedNetwork.rx_bytes_per_sec : null
+      const selectedTx = isNumber(selectedNetwork?.tx_bytes_per_sec) ? selectedNetwork.tx_bytes_per_sec : null
+
+      const primaryBandwidthMbps = primaryInterface
+        ? staticInfo?.io.network_speeds_mbps?.[primaryInterface]
+        : null
+      const totalBandwidthMbps = isNumber(primaryBandwidthMbps) && primaryBandwidthMbps > 0
+        ? primaryBandwidthMbps
+        : (isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
+            ? staticInfo.io.network_peak_mbps
+            : null)
+
+      const rxNetworkUtil = calcBandwidthUtilization(selectedRx, totalBandwidthMbps)
+      const txNetworkUtil = calcBandwidthUtilization(selectedTx, totalBandwidthMbps)
+      updates['util:network:rx'] = rxNetworkUtil
+      updates['util:network:tx'] = txNetworkUtil
+      const networkUtilValues = [rxNetworkUtil, txNetworkUtil].filter(isNumber)
+      updates['util:network'] = networkUtilValues.length ? Math.max(...networkUtilValues) : null
+
+      const gpuDevices = buildGpuDevices(staticInfo, data)
+      const gpuUtils: number[] = []
+      gpuDevices.forEach((device) => {
+        updates[`gpu:${device.id}:util`] = device.utilization
+        updates[`gpu:${device.id}:power:gpu_cur_power`] = device.powerGpu
+        updates[`gpu:${device.id}:power:pkg_cur_power`] = device.powerPkg
+        updates[`gpu:${device.id}:freq:gt0:cur_mhz`] = device.frequencies.gt0?.act_mhz ?? device.frequencies.gt0?.cur_mhz ?? null
+        updates[`gpu:${device.id}:freq:gt1:cur_mhz`] = device.frequencies.gt1?.act_mhz ?? device.frequencies.gt1?.cur_mhz ?? null
+        if (isNumber(device.utilization)) gpuUtils.push(device.utilization)
+        ENGINE_ORDER.forEach((engine) => {
+          updates[`gpu:${device.id}:engine:${engine}`] = device.engineUtil[engine]
+        })
+      })
+      updates['gpu:aggregate'] = gpuUtils.length ? Math.max(...gpuUtils) : null
+
+      pushTrendPoints(updates)
+    } catch (e: unknown) {
+      setErrorDynamic(e instanceof Error ? e.message : 'Failed to fetch dynamic info')
+    } finally {
+      setLoadingDynamic(false)
+    }
+  }, [active, pushTrendPoints, staticInfo])
+
+  useEffect(() => {
+    fetchStatic()
+  }, [fetchStatic])
+
+  usePolling(fetchDynamic, refreshIntervalMs, active)
+
+  const gpuDevices = useMemo(() => buildGpuDevices(staticInfo, dynamicInfo), [staticInfo, dynamicInfo])
+
+  useEffect(() => {
+    if (gpuFilter !== 'all' && !gpuDevices.some((d) => d.id === gpuFilter)) {
+      setGpuFilter('all')
+    }
+  }, [gpuFilter, gpuDevices])
+
+  const oneMinPoints = useMemo(
+    () => Math.max(1, Math.round((60 * 1000) / refreshIntervalMs)),
+    [refreshIntervalMs],
+  )
+  const fiveMinPoints = useMemo(
+    () => Math.max(1, Math.round((5 * 60 * 1000) / refreshIntervalMs)),
+    [refreshIntervalMs],
+  )
+  const trendPoints = trendWindow === '1m' ? oneMinPoints : fiveMinPoints
+  const getSeries = useCallback(
+    (key: string) => {
+      const values = trends[key] || []
+      return values.slice(-trendPoints)
+    },
+    [trends, trendPoints],
+  )
+
+  const filteredGpuDevices = useMemo(() => {
+    if (gpuFilter === 'all') return gpuDevices
+    return gpuDevices.filter((d) => d.id === gpuFilter)
+  }, [gpuDevices, gpuFilter])
+
+  const networkUtilizationSeries = useMemo(
+    () => [
+      {
+        key: 'rx',
+        label: 'RX BW %',
+        data: getSeries('util:network:rx'),
+        stroke: PERF_COLORS.network,
+      },
+      {
+        key: 'tx',
+        label: 'TX BW %',
+        data: getSeries('util:network:tx'),
+        stroke: PERF_COLORS.gpu,
+      },
+    ],
+    [getSeries],
+  )
+
+  const gpuUtilizationSeries = useMemo(
+    () => gpuDevices.map((device, index) => ({
+      key: `gpu-util-${device.id}`,
+      label: `${device.label} Util %`,
+      data: getSeries(`gpu:${device.id}:util`),
+      stroke: GPU_UTIL_COLORS[index % GPU_UTIL_COLORS.length],
+    })),
+    [gpuDevices, getSeries],
+  )
+
+  const gpuSplitBars = useMemo(
+    () => gpuDevices.map((device, index) => ({
+      key: `gpu-bar-${device.id}`,
+      label: device.label,
+      value: device.utilization,
+      color: GPU_UTIL_COLORS[index % GPU_UTIL_COLORS.length],
+    })),
+    [gpuDevices],
+  )
+
+  const gpuAggregateUtil = useMemo(() => {
+    const values = gpuDevices.map((device) => device.utilization).filter(isNumber)
+    return values.length ? Math.max(...values) : null
+  }, [gpuDevices])
+
+  const gpuHasThrottle = useMemo(() => gpuDevices.some((device) => device.status === 'Throttle'), [gpuDevices])
+
+  const gpuCombinedStatus = useMemo(() => {
+    if (!gpuDevices.length) return undefined
+    if (gpuHasThrottle) return 'Throttle'
+    if (isNumber(gpuAggregateUtil) && gpuAggregateUtil >= 80) return 'Busy'
+    return 'OK'
+  }, [gpuDevices, gpuHasThrottle, gpuAggregateUtil])
+
+  const gpuCombinedStatusColor = useMemo(() => {
+    if (!gpuCombinedStatus) return COLORS.textMuted
+    if (gpuCombinedStatus === 'Throttle') return COLORS.orange
+    if (gpuCombinedStatus === 'Busy') return COLORS.red
+    return COLORS.green
+  }, [gpuCombinedStatus])
+
+  const gpuCombinedDetails = useMemo(
+    () => gpuDevices.flatMap((device) => [
+      {
+        label: `${device.label} Util`,
+        value: formatPercent(device.utilization),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} GT0 Actual`,
+        value: formatMetric(device.frequencies.gt0?.act_mhz, 'MHz', 0),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} GT1 Actual`,
+        value: formatMetric(device.frequencies.gt1?.act_mhz, 'MHz', 0),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} Static Freq Range`,
+        value: formatFreqRange(device.freqBounds.min_mhz, device.freqBounds.max_mhz),
+        source: 'static' as DataSourceKind,
+      },
+      {
+        label: `${device.label} Type`,
+        value: formatPlain(device.devType),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} Driver`,
+        value: formatPlain(device.driver),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} PCI`,
+        value: formatPlain(device.pci),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} GPU Power`,
+        value: formatMetric(device.powerGpu, 'W', 2),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} Package Power`,
+        value: formatMetric(device.powerPkg, 'W', 2),
+        source: 'dynamic' as DataSourceKind,
+      },
+      {
+        label: `${device.label} VRAM Usage`,
+        value: formatPercent(device.vramUsage),
+        source: 'dynamic' as DataSourceKind,
+      },
+    ]),
+    [gpuDevices],
+  )
+
+  const cpuSnapshotMeta = staticInfo?.cpu.model_name
+    ? `${staticInfo.cpu.core_count.logical} cores | ${staticInfo.cpu.model_name}`
+    : dynamicInfo?.cpu.per_core_usage?.length
+      ? `${dynamicInfo.cpu.per_core_usage.length} cores`
+      : 'No data'
+
+  const memorySnapshotMeta = staticInfo?.memory
+    ? `${formatMetric(staticInfo.memory.total_gb, 'GB', 1)} | ${staticInfo.memory.ddr_speeds.length ? staticInfo.memory.ddr_speeds.join('/') : 'DDR N/A'}`
+    : isNumber(dynamicInfo?.memory.total_gb)
+      ? `${dynamicInfo.memory.total_gb.toFixed(1)} GB total`
+      : 'No data'
+
+  const primaryInterfaceName = typeof staticInfo?.io.primary_interface === 'string'
+    ? staticInfo.io.primary_interface
+    : null
+  const selectedNetworkRates = primaryInterfaceName && dynamicInfo?.network?.interfaces?.[primaryInterfaceName]
+    ? dynamicInfo.network.interfaces[primaryInterfaceName]
+    : dynamicInfo?.network?.total
+  const selectedRxRate = isNumber(selectedNetworkRates?.rx_bytes_per_sec) ? selectedNetworkRates.rx_bytes_per_sec : null
+  const selectedTxRate = isNumber(selectedNetworkRates?.tx_bytes_per_sec) ? selectedNetworkRates.tx_bytes_per_sec : null
+
+  const primaryBandwidthMbps = primaryInterfaceName
+    ? staticInfo?.io.network_speeds_mbps?.[primaryInterfaceName]
+    : null
+  const totalBandwidthMbps = isNumber(primaryBandwidthMbps) && primaryBandwidthMbps > 0
+    ? primaryBandwidthMbps
+    : (isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
+        ? staticInfo.io.network_peak_mbps
+        : null)
+
+  const rxNetworkUtil = calcBandwidthUtilization(selectedRxRate, totalBandwidthMbps)
+  const txNetworkUtil = calcBandwidthUtilization(selectedTxRate, totalBandwidthMbps)
+  const networkUtilValues = [rxNetworkUtil, txNetworkUtil].filter(isNumber)
+  const networkUtilMax = networkUtilValues.length ? Math.max(...networkUtilValues) : null
+
+  const networkSnapshotMeta = staticInfo?.io
+    ? `NIC ${formatPlain(staticInfo.io.nic_count)} | ${primaryInterfaceName || 'No primary'} | BW ${formatNetworkSpeed(totalBandwidthMbps)}`
+    : (isNumber(rxNetworkUtil) || isNumber(txNetworkUtil))
+      ? `RX ${formatPercent(rxNetworkUtil, 1)} / TX ${formatPercent(txNetworkUtil, 1)}`
+      : 'No data'
+
+  const npuSnapshotMeta = staticInfo?.npu.names?.length
+    ? staticInfo.npu.names.join(', ')
+    : dynamicInfo?.npu.npu_smi.error || 'npu-smi'
+
+  const diskDevices = dynamicInfo?.disk?.disk_io ? Object.entries(dynamicInfo.disk.disk_io) : []
+  const busiestDisk = diskDevices.length
+    ? [...diskDevices].sort((a, b) => {
+        const left = normalizePercent(a[1]?.utilization) || 0
+        const right = normalizePercent(b[1]?.utilization) || 0
+        return right - left
+      })[0]
+    : null
+  const maxDiskUtil = busiestDisk ? normalizePercent(busiestDisk[1]?.utilization) : null
+
+  const pressureCpu = normalizePercent(dynamicInfo?.pressure?.cpu)
+  const pressureMemory = normalizePercent(dynamicInfo?.pressure?.memory)
+  const pressureIo = normalizePercent(dynamicInfo?.pressure?.io)
+  const systemPressurePct = isNumber(pressureCpu) && isNumber(pressureMemory) ? (pressureCpu + pressureMemory) / 2 : null
+  const diskPressurePct = pressureIo
+  const networkPressurePct = networkUtilMax
+
+  const npuValue = dynamicInfo ? (dynamicInfo.npu.npu_smi.available ? 100 : 0) : null
+  const cpuTrendValue = normalizePercent(dynamicInfo?.cpu.usage_total ?? null)
+  const memoryTrendValue = normalizePercent(dynamicInfo?.memory.usage_percent ?? null)
+  const cpuBusy = isNumber(cpuTrendValue) ? cpuTrendValue >= 80 : false
+  const memoryBusy = isNumber(memoryTrendValue) ? memoryTrendValue >= 80 : false
+  const cpuTrendStatus = isNumber(cpuTrendValue) ? (cpuBusy ? 'Busy' : 'OK') : undefined
+  const memoryTrendStatus = isNumber(memoryTrendValue) ? (memoryBusy ? 'Busy' : 'OK') : undefined
+  const cpuTrendStatusColor = cpuTrendStatus ? (cpuBusy ? COLORS.red : COLORS.green) : COLORS.textMuted
+  const memoryTrendStatusColor = memoryTrendStatus ? (memoryBusy ? COLORS.red : COLORS.green) : COLORS.textMuted
+
+  const coreGroups = useMemo(() => {
+    const usage = dynamicInfo?.cpu.per_core_usage || []
+    const freqs = dynamicInfo?.cpu.per_core_freq_mhz || []
+    if (!usage.length) return [] as Array<{ label: string; type: 'P' | 'E' | 'Core'; indices: number[] }>
+
+    const p = dynamicInfo?.cpu.p_core_indices || []
+    const e = dynamicInfo?.cpu.e_core_indices || []
+
+    if (p.length || e.length) {
+      const groups: Array<{ label: string; type: 'P' | 'E' | 'Core'; indices: number[] }> = []
+      if (p.length) groups.push({ label: 'P-Cores', type: 'P', indices: p })
+      if (e.length) groups.push({ label: 'E-Cores', type: 'E', indices: e })
+      return groups
+    }
+
+    return [
+      {
+        label: 'CPU Cores',
+        type: 'Core',
+        indices: usage.map((_, i) => i).filter((i) => i < freqs.length || freqs.length === 0),
+      },
+    ]
+  }, [dynamicInfo])
+
+  const coreFreqAxisMax = useMemo(() => {
+    const staticMax = staticInfo?.cpu.freq_mhz.max_mhz
+    const dynamicMax = Math.max(
+      0,
+      ...(dynamicInfo?.cpu.per_core_freq_mhz || []).map((value) => (isNumber(value) ? value : 0))
+    )
+    const candidate = isNumber(staticMax) ? staticMax : dynamicMax
+    if (!isNumber(candidate) || candidate <= 0) return 1000
+    return Math.max(1000, Math.ceil(candidate / 100) * 100)
+  }, [staticInfo?.cpu.freq_mhz.max_mhz, dynamicInfo?.cpu.per_core_freq_mhz])
+
+  const environmentCoreItems = useMemo(() => {
+    return [
+      { label: 'OS version', value: formatPlain(staticInfo?.os.version) },
+      { label: 'BIOS version', value: formatPlain(staticInfo?.bios.version) },
+      { label: 'Kernel version', value: formatPlain(staticInfo?.driver.kernel_version) },
+      { label: 'NPU FW', value: formatPlain(staticInfo?.driver.npu_fw) },
+    ]
+  }, [staticInfo])
+
+  const gpuDriverItems = useMemo(() => {
+    return [
+      { label: 'Mesa', value: formatPackageText(staticInfo?.driver.mesa) },
+      { label: 'OpenCL', value: formatPackageText(staticInfo?.driver.opencl) },
+      { label: 'Level Zero', value: formatPackageText(staticInfo?.driver.level_zero) },
+      { label: 'Media', value: formatPackageText(staticInfo?.driver.media) },
+    ]
+  }, [staticInfo])
+
+  const cpuStaticFreqText = useMemo(
+    () => formatFreqRange(staticInfo?.cpu.freq_mhz.min_mhz, staticInfo?.cpu.freq_mhz.max_mhz),
+    [staticInfo?.cpu.freq_mhz.min_mhz, staticInfo?.cpu.freq_mhz.max_mhz]
+  )
+
+  const npuStaticFreqText = useMemo(
+    () => summarizeFreqBounds(staticInfo?.npu.freq_bounds_mhz),
+    [staticInfo?.npu.freq_bounds_mhz]
+  )
+
+  const networkPeakText = useMemo(
+    () => formatNetworkSpeed(staticInfo?.io.network_peak_mbps),
+    [staticInfo?.io.network_peak_mbps]
+  )
+
+  const networkSpeedMapText = useMemo(
+    () => summarizeNetworkSpeeds(staticInfo?.io.network_speeds_mbps),
+    [staticInfo?.io.network_speeds_mbps]
+  )
+
+  const diskStaticTotalText = useMemo(
+    () => (isNumber(staticInfo?.disk.total_size_gb) ? `${staticInfo?.disk.total_size_gb.toFixed(2)} GB` : 'N/A'),
+    [staticInfo?.disk.total_size_gb]
+  )
+
+  const diskStaticDevicesText = useMemo(
+    () => `${staticInfo?.disk.device_count ?? 0} device(s) | ${summarizeDiskSizes(staticInfo?.disk.devices)}`,
+    [staticInfo?.disk.device_count, staticInfo?.disk.devices]
+  )
+
+  const gpuFilterOptions = useMemo(() => {
+    const options: Array<{ label: string; value: string }> = [{ label: 'All GPU', value: 'all' }]
+    gpuDevices.forEach((device) => {
+      options.push({ label: device.label, value: device.id })
+    })
+    return options
+  }, [gpuDevices])
+
+  return (
+    <div className="perf-root">
+      <div className="perf-ambient perf-ambient--blue" />
+      <div className="perf-ambient perf-ambient--orange" />
+      <div className="perf-ambient perf-ambient--teal" />
+
+      <div className="perf-header">
+        <div>
+          <Title level={3} style={{ color: COLORS.text, margin: 0 }}>
+            Performance
+          </Title>
+          <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
+            Multi-GPU + per-engine + per-core telemetry
+          </Text>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Space size={6}>
+            <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>Refresh</Text>
+            <Segmented
+              size="small"
+              options={REFRESH_INTERVAL_OPTIONS}
+              value={refreshIntervalMs}
+              onChange={(value) => setRefreshIntervalMs(Number(value))}
+            />
+          </Space>
+          <Badge status="processing" color={COLORS.green} />
+          <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>Streaming</Text>
+          {dynamicInfo?.collected_at && (
+            <Tag style={{ fontSize: 10, color: COLORS.textMuted, borderColor: COLORS.border }}>
+              {dynamicInfo.collected_at}
+            </Tag>
+          )}
+        </div>
+      </div>
+
+      <Card className="perf-card perf-env-strip perf-rise perf-static-card" bodyStyle={{ padding: 10, marginBottom: 12 }}>
+        <div className="perf-env-header">
+          <Text className="perf-env-title">Software Configuration</Text>
+          <Space size={8}>
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={refreshStatic}
+              loading={loadingStatic}
+            >
+              Refresh
+            </Button>
+            {loadingStatic && !staticInfo ? <Spin size="small" /> : null}
+          </Space>
+        </div>
+
+        <div className="perf-env-core-grid">
+          {environmentCoreItems.map((item) => (
+            <div key={item.label} className="perf-env-item">
+              <Text className="perf-env-item-label">{item.label}</Text>
+              <Text className="perf-env-item-value" title={item.value}>{item.value}</Text>
+            </div>
+          ))}
+        </div>
+
+        <div className="perf-env-driver-section">
+          <Text className="perf-env-driver-title">GPU Driver</Text>
+          <div className="perf-env-driver-grid">
+            {gpuDriverItems.map((item) => (
+              <div key={item.label} className="perf-env-driver-item">
+                <Text className="perf-env-driver-label">{item.label}</Text>
+                <Text className="perf-env-driver-value" title={item.value}>{item.value}</Text>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
+
+      {errorStatic && (
+        <Alert message="Static Info Error" description={errorStatic} type="warning" showIcon style={{ marginBottom: 12 }} />
+      )}
+
+      {errorDynamic && (
+        <Alert message="Dynamic Info Error" description={errorDynamic} type="error" showIcon style={{ marginBottom: 12 }} />
+      )}
+
+      <Card className="perf-card perf-rise" bodyStyle={{ padding: 18, marginBottom: 18 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+          <Space size={8}>
+            <AlertOutlined style={{ color: PERF_COLORS.pressure }} />
+            <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>Pressure Overview</Text>
+          </Space>
+          <Tag
+            style={{
+              color: systemPressurePct !== null ? getPressureColor(systemPressurePct / 100) : PERF_COLORS.pressure,
+              borderColor: systemPressurePct !== null ? getPressureColor(systemPressurePct / 100) : PERF_COLORS.pressure,
+              background: `${PERF_COLORS.pressure}22`,
+              fontSize: 10,
+              letterSpacing: 1,
+            }}
+          >
+            {systemPressurePct !== null ? getPressureLabel(systemPressurePct / 100) : 'N/A'}
+          </Tag>
+        </div>
+        <Row gutter={[16, 12]}>
+          <Col xs={24} md={8}>
+            <PressurePointerGauge
+              title="System Pressure"
+              valuePct={systemPressurePct}
+              subtitle={`CPU: ${formatPercent(pressureCpu, 0)} | Mem: ${formatPercent(pressureMemory, 0)}`}
+              description="Combined CPU + Memory pressure"
+            />
+          </Col>
+          <Col xs={24} md={8}>
+            <PressurePointerGauge
+              title="Disk IO Pressure"
+              valuePct={diskPressurePct}
+              subtitle={`IO: ${formatPercent(pressureIo, 0)}`}
+              description="Disk I/O saturation"
+            />
+          </Col>
+          <Col xs={24} md={8}>
+            <PressurePointerGauge
+              title="Network IO Pressure"
+              valuePct={networkPressurePct}
+              subtitle={isNumber(rxNetworkUtil) || isNumber(txNetworkUtil) ? `RX: ${formatPercent(rxNetworkUtil, 0)} | TX: ${formatPercent(txNetworkUtil, 0)}` : undefined}
+              description="Network bandwidth utilization"
+            />
+          </Col>
         </Row>
       </Card>
 
-      {/* ── Detail cards ──────────────────────────────────────────────────── */}
-      <Row gutter={[12, 12]}>
+      <SectionTitle
+        title="Utilization Insights"
+        subtitle="Overall utilization + trend details in one unified view"
+        action={
+          <Space wrap>
+            {loadingDynamic && !dynamicInfo ? <Spin size="small" /> : null}
+            <Segmented
+              value={trendWindow}
+              onChange={(value) => setTrendWindow(value as '1m' | '5m')}
+              options={['1m', '5m']}
+            />
+            <Segmented
+              value={sparkMode}
+              onChange={(value) => setSparkMode(value as SparkMode)}
+              options={[
+                { label: 'Compact', value: 'compact' },
+                { label: 'Axis', value: 'axis' },
+                { label: 'Points', value: 'points' },
+              ]}
+            />
+          </Space>
+        }
+      />
 
-        {/* CPU */}
-        <Col xs={24} sm={12} xl={6}>
-          <PanelCard
+      <Row className="perf-insights-grid" gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        <Col xs={24} md={12} xl={8}>
+          <TrendPanel
             title="CPU"
-            icon={<ThunderboltOutlined style={{ color: COLORS.accent }} />}
-            loading={loading && !cpu}
-            error={errors.cpu}
-            extra={cpu && (
-              <Tag color={cpu.is_busy ? 'error' : 'success'} style={{ fontSize: 10 }}>
-                {cpu.is_busy ? 'BUSY' : 'OK'}
-              </Tag>
-            )}
-          >
-            {cpu && (
-              <>
-                <MetricRow label="Core Count" value={cpu.count} />
-                <MetricRow label="Usage" value={`${(cpu.usage * 100).toFixed(1)}`} unit="%" />
-                <MetricRow label="Available" value={`${(cpu.available * 100).toFixed(1)}`} unit="%" />
-                <div style={{ marginTop: 10 }}>
-                  <UsageBar value={cpu.usage} label="Overall Usage" />
-                </div>
-              </>
-            )}
-          </PanelCard>
+            accent={PERF_COLORS.cpu}
+            value={cpuTrendValue}
+            unit="%"
+            status={cpuTrendStatus}
+            statusColor={cpuTrendStatusColor}
+            series={getSeries('util:cpu')}
+            subtitle={cpuSnapshotMeta}
+            details={[
+              { label: 'Static Freq Range', value: cpuStaticFreqText, source: 'static' },
+              { label: 'P-Core Usage', value: formatPercent(dynamicInfo?.cpu.p_core_usage), source: 'dynamic' },
+              { label: 'E-Core Usage', value: formatPercent(dynamicInfo?.cpu.e_core_usage), source: 'dynamic' },
+              { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu.p_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
+              { label: 'E-Core Freq', value: formatMetric(dynamicInfo?.cpu.e_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
+            ]}
+            sparkMode={sparkMode}
+            trendWindow={trendWindow}
+          />
         </Col>
 
-        {/* Memory */}
-        <Col xs={24} sm={12} xl={6}>
-          <PanelCard
-            title="System Memory"
-            icon={<ApiOutlined style={{ color: '#f7c948' }} />}
-            loading={loading && !memory}
-            error={errors.memory}
-            extra={memory && (
-              <Tag color={memory.is_busy ? 'error' : 'success'} style={{ fontSize: 10 }}>
-                {memory.is_busy ? 'BUSY' : 'OK'}
-              </Tag>
-            )}
-          >
-            {memory && (
-              <>
-                <MetricRow label="Total" value={memory.total_gb.toFixed(1)} unit="GB" />
-                <MetricRow label="Usage" value={`${(memory.usage * 100).toFixed(1)}`} unit="%" />
-                <MetricRow label="Available" value={`${(memory.available_ratio * 100).toFixed(1)}`} unit="%" />
-                <div style={{ marginTop: 10 }}>
-                  <UsageBar value={memory.usage} label="Memory Usage" />
-                </div>
-              </>
-            )}
-          </PanelCard>
+        <Col xs={24} md={12} xl={8}>
+          <TrendPanel
+            title="Memory"
+            accent={PERF_COLORS.memory}
+            value={memoryTrendValue}
+            unit="%"
+            status={memoryTrendStatus}
+            statusColor={memoryTrendStatusColor}
+            series={getSeries('util:memory')}
+            subtitle={memorySnapshotMeta}
+            details={[
+              { label: 'Available', value: formatMetric(dynamicInfo?.memory.available_gb, 'GB', 1), source: 'dynamic' },
+              { label: 'Usage', value: formatPercent(memoryTrendValue), source: 'dynamic' },
+            ]}
+            sparkMode={sparkMode}
+            trendWindow={trendWindow}
+          />
         </Col>
 
-        {/* Disk IO */}
-        <Col xs={24} sm={12} xl={6}>
-          <PanelCard
+        <Col xs={24} md={12} xl={8}>
+          <TrendPanel
             title="Disk IO"
-            icon={<HddOutlined style={{ color: '#e05c5c' }} />}
-            loading={loading && !disk}
-            error={errors.disk}
-          >
-            {diskDevices.length === 0 && !loading ? (
-              <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>No disk devices found</Text>
-            ) : (
-              diskDevices.map(([device, data]) => (
-                <div key={device} style={{ marginBottom: 12 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <Text style={{ color: COLORS.accent, fontSize: 12, fontWeight: 600 }}>{device}</Text>
-                    <Tag color={data.is_busy ? 'error' : 'success'} style={{ fontSize: 10, margin: 0 }}>
-                      {data.is_busy ? 'BUSY' : 'IDLE'}
-                    </Tag>
-                  </div>
-                  <MetricRow label="Read" value={data.read_kb_per_sec.toFixed(1)} unit="KB/s" />
-                  <MetricRow label="Write" value={data.write_kb_per_sec.toFixed(1)} unit="KB/s" />
-                  <UsageBar value={data.utilization} label="Utilization" />
-                </div>
-              ))
-            )}
-          </PanelCard>
-        </Col>
-
-        {/* Network IO */}
-        <Col xs={24} sm={12} xl={6}>
-          <PanelCard
-            title="Network IO"
-            icon={<WifiOutlined style={{ color: '#52c41a' }} />}
-            loading={loading && !network}
-            error={errors.network}
-          >
-            {network && (
-              <>
-                <div style={{ marginBottom: 10 }}>
-                  <UsageBar value={network.rx} label="RX" />
-                  <UsageBar value={network.tx} label="TX" />
-                </div>
-                <MetricRow label="RX" value={`${(network.rx * 100).toFixed(1)}`} unit="% BW" />
-                <MetricRow label="TX" value={`${(network.tx * 100).toFixed(1)}`} unit="% BW" />
-              </>
-            )}
-          </PanelCard>
-        </Col>
-
-        {/* iGPU */}
-        <Col xs={24} sm={12} xl={8}>
-          <UnavailableCard
-            title="iGPU (Integrated)"
-            icon={<ThunderboltOutlined style={{ color: '#a855f7' }} />}
-            rows={['Name', 'EU Count', 'Min Freq', 'Max Freq', 'TDP', 'RCS Usage', 'VCS Usage', 'Power']}
+            accent={PERF_COLORS.disk}
+            value={maxDiskUtil}
+            unit="%"
+            status={busiestDisk ? (busiestDisk[1].is_busy ? 'Busy' : 'OK') : undefined}
+            statusColor={busiestDisk?.[1].is_busy ? COLORS.red : COLORS.green}
+            series={getSeries('util:disk')}
+            subtitle={busiestDisk ? `busiest disk: ${busiestDisk[0]}` : 'No data'}
+            details={[
+              { label: 'Read', value: formatMetric(busiestDisk?.[1].read_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
+              { label: 'Write', value: formatMetric(busiestDisk?.[1].write_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
+              { label: 'Utilization', value: formatPercent(busiestDisk?.[1].utilization), source: 'dynamic' },
+              { label: 'Static Disk Total', value: diskStaticTotalText, source: 'static' },
+              { label: 'Disk Device Sizes', value: diskStaticDevicesText, source: 'static' },
+            ]}
+            sparkMode={sparkMode}
+            trendWindow={trendWindow}
           />
         </Col>
 
-        {/* dGPU */}
-        <Col xs={24} sm={12} xl={8}>
-          <UnavailableCard
-            title="dGPU (Discrete)"
-            icon={<DeploymentUnitOutlined style={{ color: '#f59e0b' }} />}
-            rows={['Name', 'Count', 'Min Freq', 'Max Freq', 'TDP', 'BCS Usage', 'CCS Usage', 'Power']}
+        <Col xs={24} md={12} xl={8}>
+          <TrendPanel
+            title="Network"
+            accent={PERF_COLORS.network}
+            value={networkUtilMax}
+            unit="%"
+            status={isNumber(networkUtilMax) ? (networkUtilMax >= 80 ? 'Busy' : 'OK') : undefined}
+            statusColor={isNumber(networkUtilMax) && networkUtilMax >= 80 ? COLORS.red : PERF_COLORS.network}
+            series={getSeries('util:network')}
+            multiSeries={networkUtilizationSeries}
+            splitBars={[
+              { key: 'rx-bar', label: 'RX', value: rxNetworkUtil, color: PERF_COLORS.network },
+              { key: 'tx-bar', label: 'TX', value: txNetworkUtil, color: PERF_COLORS.gpu },
+            ]}
+            subtitle={`${networkSnapshotMeta} | Total = max(RX, TX)`}
+            details={[
+              { label: 'Total Util (max)', value: formatPercent(networkUtilMax), source: 'dynamic' },
+              { label: 'RX BW Util', value: formatPercent(rxNetworkUtil), source: 'dynamic' },
+              { label: 'TX BW Util', value: formatPercent(txNetworkUtil), source: 'dynamic' },
+              {
+                label: 'RX Rate',
+                value: formatMetric(selectedRxRate, 'B/s', 0),
+                source: 'dynamic',
+              },
+              {
+                label: 'TX Rate',
+                value: formatMetric(selectedTxRate, 'B/s', 0),
+                source: 'dynamic',
+              },
+              { label: 'Total Bandwidth', value: formatNetworkSpeed(totalBandwidthMbps), source: 'static' },
+              { label: 'Total RX', value: formatMetric(dynamicInfo?.network?.total.rx_bytes_per_sec, 'B/s', 0), source: 'dynamic' },
+              { label: 'Total TX', value: formatMetric(dynamicInfo?.network?.total.tx_bytes_per_sec, 'B/s', 0), source: 'dynamic' },
+              { label: 'Network Peak', value: networkPeakText, source: 'static' },
+              { label: 'NIC Speeds', value: networkSpeedMapText, source: 'static' },
+            ]}
+            sparkMode={sparkMode}
+            trendWindow={trendWindow}
           />
         </Col>
 
-        {/* NPU */}
-        <Col xs={24} sm={12} xl={8}>
-          <UnavailableCard
+        <Col xs={24} md={12} xl={8}>
+          <TrendPanel
+            title="GPU (iGPU + dGPU)"
+            accent={PERF_COLORS.gpu}
+            value={gpuAggregateUtil}
+            unit="%"
+            status={gpuCombinedStatus}
+            statusColor={gpuCombinedStatusColor}
+            series={getSeries('gpu:aggregate')}
+            multiSeries={gpuUtilizationSeries}
+            splitBars={gpuSplitBars}
+            subtitle={gpuDevices.length ? gpuDevices.map((device) => `${device.label} ${device.devType}`).join(' | ') : 'No data'}
+            details={gpuCombinedDetails}
+            sparkMode={sparkMode}
+            trendWindow={trendWindow}
+          />
+        </Col>
+
+        <Col xs={24} md={12} xl={8}>
+          <TrendPanel
             title="NPU"
-            icon={<RobotOutlined style={{ color: '#06b6d4' }} />}
-            rows={['Min Freq', 'Max Freq', 'Tile Count', 'Usage', 'Power', 'Thermal']}
+            accent={PERF_COLORS.npu}
+            value={npuValue}
+            unit="%"
+            status={dynamicInfo ? (dynamicInfo.npu.npu_smi.available ? 'OK' : 'Offline') : undefined}
+            statusColor={dynamicInfo?.npu.npu_smi.available ? COLORS.green : COLORS.textMuted}
+            series={getSeries('npu:availability')}
+            subtitle={npuSnapshotMeta}
+            details={[
+              { label: 'Tool', value: 'intel-npu-smi', source: 'static' },
+              { label: 'Available', value: dynamicInfo?.npu.npu_smi.available ? 'Yes' : 'No', source: 'dynamic' },
+              { label: 'Error', value: dynamicInfo?.npu.npu_smi.error || 'None', source: 'dynamic' },
+              { label: 'Raw Output', value: dynamicInfo?.npu.npu_smi.raw ? 'Present' : 'N/A', source: 'dynamic' },
+              { label: 'Static Freq Bounds', value: npuStaticFreqText, source: 'static' },
+            ]}
+            sparkMode={sparkMode}
+            trendWindow={trendWindow}
           />
         </Col>
 
       </Row>
+
+      <SectionTitle
+        title="Per-Core CPU"
+        subtitle="Grouped by P / E cores with dual-axis util/freq trends"
+        action={
+          <Button
+            size="small"
+            type="text"
+            className="perf-toggle-btn"
+            icon={showCpuDetails ? <UpOutlined /> : <DownOutlined />}
+            onClick={() => setShowCpuDetails((prev) => !prev)}
+          >
+            {showCpuDetails ? 'Collapse' : 'Expand'}
+          </Button>
+        }
+      />
+
+      {showCpuDetails && (
+      <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        {coreGroups.length === 0 ? (
+          <Col span={24}>
+            <Card className="perf-card" bodyStyle={{ padding: 16 }}>
+              <Text style={{ color: COLORS.textMuted }}>No per-core CPU data</Text>
+            </Card>
+          </Col>
+        ) : (
+          coreGroups.map((group) => (
+            <Col key={group.label} xs={24} xl={12}>
+              <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                  <Space size={8}>
+                    <ThunderboltOutlined style={{ color: PERF_COLORS.cpu }} />
+                    <Text style={{ color: COLORS.text, fontWeight: 600 }}>{group.label}</Text>
+                  </Space>
+                  <Tag style={{ fontSize: 10 }}>{group.indices.length} cores</Tag>
+                </div>
+                {(() => {
+                  const groupCores = group.indices.map((coreIndex) => ({
+                    coreIndex,
+                    usage: dynamicInfo?.cpu.per_core_usage?.[coreIndex] ?? null,
+                    freq: dynamicInfo?.cpu.per_core_freq_mhz?.[coreIndex] ?? null,
+                    trend: getSeries(`cpu:core:${coreIndex}`),
+                    freqTrend: getSeries(`cpu:core_freq:${coreIndex}`),
+                  }))
+                  const freqValues = groupCores.flatMap((item) => [item.freq, ...item.freqTrend])
+                  const groupUtilAxis = { min: 0, max: 100 }
+                  const groupFreqAxis = getAdaptiveAxis(freqValues, null, {
+                    lower: 0,
+                    upper: Math.max(1000, coreFreqAxisMax),
+                    minRange: 200,
+                    padding: 60,
+                    step: 20,
+                  })
+
+                  return (
+                <div className="perf-core-grid">
+                  {groupCores.map((core) => (
+                    <CoreCell
+                      key={`${group.label}-${core.coreIndex}`}
+                      index={core.coreIndex}
+                      usage={core.usage}
+                      freq={core.freq}
+                      type={group.type}
+                      trend={core.trend}
+                      freqTrend={core.freqTrend}
+                      trendWindow={trendWindow}
+                      utilAxis={groupUtilAxis}
+                      freqAxis={groupFreqAxis}
+                    />
+                  ))}
+                </div>
+                  )
+                })()}
+              </Card>
+            </Col>
+          ))
+        )}
+      </Row>
+      )}
+
+      <SectionTitle
+        title="GPU Devices"
+        subtitle="Device-level telemetry (iGPU / dGPU) with engine trends"
+        action={
+          <Space wrap>
+            <Button
+              size="small"
+              type="text"
+              className="perf-toggle-btn"
+              icon={showGpuDetails ? <UpOutlined /> : <DownOutlined />}
+              onClick={() => setShowGpuDetails((prev) => !prev)}
+            >
+              {showGpuDetails ? 'Collapse' : 'Expand'}
+            </Button>
+            <Segmented
+              value={gpuFilter}
+              onChange={(value) => setGpuFilter(value as string)}
+              options={gpuFilterOptions}
+            />
+          </Space>
+        }
+      />
+
+      {showGpuDetails && (
+      <Row className="perf-gpu-devices-row" gutter={[16, 16]} style={{ marginBottom: 24 }}>
+        {filteredGpuDevices.length === 0 ? (
+          <Col span={24}>
+            <Card className="perf-card" bodyStyle={{ padding: 16 }}>
+              <Text style={{ color: COLORS.textMuted }}>No GPU device data</Text>
+            </Card>
+          </Col>
+        ) : (
+          filteredGpuDevices.map((device) => (
+            <Col span={24} key={device.id}>
+              <GpuDeviceCard
+                device={device}
+                trendWindow={trendWindow}
+                getSeries={getSeries}
+                sparkMode={sparkMode}
+              />
+            </Col>
+          ))
+        )}
+      </Row>
+      )}
+
+      {loadingDynamic && !dynamicInfo && (
+        <div style={{ marginTop: 16 }}>
+          <Spin size="small" />
+        </div>
+      )}
     </div>
   )
 }

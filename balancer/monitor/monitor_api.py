@@ -12,11 +12,14 @@
 #
 
 
+import json
 import threading
 import time
-from flask import Blueprint, jsonify
+from flask import Blueprint, request
 
+from db.DatabaseModel import MonitorSnapshot
 from monitor import ResourceMonitor, PSIMonitor, NetworkMonitor, PressureAnalyzer
+from monitor.system_info import collect_static_info, collect_dynamic_info
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -271,6 +274,180 @@ def get_top_consumers():
         )
     except Exception as e:
         logger.error(f"get_top_consumers failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/static_info', methods=['GET'])
+def get_static_info():
+    """
+    Return static system configuration info.
+
+    Response data:
+        {
+            "bios": { ... },
+            "os": { ... },
+            "driver": { ... },
+            "cpu": { ... },
+            "memory": { ... },
+            "io": { ... },
+            "gpu": { ... },
+            "npu": { ... },
+            "collected_at": <str>
+        }
+    """
+    try:
+        force_raw = (request.args.get('force_refresh') or '').strip().lower()
+        force_refresh = force_raw in {'1', 'true', 'yes', 'y', 'on'}
+        data = collect_static_info(force_refresh=force_refresh)
+        return construct_response(
+            data=data,
+            retmsg="Successfully retrieved static system info"
+        )
+    except Exception as e:
+        logger.error(f"get_static_info failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/dynamic_info', methods=['GET'])
+def get_dynamic_info():
+    """
+    Return dynamic system metrics snapshot.
+
+    Response data:
+        {
+            "cpu": { ... },
+            "memory": { ... },
+            "pressure": { ... },
+            "network": { ... },
+            "disk": { ... },
+            "gpu": { ... },
+            "npu": { ... },
+            "collected_at": <str>
+        }
+    """
+    try:
+        monitor = _get_resource_monitor()
+        data = collect_dynamic_info(resource_monitor=monitor)
+        return construct_response(
+            data=data,
+            retmsg="Successfully retrieved dynamic system info"
+        )
+    except Exception as e:
+        logger.error(f"get_dynamic_info failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/history', methods=['GET'])
+def get_history():
+    try:
+        snapshot_type = (request.args.get('snapshot_type') or '').strip().lower()
+        if snapshot_type in ('', 'all'):
+            snapshot_type = None
+        elif snapshot_type not in ('static', 'dynamic'):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="snapshot_type must be one of: static, dynamic, all"
+            )
+
+        limit_raw = request.args.get('limit', '100')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="limit must be an integer"
+            )
+
+        limit = max(1, min(limit, 1000))
+
+        start_raw = (request.args.get('start_time') or '').strip()
+        end_raw = (request.args.get('end_time') or '').strip()
+
+        start_time = None
+        end_time = None
+
+        if start_raw:
+            try:
+                start_time = int(start_raw)
+            except (TypeError, ValueError):
+                return construct_response(
+                    data={},
+                    retcode=RetCode.ARGUMENT_ERROR,
+                    retmsg="start_time must be a unix timestamp (seconds)"
+                )
+
+        if end_raw:
+            try:
+                end_time = int(end_raw)
+            except (TypeError, ValueError):
+                return construct_response(
+                    data={},
+                    retcode=RetCode.ARGUMENT_ERROR,
+                    retmsg="end_time must be a unix timestamp (seconds)"
+                )
+
+        if start_time is not None and end_time is not None and start_time > end_time:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="start_time must be less than or equal to end_time"
+            )
+
+        rows = MonitorSnapshot.query_recent(
+            snapshot_type=snapshot_type,
+            limit=limit,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        items = []
+        for row in rows:
+            payload = None
+            if row.data_json:
+                try:
+                    payload = json.loads(row.data_json)
+                except Exception:
+                    payload = row.data_json
+
+            items.append({
+                'id': row.id,
+                'snapshot_type': row.snapshot_type,
+                'source': row.source,
+                'collected_at': row.collected_at,
+                'create_time': row.create_time,
+                'update_time': row.update_time,
+                'create_date': str(row.create_date) if row.create_date else None,
+                'update_date': str(row.update_date) if row.update_date else None,
+                'data': payload,
+            })
+
+        return construct_response(
+            data={
+                'snapshot_type': snapshot_type or 'all',
+                'limit': limit,
+                'start_time': start_time,
+                'end_time': end_time,
+                'count': len(items),
+                'items': items,
+            },
+            retmsg="Successfully retrieved monitor history"
+        )
+    except Exception as e:
+        logger.error(f"get_history failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

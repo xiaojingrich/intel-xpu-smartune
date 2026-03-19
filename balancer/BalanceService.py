@@ -14,6 +14,7 @@ from flask import Flask, request, Response, stream_with_context
 from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
 from monitor.monitor_api import monitor_bp
+from monitor.system_info import preload_static_info, shutdown_qmassa
 from utils.app_utils import adjust_oom_priority, callback_manager, fetch_all_apps, get_priority_value
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -76,6 +77,7 @@ class DynamicService:
 
     def shutdown(self):
         self.balancer.shutdown()
+        shutdown_qmassa()
 
 
 def start_service():
@@ -730,6 +732,11 @@ def main():
         return
 
     init_database()
+    try:
+        preload_static_info()
+    except Exception as exc:
+        logger.warning(f"Preload static info failed, will retry on first static request: {exc}")
+
     if not hasattr(app, "_service_initialized"):  # Make sure the service is only initialized once
         start_service()
         app._service_initialized = True

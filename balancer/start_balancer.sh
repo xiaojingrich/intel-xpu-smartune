@@ -28,7 +28,10 @@ fi
 cleanup() {
     echo "Clean up..."
     sudo pkill -f "BalanceService.py" 2>/dev/null
+    sudo pkill -f "/tools/qmassa -t /tmp/qmassa-metrics.json" 2>/dev/null
+    sudo pkill -f "qmassa -t /tmp/qmassa-metrics.json" 2>/dev/null
     wait
+    stty sane 2>/dev/null || true
     echo "Service stopped."
 }
 

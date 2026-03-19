@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import json
 from peewee import *
 from threading import Lock
 import time
@@ -152,11 +153,66 @@ class AIAppPriority(DataBaseModel):
     status = CharField(default="NA", max_length=32, null=True, help_text="app status, NA, running, pending, stopped", index=True)
 
 
+class MonitorSnapshot(DataBaseModel):
+    id = AutoField()
+    snapshot_type = CharField(max_length=16, null=False, help_text="snapshot category, e.g. static/dynamic", index=True)
+    source = CharField(max_length=64, null=False, default="monitor.system_info", help_text="snapshot source", index=True)
+    collected_at = CharField(max_length=32, null=True, help_text="origin collect timestamp", index=True)
+    data_json = TextField(null=False, help_text="serialized snapshot payload")
+
+    @classmethod
+    def insert_snapshot(cls, snapshot_type: str, data: dict, source: str = "monitor.system_info", collected_at: str = None):
+        with db_lock:
+            timestamp = int(time.time())
+            now = datetime.now()
+            payload = json.dumps(data, ensure_ascii=False, default=str)
+            try:
+                with db.atomic():
+                    cls.create(
+                        snapshot_type=snapshot_type,
+                        source=source,
+                        collected_at=collected_at,
+                        data_json=payload,
+                        create_time=timestamp,
+                        create_date=now,
+                        update_time=timestamp,
+                        update_date=now,
+                    )
+                    return DBStatus.SUCCESS
+            except (IntegrityError, OperationalError) as e:
+                print(f"Error inserting monitor snapshot: {e}")
+                return DBStatus.FAILED
+
+    @classmethod
+    def query_recent(
+        cls,
+        snapshot_type: str = None,
+        limit: int = 100,
+        start_time: int = None,
+        end_time: int = None,
+    ):
+        with db_lock:
+            try:
+                with db.atomic():
+                    query = cls.select()
+                    if snapshot_type:
+                        query = query.where(cls.snapshot_type == snapshot_type)
+                    if isinstance(start_time, int):
+                        query = query.where(cls.create_time >= start_time)
+                    if isinstance(end_time, int):
+                        query = query.where(cls.create_time <= end_time)
+                    query = query.order_by(cls.id.desc()).limit(max(1, limit))
+                    return list(query)
+            except (IntegrityError, OperationalError) as e:
+                print(f"Error querying monitor snapshots: {e}")
+                return []
+
+
 def init_database():
-    db.create_tables([AIAppPriority])  # Add other tables as needed
+    db.create_tables([AIAppPriority, MonitorSnapshot])  # Add other tables as needed
 
 
 if __name__ == "__main__":
     print("test*****************")
     db.connect()
-    db.create_tables([AIAppPriority])
+    db.create_tables([AIAppPriority, MonitorSnapshot])

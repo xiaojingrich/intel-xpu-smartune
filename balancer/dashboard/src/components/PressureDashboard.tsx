@@ -25,9 +25,12 @@ interface GaugePanelProps {
 }
 
 function GaugePanel({ title, value, subtitle, description }: GaugePanelProps) {
-  const color = getPressureColor(value)
-  const label = getPressureLabel(value)
-  const pct = Math.round(value * 100)
+  const safeValue = Number.isFinite(value) ? Math.max(0, Math.min(value, 1)) : 0
+  const color = getPressureColor(safeValue)
+  const pointerColor = COLORS.text
+  const label = getPressureLabel(safeValue)
+  const pct = Math.round(safeValue * 100)
+  const needleAngle = 180 - (pct * 180) / 100
 
   const gaugeData = [{ value: pct, fill: color }]
 
@@ -46,13 +49,13 @@ function GaugePanel({ title, value, subtitle, description }: GaugePanelProps) {
           {title}
         </Text>
 
-        <div style={{ position: 'relative', height: 200 }}>
+        <div style={{ position: 'relative', height: 220, overflow: 'hidden' }}>
           <ResponsiveContainer width="100%" height="100%">
             <RadialBarChart
               cx="50%"
               cy="70%"
               innerRadius="60%"
-              outerRadius="85%"
+              outerRadius="88%"
               startAngle={180}
               endAngle={0}
               data={gaugeData}
@@ -67,6 +70,33 @@ function GaugePanel({ title, value, subtitle, description }: GaugePanelProps) {
             </RadialBarChart>
           </ResponsiveContainer>
 
+          <svg
+            viewBox="0 0 100 100"
+            preserveAspectRatio="xMidYMid meet"
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              pointerEvents: 'none',
+              filter: 'drop-shadow(0 0 4px rgba(90, 169, 255, 0.2))',
+              zIndex: 1,
+            }}
+          >
+            <line
+              x1="50"
+              y1="70"
+              x2="73"
+              y2="70"
+              stroke={pointerColor}
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              transform={`rotate(${needleAngle} 50 70)`}
+            />
+            <circle cx="50" cy="70" r="2.8" fill={pointerColor} />
+          </svg>
+
           <div
             style={{
               position: 'absolute',
@@ -74,6 +104,7 @@ function GaugePanel({ title, value, subtitle, description }: GaugePanelProps) {
               left: '50%',
               transform: 'translateX(-50%)',
               textAlign: 'center',
+              zIndex: 2,
             }}
           >
             <div

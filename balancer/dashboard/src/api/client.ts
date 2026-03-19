@@ -1,14 +1,14 @@
 import axios from 'axios'
 import type {
   ApiResponse,
-  CpuData,
-  MemoryData,
-  DiskData,
   NetworkData,
   PressureData,
-  SummaryData,
   TopConsumersData,
   AppListData,
+  StaticInfoData,
+  DynamicInfoData,
+  HistoryData,
+  HistoryQueryOptions,
   SetControlPayload,
   AppIdPayload,
   SetPriorityPayload,
@@ -34,13 +34,29 @@ async function post<T>(url: string, body: object = {}): Promise<T> {
 }
 
 export const api = {
-  getCpu: () => get<CpuData>('/monitor/cpu'),
-  getMemory: () => get<MemoryData>('/monitor/memory'),
-  getDisk: () => get<DiskData>('/monitor/disk'),
   getNetwork: () => get<NetworkData>('/monitor/network'),
   getPressure: () => get<PressureData>('/monitor/pressure'),
-  getSummary: () => get<SummaryData>('/monitor/summary'),
   getTopConsumers: () => get<TopConsumersData>('/monitor/top_consumers'),
+  getStaticInfo: () => get<StaticInfoData>('/monitor/static_info'),
+  refreshStaticInfo: () => get<StaticInfoData>('/monitor/static_info?force_refresh=1'),
+  getDynamicInfo: () => get<DynamicInfoData>('/monitor/dynamic_info'),
+  getHistory: (options: HistoryQueryOptions = {}) => {
+    const snapshotType = options.snapshotType ?? 'dynamic'
+    const limit = Math.max(1, Math.min(options.limit ?? 100, 1000))
+    const params = new URLSearchParams({
+      snapshot_type: snapshotType,
+      limit: String(limit),
+    })
+
+    if (typeof options.startTime === 'number' && Number.isFinite(options.startTime)) {
+      params.set('start_time', String(Math.floor(options.startTime)))
+    }
+    if (typeof options.endTime === 'number' && Number.isFinite(options.endTime)) {
+      params.set('end_time', String(Math.floor(options.endTime)))
+    }
+
+    return get<HistoryData>(`/monitor/history?${params.toString()}`)
+  },
 
   getApps: () => post<AppListData>('/app/get_apps'),
   getControlledApps: () => post<AppListData>('/app/get_controlled_app'),

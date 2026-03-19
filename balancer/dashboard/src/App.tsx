@@ -6,12 +6,14 @@ import {
   NodeIndexOutlined,
   AlertOutlined,
   ControlOutlined,
+  LineChartOutlined,
 } from '@ant-design/icons'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
 import ProcessResources from './components/ProcessResources'
 import PressureDashboard from './components/PressureDashboard'
 import AppManagement from './components/AppManagement'
+import HistoryDashboard from './components/HistoryDashboard'
 import { COLORS } from './styles/theme'
 
 const { Header, Content } = Layout
@@ -25,7 +27,7 @@ export default function App() {
       label: (
         <Space>
           <DashboardOutlined />
-          System Overview
+          Performance
         </Space>
       ),
       children: <SystemOverview active={activeTab === '1'} />,
@@ -70,6 +72,16 @@ export default function App() {
       ),
       children: <AppManagement active={activeTab === '5'} />,
     },
+    {
+      key: '6',
+      label: (
+        <Space>
+          <LineChartOutlined />
+          History
+        </Space>
+      ),
+      children: <HistoryDashboard active={activeTab === '6'} />,
+    },
   ]
 
   return (
@@ -111,7 +123,7 @@ export default function App() {
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
           <Badge status="processing" color={COLORS.green} />
           <Typography.Text style={{ color: COLORS.textMuted, fontSize: 12 }}>
-            Live
+            Dynamic
           </Typography.Text>
         </div>
       </Header>

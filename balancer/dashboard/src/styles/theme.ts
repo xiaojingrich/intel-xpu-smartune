@@ -28,7 +28,7 @@ export const darkTheme: ThemeConfig = {
     colorText: COLORS.text,
     colorTextSecondary: COLORS.textMuted,
     borderRadius: 4,
-    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
+    fontFamily: "'Sora', 'Space Grotesk', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
   },
   components: {
     Tabs: {
