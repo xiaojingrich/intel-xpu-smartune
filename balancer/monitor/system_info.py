@@ -16,10 +16,11 @@ import glob
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 import threading
 
 import psutil
@@ -39,8 +40,12 @@ _QMASSA_STATE: Dict[str, Any] = {
     "json_path": None,
     "last_start": 0.0,
     "last_parsed": None,
+    "last_invalid_json_log_ts": 0.0,
 }
 _QMASSA_LOCK = threading.Lock()
+_QMASSA_SHUTDOWN = False
+_QMASSA_MAX_JSON_BYTES = 8 * 1024 * 1024
+_QMASSA_MAX_STATES = 600
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
 _DYNAMIC_SNAPSHOT_LOCK = threading.Lock()
 _DYNAMIC_SNAPSHOT_STATE: Dict[str, Any] = {"last_persist_ts": 0.0}
@@ -116,6 +121,42 @@ def _parse_cpu_model() -> Optional[str]:
     return None
 
 
+def _parse_dmesg_fw_versions(kind: str) -> List[str]:
+    output = _run_cmd(["dmesg"], timeout=5)
+    if not output:
+        return []
+
+    key = kind.strip().lower()
+    if key not in {"guc", "huc"}:
+        return []
+
+    entries: List[str] = []
+    seen = set()
+    # Support both formats:
+    # - "Using GuC firmware from xe/bmg_guc_70.bin version 70.44.1"
+    # - "GT0: GuC firmware i915/mtl_guc_70.bin version 70.36.0"
+    pattern = re.compile(
+        rf"\b{key}\s+firmware\s+(?:from\s+)?(?P<path>\S+)\s+version\s+(?P<ver>[0-9]+(?:\.[0-9]+)*)",
+        re.IGNORECASE,
+    )
+
+    for line in output.splitlines():
+        if key not in line.lower():
+            continue
+        match = pattern.search(line)
+        if not match:
+            continue
+        fw_path = match.group("path").strip()
+        version = match.group("ver").strip()
+        value = f"{fw_path} version {version}"
+        if value in seen:
+            continue
+        seen.add(value)
+        entries.append(value)
+
+    return entries
+
+
 def _get_dpkg_version(pkg_name: str) -> Dict[str, Any]:
     cmd = ["dpkg", "-l", pkg_name]
     try:
@@ -144,21 +185,43 @@ def _get_cpu_freq_summary() -> Dict[str, Any]:
     per_core = []
     min_vals = []
     max_vals = []
+    per_core_max: List[Optional[float]] = []
     for freq in freqs or []:
         if freq is None:
             per_core.append(None)
+            per_core_max.append(None)
             continue
         per_core.append(round(freq.current, 1))
+        per_core_max.append(freq.max if freq.max is not None else None)
         if freq.min is not None:
             min_vals.append(freq.min)
         if freq.max is not None:
             max_vals.append(freq.max)
     min_freq = round(min(min_vals), 1) if min_vals else None
     max_freq = round(max(max_vals), 1) if max_vals else None
+
+    # P/E-core freq bounds: use same core classification as dynamic path
+    core_class = _detect_core_groups()
+    p_indices = core_class.get("p_cores", [])
+    e_indices = core_class.get("e_cores", [])
+
+    def _core_range(indices: List[int]) -> Dict[str, Optional[float]]:
+        mins = [min_vals[i] for i in indices if i < len(min_vals)] if min_vals else []
+        maxs = [per_core_max[i] for i in indices if i < len(per_core_max) and per_core_max[i] is not None]
+        # fall back to global min if per-core min not available
+        all_mins = [v for v in mins if v is not None]
+        all_maxs = [v for v in maxs if v is not None]
+        return {
+            "min_mhz": round(min(all_mins), 1) if all_mins else min_freq,
+            "max_mhz": round(max(all_maxs), 1) if all_maxs else None,
+        }
+
     return {
         "min_mhz": min_freq,
         "max_mhz": max_freq,
         "per_core_mhz": per_core,
+        "p_core_freq_mhz": _core_range(p_indices) if p_indices else None,
+        "e_core_freq_mhz": _core_range(e_indices) if e_indices else None,
     }
 
 
@@ -201,6 +264,36 @@ def _get_gpu_engines(cards: List[str]) -> Dict[str, List[str]]:
     return engines
 
 
+def _normalize_gpu_engine_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    lowered = str(name).strip().lower()
+    if not lowered:
+        return None
+
+    if "video-enhance" in lowered or lowered.startswith("vecs"):
+        return "vecs"
+    if "video" in lowered or lowered.startswith("vcs"):
+        return "vcs"
+    if "render" in lowered or lowered.startswith("rcs"):
+        return "rcs"
+    if "copy" in lowered or lowered.startswith("bcs"):
+        return "bcs"
+    if "compute" in lowered or lowered.startswith("ccs"):
+        return "ccs"
+    return None
+
+
+def _normalize_gpu_engines(engines: List[str]) -> List[str]:
+    normalized = {
+        engine
+        for engine in (_normalize_gpu_engine_name(name) for name in engines)
+        if engine
+    }
+    order = ["bcs", "ccs", "rcs", "vcs", "vecs"]
+    return [engine for engine in order if engine in normalized]
+
+
 def _get_gpu_freq_bounds(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
     result: Dict[str, Dict[str, Optional[float]]] = {}
     for card in cards:
@@ -228,8 +321,13 @@ def _get_gpu_freq_bounds(cards: List[str]) -> Dict[str, Dict[str, Optional[float
 
 def _parse_debugfs_vram_mm(card_index: int) -> Dict[str, Optional[float]]:
     path = f"/sys/kernel/debug/dri/{card_index}/vram0_mm"
-    content = _safe_read(path)
-    if not content:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.debug("Read failed for %s: %s", path, exc)
         return {}
 
     size_match = re.search(r"(?m)^\s*size:\s*(\d+)\s*$", content)
@@ -254,44 +352,29 @@ def _parse_debugfs_vram_mm(card_index: int) -> Dict[str, Optional[float]]:
 
 
 def _parse_i915_gem_objects_vram(card_index: int) -> Dict[str, Optional[float]]:
+    """Parse visible_size and visible_avail from i915_gem_objects debugfs (i915 dGPU only)."""
     path = f"/sys/kernel/debug/dri/{card_index}/i915_gem_objects"
-    content = _safe_read(path)
-    if not content:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.debug("Read failed for %s: %s", path, exc)
         return {}
 
-    if not re.search(r"(?m)^local0:\s*", content):
+    # visible_size / visible_avail are present only for dGPU local memory
+    size_match = re.search(r"(?m)^\s*visible_size:\s*([0-9]+)\s*MiB", content)
+    avail_match = re.search(r"(?m)^\s*visible_avail:\s*([0-9]+)\s*MiB", content)
+
+    if not size_match:
         return {}
 
-    total_bytes: Optional[float] = None
-    used_bytes: Optional[float] = None
-
-    chunk_match = re.search(
-        r"(?mi)^chunk_size:.*?total:\s*([0-9]+)\s*MiB,\s*free:\s*([0-9]+)\s*MiB",
-        content,
-    )
-    if chunk_match:
-        total_mib = float(chunk_match.group(1))
-        free_mib = float(chunk_match.group(2))
-        total_bytes = total_mib * 1024 * 1024
-        used_bytes = max(0.0, total_mib - free_mib) * 1024 * 1024
-
-    local_block_match = re.search(r"(?ms)^local0:\s.*?(?=^\S|\Z)", content)
-    if local_block_match:
-        block = local_block_match.group(0)
-        size_match = re.search(r"(?m)^\s*size:\s*(\d+)\s*$", block)
-        usage_match = re.search(r"(?m)^\s*usage:\s*(\d+)\s*$", block)
-        size_bytes = float(size_match.group(1)) if size_match else None
-        usage_bytes = float(usage_match.group(1)) if usage_match else None
-        if total_bytes is None and size_bytes is not None:
-            total_bytes = size_bytes
-        if used_bytes is None and usage_bytes is not None:
-            used_bytes = usage_bytes
-
-    if total_bytes is None and used_bytes is None:
-        return {}
-
+    total_bytes = float(size_match.group(1)) * 1024 * 1024
+    avail_bytes = float(avail_match.group(1)) * 1024 * 1024 if avail_match else None
+    used_bytes = max(0.0, total_bytes - avail_bytes) if avail_bytes is not None else None
     usage_percent = None
-    if total_bytes is not None and total_bytes > 0 and used_bytes is not None:
+    if used_bytes is not None and total_bytes > 0:
         usage_percent = round((used_bytes / total_bytes) * 100, 2)
 
     return {
@@ -333,58 +416,60 @@ def _get_gpu_vram(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
 
     for card in cards:
         card_name = os.path.basename(card)
-        driver_name = _get_gpu_driver_name(card)
-
         match = re.match(r"^card(\d+)$", card_name)
-        if driver_name == "i915":
-            if match:
-                card_index = int(match.group(1))
-                i915_vram = _parse_i915_gem_objects_vram(card_index)
-                if i915_vram:
-                    result[card_name] = i915_vram
-                    continue
 
-            result[card_name] = {
-                "total_bytes": system_memory_stats.get("total_bytes"),
-                "used_bytes": system_memory_stats.get("used_bytes"),
-                "usage_percent": system_memory_stats.get("usage_percent"),
-            }
-            continue
-
-        if driver_name == "xe" and match:
+        if match:
             card_index = int(match.group(1))
-            debugfs_vram = _parse_debugfs_vram_mm(card_index)
-            if debugfs_vram:
-                result[card_name] = debugfs_vram
+            # Try xe dGPU (vram0_mm) — silent on FileNotFoundError
+            xe_vram = _parse_debugfs_vram_mm(card_index)
+            if xe_vram:
+                result[card_name] = xe_vram
                 continue
+            # Try i915 dGPU (i915_gem_objects) — silent on FileNotFoundError
+            i915_vram = _parse_i915_gem_objects_vram(card_index)
+            if i915_vram:
+                result[card_name] = i915_vram
+                continue
+            # Neither file openable: iGPU → use system memory
 
-        total_paths = [
-            os.path.join(card, "device", "mem_info_vram_total"),
-            os.path.join(card, "device", "local_mem_total_bytes"),
-            os.path.join(card, "device", "vram_total"),
-        ]
-        used_paths = [
-            os.path.join(card, "device", "mem_info_vram_used"),
-            os.path.join(card, "device", "local_mem_used_bytes"),
-            os.path.join(card, "device", "vram_used"),
-        ]
-        total_raw = _read_first_existing(total_paths)
-        used_raw = _read_first_existing(used_paths)
-        total = float(total_raw) if total_raw and total_raw.isdigit() else None
-        used = float(used_raw) if used_raw and used_raw.isdigit() else None
-        usage_percent = round((used / total) * 100, 2) if used is not None and total else None
-        if total or used:
-            result[card_name] = {
-                "total_bytes": total,
-                "used_bytes": used,
-                "usage_percent": usage_percent,
-            }
-        else:
-            result[card_name] = {
-                "total_bytes": system_memory_stats.get("total_bytes"),
-                "used_bytes": system_memory_stats.get("used_bytes"),
-                "usage_percent": system_memory_stats.get("usage_percent"),
-            }
+        result[card_name] = {
+            "total_bytes": system_memory_stats.get("total_bytes"),
+            "used_bytes": system_memory_stats.get("used_bytes"),
+            "usage_percent": system_memory_stats.get("usage_percent"),
+        }
+    return result
+
+
+def _get_igpu_eu_count(cards: List[str]) -> Dict[str, Optional[int]]:
+    """Read EU count per card. Method depends on driver:
+    - i915: parse 'Available EU Total' from i915_sseu_status debugfs
+    - xe:   read total_eu_count from GT0 sysfs
+    """
+    result: Dict[str, Optional[int]] = {}
+    for card in cards:
+        card_name = os.path.basename(card)
+        match = re.match(r"^card(\d+)$", card_name)
+        if not match:
+            continue
+        card_index = int(match.group(1))
+        driver = _get_gpu_driver_name(card)
+
+        if driver == "i915":
+            path = f"/sys/kernel/debug/dri/{card_index}/i915_sseu_status"
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                eu_match = re.search(r"(?m)^\s*Available EU Total:\s*(\d+)", content)
+                if eu_match:
+                    result[card_name] = int(eu_match.group(1))
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                logger.debug("Read failed for %s: %s", path, exc)
+
+        elif driver == "xe":
+            result[card_name] = None
+
     return result
 
 
@@ -396,13 +481,31 @@ def _get_gpu_pcie(cards: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
         current_width = _safe_read(os.path.join(base, "current_link_width"))
         max_speed = _safe_read(os.path.join(base, "max_link_speed"))
         max_width = _safe_read(os.path.join(base, "max_link_width"))
-        if current_speed or max_speed:
+        # Only include real PCIe speeds (contain "GT/s"); iGPU sysfs may expose "Unknown" garbage
+        has_real_speed = (current_speed and "GT/s" in current_speed) or (max_speed and "GT/s" in max_speed)
+        if has_real_speed:
             result[os.path.basename(card)] = {
                 "current_speed": current_speed,
                 "current_width": current_width,
                 "max_speed": max_speed,
                 "max_width": max_width,
             }
+    return result
+
+
+def _get_gpu_pci_addresses(cards: List[str]) -> Dict[str, str]:
+    """Return mapping of cardKey -> PCI address (e.g. card0 -> 0000:00:02.0)."""
+    result: Dict[str, str] = {}
+    for card in cards:
+        device_path = os.path.join(card, "device")
+        try:
+            resolved = os.path.realpath(device_path)
+            pci_addr = os.path.basename(resolved)
+            # PCI address pattern: DDDD:BB:DD.F
+            if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", pci_addr):
+                result[os.path.basename(card)] = pci_addr
+        except Exception:
+            pass
     return result
 
 
@@ -435,19 +538,40 @@ def _get_npu_fw_version() -> str:
     return "NA"
 
 
+def _get_npu_device_info() -> Dict[str, Optional[str]]:
+    driver_path = "/sys/bus/pci/drivers/intel_vpu/"
+    pciid: Optional[str] = None
+    driver_version: Optional[str] = None
+    for pci_dev in _get_intel_vpu_pci_devices():
+        dev_path = os.path.join("/sys/bus/pci/devices", pci_dev)
+        raw_id = _safe_read(os.path.join(dev_path, "device"))
+        if raw_id:
+            pciid = raw_id.strip()
+        break
+    module_version = _safe_read(os.path.join(driver_path, "module", "version"))
+    if module_version:
+        driver_version = module_version.split(" ")[0]
+    return {
+        "pciid": pciid,
+        "driver_version": driver_version,
+    }
+
+
 def _get_npu_freq_bounds() -> Dict[str, Dict[str, Optional[float]]]:
     result: Dict[str, Dict[str, Optional[float]]] = {}
     for pci_dev in _get_intel_vpu_pci_devices():
-        device = os.path.join("/sys/bus/pci/devices", pci_dev)
-        min_path = os.path.join(device, "npu_min_frequency_mhz")
-        max_path = os.path.join(device, "npu_max_frequency_mhz")
-        min_val = _safe_read(min_path)
-        max_val = _safe_read(max_path)
-        if min_val or max_val:
+        max_path = os.path.join("/sys/bus/pci/devices", pci_dev, "npu_max_frequency_mhz")
+        try:
+            with open(max_path, "r", encoding="utf-8") as f:
+                max_val = f.read().strip()
             result[pci_dev] = {
-                "min_mhz": float(min_val) if min_val and min_val.isdigit() else None,
-                "max_mhz": float(max_val) if max_val and max_val.isdigit() else None,
+                "max_mhz": float(max_val) if max_val.isdigit() else None,
             }
+        except FileNotFoundError:
+            result[pci_dev] = {"max_mhz": None}
+        except Exception as exc:
+            logger.debug("Read failed for %s: %s", max_path, exc)
+            result[pci_dev] = {"max_mhz": None}
     return result
 
 
@@ -560,9 +684,19 @@ def _detect_core_groups() -> Dict[str, Any]:
             source_chain.append("cpuid")
 
     if remaining_core_ids:
-        core_set = _expand_cpu_ranges(_safe_read("/sys/devices/cpu_core/cpus"))
-        atom_set = _expand_cpu_ranges(_safe_read("/sys/devices/cpu_atom/cpus"))
-        lowpower_set = _expand_cpu_ranges(_safe_read("/sys/devices/cpu_lowpower/cpus"))
+        def _read_cpu_topology(path: str) -> Set[int]:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return _expand_cpu_ranges(f.read().strip())
+            except FileNotFoundError:
+                return set()
+            except Exception as exc:
+                logger.debug("Read failed for %s: %s", path, exc)
+                return set()
+
+        core_set = _read_cpu_topology("/sys/devices/cpu_core/cpus")
+        atom_set = _read_cpu_topology("/sys/devices/cpu_atom/cpus")
+        lowpower_set = _read_cpu_topology("/sys/devices/cpu_lowpower/cpus")
         assigned: List[int] = []
         atom_candidates: List[int] = []
 
@@ -795,8 +929,20 @@ def _get_network_runtime_bw() -> Dict[str, Any]:
 
 def _get_network_static_info() -> Dict[str, Any]:
     stats = psutil.net_if_stats()
+    io_stats = psutil.net_io_counters(pernic=True)
     network_speeds_mbps: Dict[str, int] = {}
     peak_speed: Optional[int] = None
+
+    def _is_candidate_interface(name: str) -> bool:
+        lower = name.lower()
+        if lower == "lo" or lower.startswith("docker") or lower.startswith("veth"):
+            return False
+        if lower.startswith("br-") or lower.startswith("virbr"):
+            return False
+        return True
+
+    primary_interface: Optional[str] = None
+    primary_score: Optional[Tuple[int, int, int]] = None
 
     for name, nic in stats.items():
         raw_speed = getattr(nic, "speed", 0)
@@ -808,11 +954,26 @@ def _get_network_static_info() -> Dict[str, Any]:
         if speed > 0:
             peak_speed = speed if peak_speed is None else max(peak_speed, speed)
 
+        if not _is_candidate_interface(name):
+            continue
+
+        is_up = bool(getattr(nic, "isup", False))
+        counters = io_stats.get(name)
+        total_bytes = int((getattr(counters, "bytes_recv", 0) or 0) + (getattr(counters, "bytes_sent", 0) or 0))
+        score = (
+            1 if is_up else 0,
+            speed if speed > 0 else 0,
+            total_bytes,
+        )
+        if primary_score is None or score > primary_score:
+            primary_score = score
+            primary_interface = name
+
     return {
         "nic_count": len(stats),
         "network_speeds_mbps": network_speeds_mbps,
         "network_peak_mbps": peak_speed,
-        "primary_interface": b_config.network_interface,
+        "primary_interface": primary_interface,
     }
 
 
@@ -929,7 +1090,7 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
 
     try:
         telemetry = PmtTelemetry()
-    except SystemExit as exc:
+    except (SystemExit, RuntimeError) as exc:
         return {"available": False, "raw": None, "error": f"PmtTelemetry init failed: {exc}"}
     except Exception as exc:
         return {"available": False, "raw": None, "error": f"PmtTelemetry init failed: {exc}"}
@@ -950,6 +1111,7 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
     interval_ms = 200.0
     telemetry.update_buffer()
     busy_start = read_busy_time()
+    t_start = time.monotonic()
     energy_start = telemetry.get_npu_energy()
     bandwidth_start = telemetry.get_noc_bandwidth()
 
@@ -957,13 +1119,16 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
 
     telemetry.update_buffer()
     busy_end = read_busy_time()
+    t_end = time.monotonic()
     energy_end = telemetry.get_npu_energy()
     bandwidth_end = telemetry.get_noc_bandwidth()
 
     utilization_percent: Optional[float] = None
     if busy_start is not None and busy_end is not None:
         busy_delta = busy_end - busy_start
-        utilization_percent = max(0.0, min(100.0, 100.0 * busy_delta / (interval_ms * 1e-3) / 1e6))
+        elapsed_us = (t_end - t_start) * 1e6  # actual elapsed time in microseconds
+        if elapsed_us > 0:
+            utilization_percent = max(0.0, min(100.0, 100.0 * busy_delta / elapsed_us))
 
     power_w: Optional[float] = None
     if energy_start is not None and energy_end is not None:
@@ -971,12 +1136,18 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
 
     memory_bytes: Optional[int] = None
     memory_path = os.path.join(dev_path, "npu_memory_utilization")
-    memory_raw = _safe_read(memory_path)
-    if memory_raw:
-        try:
-            memory_bytes = int(memory_raw)
-        except ValueError:
-            memory_bytes = None
+    try:
+        with open(memory_path, "r", encoding="utf-8") as f:
+            memory_raw = f.read().strip()
+        if memory_raw:
+            try:
+                memory_bytes = int(memory_raw)
+            except ValueError:
+                memory_bytes = None
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug("Read failed for %s: %s", memory_path, exc)
 
     fw_version = _safe_read(os.path.join(debugfs_path, "fw_version")) if debugfs_path else None
     pciid = _safe_read(os.path.join(dev_path, "device"))
@@ -1028,7 +1199,10 @@ def _get_qmassa_binary() -> Optional[str]:
 
 
 def _ensure_qmassa_running() -> Optional[str]:
+    global _QMASSA_SHUTDOWN
     with _QMASSA_LOCK:
+        if _QMASSA_SHUTDOWN:
+            return None
         proc = _QMASSA_STATE.get("process")
         if proc and proc.poll() is None:
             return _QMASSA_STATE.get("json_path")
@@ -1041,16 +1215,23 @@ def _ensure_qmassa_running() -> Optional[str]:
         json_path = os.path.join("/tmp", "qmassa-metrics.json")
         try:
             proc = subprocess.Popen(
-                [qmassa_bin, "-t", json_path],
+                [qmassa_bin, "-x", "-t", json_path],
                 cwd=repo_root,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            # Give it a moment and check it didn't immediately exit
+            import time as _time
+            _time.sleep(0.3)
+            if proc.poll() is not None:
+                logger.warning("qmassa exited immediately (code %s), binary: %s", proc.returncode, qmassa_bin)
+                return None
             _QMASSA_STATE["process"] = proc
             _QMASSA_STATE["json_path"] = json_path
             _QMASSA_STATE["last_start"] = time.time()
+            logger.info("qmassa started: %s", qmassa_bin)
             return json_path
         except Exception as exc:
             logger.debug("Failed to start qmassa: %s", exc)
@@ -1058,6 +1239,9 @@ def _ensure_qmassa_running() -> Optional[str]:
 
 
 def shutdown_qmassa() -> None:
+    global _QMASSA_SHUTDOWN
+    _QMASSA_SHUTDOWN = True
+
     proc = None
     json_path = None
 
@@ -1071,20 +1255,25 @@ def shutdown_qmassa() -> None:
 
     if proc and proc.poll() is None:
         try:
-            proc.terminate()
+            os.killpg(proc.pid, signal.SIGTERM)
             proc.wait(timeout=1)
         except Exception:
             try:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait(timeout=1)
             except Exception as exc:
-                logger.debug("Failed to stop qmassa process: %s", exc)
+                logger.debug("Failed to stop qmassa process group: %s", exc)
 
     if json_path and os.path.exists(json_path):
         try:
             os.remove(json_path)
         except Exception as exc:
             logger.debug("Failed to remove qmassa output file %s: %s", json_path, exc)
+
+
+def _compact_qmassa_json_if_needed(json_path: str, raw_data: str) -> str:
+    # Compaction disabled: keep qmassa output in original form.
+    return raw_data
 
 
 def _get_qmassa_output() -> Dict[str, Any]:
@@ -1096,25 +1285,32 @@ def _get_qmassa_output() -> Dict[str, Any]:
 
     try:
         with open(json_path, "r", encoding="utf-8") as f:
-            data = f.read().strip()
-        if not data:
+            data = f.read()
+        if not data or not data.strip():
             return {"available": False, "raw": None, "parsed": None, "error": "qmassa output empty"}
+
         parsed = _parse_qmassa_json(data)
+
         with _QMASSA_LOCK:
             cached = _QMASSA_STATE.get("last_parsed")
             if parsed is None:
-                logger.debug("qmassa output is not valid JSON yet")
+                now = time.time()
+                last_log_ts = float(_QMASSA_STATE.get("last_invalid_json_log_ts") or 0.0)
+                if now - last_log_ts >= 30.0:
+                    logger.debug("qmassa output not valid JSON yet (likely being written), will retry")
+                    _QMASSA_STATE["last_invalid_json_log_ts"] = now
                 if cached:
                     return {
                         "available": True,
-                        "raw": data,
+                        "raw": None,
                         "parsed": cached,
-                        "error": "qmassa output invalid, using cached",
+                        "error": "qmassa output transient invalid, using cached",
                     }
-                return {"available": True, "raw": data, "parsed": None, "error": "qmassa output invalid"}
+                return {"available": True, "raw": None, "parsed": None, "error": "qmassa output transient invalid"}
             parsed = _merge_qmassa_with_cache(parsed, cached)
             _QMASSA_STATE["last_parsed"] = parsed
-        return {"available": True, "raw": data, "parsed": parsed, "error": None}
+            _QMASSA_STATE["last_invalid_json_log_ts"] = 0.0
+        return {"available": True, "raw": None, "parsed": parsed, "error": None}
     except Exception as exc:
         return {"available": False, "raw": None, "parsed": None, "error": str(exc)}
 
@@ -1228,6 +1424,66 @@ def _merge_qmassa_with_cache(parsed: Dict[str, Any], cached: Optional[Dict[str, 
         if not dev.get("engines") and cached_dev.get("engines"):
             dev["engines"] = cached_dev["engines"]
     return parsed
+
+
+def _get_gpu_qmassa_static_info(
+    cards: List[str],
+    gpu_pci_addresses: Dict[str, str],
+) -> Tuple[
+    Dict[str, Dict[str, Dict[str, Optional[float]]]],
+    Dict[str, List[str]],
+]:
+    parsed_qmassa = {}
+    with _QMASSA_LOCK:
+        cached_parsed = _QMASSA_STATE.get("last_parsed")
+        if isinstance(cached_parsed, dict):
+            parsed_qmassa = cached_parsed
+
+    if not parsed_qmassa:
+        qmassa = _get_qmassa_output()
+        parsed_qmassa = qmassa.get("parsed") or {}
+
+    qmassa_devices = parsed_qmassa.get("devices") or []
+    gpu_gt_freq_bounds: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
+    gpu_engines: Dict[str, List[str]] = {}
+
+    if not qmassa_devices:
+        return gpu_gt_freq_bounds, gpu_engines
+
+    card_keys = sorted({os.path.basename(card) for card in cards} | set(gpu_pci_addresses.keys()))
+    pci_to_card = {pci_addr: card_key for card_key, pci_addr in gpu_pci_addresses.items()}
+
+    for idx, dev in enumerate(qmassa_devices):
+        pci_dev = dev.get("pci_dev")
+        card_key = pci_to_card.get(pci_dev) if isinstance(pci_dev, str) else None
+        if not card_key and idx < len(card_keys):
+            card_key = card_keys[idx]
+        if not card_key:
+            continue
+
+        freqs_by_name = {
+            str(item.get("name", "")).lower(): item
+            for item in (dev.get("freqs") or [])
+        }
+        gt_bounds: Dict[str, Dict[str, Optional[float]]] = {}
+        for gt_name in ("gt0", "gt1"):
+            match = freqs_by_name.get(gt_name)
+            if not match:
+                continue
+            gt_bounds[gt_name] = {
+                "min_mhz": _to_float(match.get("min_mhz")),
+                "max_mhz": _to_float(match.get("max_mhz")),
+            }
+
+        if gt_bounds:
+            gpu_gt_freq_bounds[card_key] = gt_bounds
+
+        engines = [str(name).strip() for name in (dev.get("engines") or []) if str(name).strip()]
+        normalized_engines = _normalize_gpu_engines(engines)
+        if normalized_engines:
+            gpu_engines[card_key] = normalized_engines
+
+    return gpu_gt_freq_bounds, gpu_engines
 
 
 def _persist_monitor_snapshot(snapshot_type: str, data: Dict[str, Any]) -> None:
@@ -1354,11 +1610,16 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
             "utilization": None,
             "read_kb_per_sec": None,
             "write_kb_per_sec": None,
+            "read_iops": None,
+            "write_iops": None,
+            "total_iops": None,
         }
 
     max_util: Optional[float] = None
     total_read_kb = 0.0
     total_write_kb = 0.0
+    total_read_iops = 0.0
+    total_write_iops = 0.0
 
     for item in disk_io.values():
         if not isinstance(item, dict):
@@ -1372,13 +1633,20 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
 
         read_kb = _to_float(item.get("read_kb_per_sec"))
         write_kb = _to_float(item.get("write_kb_per_sec"))
+        read_iops = _to_float(item.get("read_iops"))
+        write_iops = _to_float(item.get("write_iops"))
         total_read_kb += read_kb if read_kb is not None else 0.0
         total_write_kb += write_kb if write_kb is not None else 0.0
+        total_read_iops += read_iops if read_iops is not None else 0.0
+        total_write_iops += write_iops if write_iops is not None else 0.0
 
     return {
         "utilization": round(max_util, 2) if max_util is not None else None,
         "read_kb_per_sec": round(total_read_kb, 2),
         "write_kb_per_sec": round(total_write_kb, 2),
+        "read_iops": round(total_read_iops, 2),
+        "write_iops": round(total_write_iops, 2),
+        "total_iops": round(total_read_iops + total_write_iops, 2),
     }
 
 
@@ -1394,8 +1662,14 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
     if rx_bytes is not None or tx_bytes is not None:
         total_mbps = ((rx_bytes or 0.0) + (tx_bytes or 0.0)) * 8.0 / 1_000_000.0
 
+    peak_mbps = _to_float((_get_network_static_info() or {}).get("network_peak_mbps"))
+    if peak_mbps is not None and peak_mbps <= 0:
+        peak_mbps = None
+
+    # Legacy fallback when NIC peak is unavailable.
     bw_kbit = _to_float(getattr(b_config, "network_bandwidth_kbit", None))
-    max_mbps = (bw_kbit / 1000.0) if bw_kbit and bw_kbit > 0 else None
+    fallback_mbps = (bw_kbit / 1000.0) if bw_kbit and bw_kbit > 0 else None
+    max_mbps = peak_mbps if peak_mbps is not None else fallback_mbps
 
     utilization_percent = None
     if total_mbps is not None and max_mbps and max_mbps > 0:
@@ -1474,6 +1748,17 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
         cards = _get_gpu_cards()
         network_static = _get_network_static_info()
         disk_static = _get_disk_static_info()
+        gpu_pci_addresses = _get_gpu_pci_addresses(cards)
+        gpu_gt_freq_bounds, gpu_engines_from_qmassa = _get_gpu_qmassa_static_info(cards, gpu_pci_addresses)
+        gpu_engines = _get_gpu_engines(cards)
+        normalized_gpu_engines: Dict[str, List[str]] = {}
+        all_engine_card_keys = set(gpu_engines.keys()) | set(gpu_engines_from_qmassa.keys())
+        for card_key in all_engine_card_keys:
+            existing = gpu_engines.get(card_key, [])
+            qmassa_engines = gpu_engines_from_qmassa.get(card_key, [])
+            merged = _normalize_gpu_engines(existing + qmassa_engines)
+            if merged:
+                normalized_gpu_engines[card_key] = merged
 
         data = {
             "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1482,6 +1767,8 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
             "driver": {
                 "kernel_version": _safe_read("/proc/sys/kernel/osrelease"),
                 "kernel_cmdline": _safe_read("/proc/cmdline"),
+                "guc_fw": _parse_dmesg_fw_versions("guc"),
+                "huc_fw": _parse_dmesg_fw_versions("huc"),
                 "mesa": _get_dpkg_version("mesa-common-dev"),
                 "opencl": _get_dpkg_version("intel-opencl-icd"),
                 "level_zero": _get_dpkg_version("intel-level-zero-gpu"),
@@ -1505,14 +1792,18 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
             "gpu": {
                 "names": _get_gpu_names(),
                 "count": len(cards),
-                "engines": _get_gpu_engines(cards),
+                "engines": normalized_gpu_engines,
                 "freq_bounds_mhz": _get_gpu_freq_bounds(cards),
+                "gt_freq_bounds_mhz": gpu_gt_freq_bounds,
                 "vram": _get_gpu_vram(cards),
                 "pcie": _get_gpu_pcie(cards),
+                "eu_count": _get_igpu_eu_count(cards),
+                "pci_addresses": gpu_pci_addresses,
             },
             "npu": {
                 "names": _get_npu_names(),
                 "freq_bounds_mhz": _get_npu_freq_bounds(),
+                **_get_npu_device_info(),
             },
         }
 

@@ -7,6 +7,7 @@ import {
   AlertOutlined,
   ControlOutlined,
   LineChartOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
@@ -14,6 +15,7 @@ import ProcessResources from './components/ProcessResources'
 import PressureDashboard from './components/PressureDashboard'
 import AppManagement from './components/AppManagement'
 import HistoryDashboard from './components/HistoryDashboard'
+import About from './components/About'
 import { COLORS } from './styles/theme'
 
 const { Header, Content } = Layout
@@ -81,6 +83,16 @@ export default function App() {
         </Space>
       ),
       children: <HistoryDashboard active={activeTab === '6'} />,
+    },
+    {
+      key: '7',
+      label: (
+        <Space>
+          <InfoCircleOutlined />
+          About
+        </Space>
+      ),
+      children: <About active={activeTab === '7'} />,
     },
   ]
 

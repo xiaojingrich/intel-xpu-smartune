@@ -4,7 +4,6 @@ import { ReloadOutlined } from '@ant-design/icons'
 import {
   Brush,
   CartesianGrid,
-  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -34,6 +33,7 @@ interface CommonTrendPoint {
   cpuUtilization: number | null
   memoryUtilization: number | null
   diskUtilization: number | null
+  diskIops: number | null
   networkUtilization: number | null
   npuUtilization: number | null
 }
@@ -48,11 +48,15 @@ interface GpuTrendPoint {
   bcs: number | null
   gt0Freq: number | null
   gt1Freq: number | null
+  gpuPower: number | null
+  pkgPower: number | null
+  memUsage: number | null
 }
 
 interface GpuTrendSeries {
   id: string
   label: string
+  isIntegrated: boolean
   points: GpuTrendPoint[]
 }
 
@@ -64,6 +68,7 @@ interface HistoryNetworkExtra {
 
 interface HistoryDiskExtra {
   utilization?: number | null
+  total_iops?: number | null
 }
 
 interface HistoryNpuSmiExtra {
@@ -90,6 +95,35 @@ const RANGE_SECONDS: Record<Exclude<RangePreset, 'custom'>, number> = {
   '1h': 60 * 60,
   '6h': 6 * 60 * 60,
   '24h': 24 * 60 * 60,
+}
+
+const SNAPSHOT_INTERVAL_SECONDS = 5
+const HISTORY_LIMIT_CAP = 20000
+
+function estimateRequiredLimit(
+  rangePreset: RangePreset,
+  customRange: [Dayjs | null, Dayjs | null] | null,
+): number {
+  let seconds = 0
+  if (rangePreset === 'custom') {
+    const start = customRange?.[0]
+    const end = customRange?.[1]
+    if (start && end && end.unix() >= start.unix()) {
+      seconds = end.unix() - start.unix()
+    }
+  } else {
+    seconds = RANGE_SECONDS[rangePreset]
+  }
+
+  if (seconds <= 0) return 100
+  const estimated = Math.ceil(seconds / SNAPSHOT_INTERVAL_SECONDS) + 20
+  return Math.max(100, Math.min(estimated, HISTORY_LIMIT_CAP))
+}
+
+function formatHistoryAxisTick(val: string | number): string {
+  const text = String(val)
+  if (text.length >= 11) return text.slice(0, 11) // MM-DD HH:mm
+  return text
 }
 
 const ENGINE_CURVE_META: Array<{ key: EngineKey; name: string; color: string }> = [
@@ -153,6 +187,12 @@ function getDiskUsage(dynamic: DynamicInfoData | null): number | null {
   return Math.max(...values)
 }
 
+function getDiskIops(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.disk) return null
+  const disk = dynamic.disk as DynamicInfoData['disk'] & HistoryDiskExtra
+  return toNumber(disk.total_iops)
+}
+
 function getNetworkUsage(dynamic: DynamicInfoData | null): number | null {
   if (!dynamic?.network) return null
   const network = dynamic.network as DynamicInfoData['network'] & HistoryNetworkExtra
@@ -204,10 +244,16 @@ function buildCommonTrendPoints(items: HistorySnapshotItem[]): CommonTrendPoint[
         cpuUtilization: normalizePercent(dynamic?.cpu?.usage_total),
         memoryUtilization: normalizePercent(dynamic?.memory?.usage_percent),
         diskUtilization: diskUsage,
+        diskIops: getDiskIops(dynamic),
         networkUtilization: networkUsage,
         npuUtilization: getNpuUsage(dynamic),
       }
     })
+}
+
+function isIntegratedGpu(device: QmassaDevice): boolean {
+  const type = `${device.dev_type || ''}`.toLowerCase()
+  return type.includes('integrated') || type.includes('igpu')
 }
 
 function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
@@ -222,10 +268,17 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
     devices.forEach((device, index) => {
       const id = device.pci_dev || `${device.dev_type || 'gpu'}-${index}`
       const seriesLabel = getGpuLabel(device, index)
+      const integrated = isIntegratedGpu(device)
 
       if (!seriesMap.has(id)) {
-        seriesMap.set(id, { id, label: seriesLabel, points: [] })
+        seriesMap.set(id, { id, label: seriesLabel, isIntegrated: integrated, points: [] })
       }
+
+      // iGPU uses system memory; dGPU uses dedicated VRAM (keyed by card index in vram map)
+      const vramEntry = dynamic.gpu?.vram?.[`card${index}`]
+      const memUsage = integrated
+        ? normalizePercent(dynamic?.memory?.usage_percent)
+        : normalizePercent(vramEntry?.usage_percent ?? dynamic?.memory?.usage_percent)
 
       const point: GpuTrendPoint = {
         timestamp: label,
@@ -237,6 +290,9 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
         bcs: normalizeEngineUtil(device, 'bcs'),
         gt0Freq: getFreq(device, 'gt0'),
         gt1Freq: getFreq(device, 'gt1'),
+        gpuPower: toNumber(device.power_w?.gpu ?? null),
+        pkgPower: toNumber(device.power_w?.pkg ?? null),
+        memUsage,
       }
 
       seriesMap.get(id)?.points.push(point)
@@ -244,6 +300,187 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
   }
 
   return Array.from(seriesMap.values()).filter((series) => series.points.length > 0)
+}
+
+function LegendToggleItem({
+  value,
+  color,
+  hidden,
+  onClick,
+}: {
+  value: string
+  color: string
+  hidden: boolean
+  onClick: () => void
+}) {
+  return (
+    <span
+      onClick={onClick}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+        cursor: 'pointer',
+        marginRight: 12,
+        opacity: hidden ? 0.35 : 1,
+        userSelect: 'none',
+      }}
+    >
+      <span
+        style={{
+          display: 'inline-block',
+          width: 24,
+          height: 3,
+          borderRadius: 2,
+          background: hidden ? COLORS.border : color,
+          verticalAlign: 'middle',
+        }}
+      />
+      <span style={{ color: hidden ? 'rgba(174,191,223,0.3)' : COLORS.textMuted, fontSize: 11, textDecoration: hidden ? 'line-through' : 'none' }}>{value}</span>
+    </span>
+  )
+}
+
+function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
+  const [hidden, setHidden] = useState<Set<string>>(new Set())
+  const toggle = useCallback((key: string) => {
+    setHidden((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
+  const memLabel = series.isIntegrated ? 'Sys Mem %' : 'VRAM %'
+
+  const engineLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
+    ...ENGINE_CURVE_META.map((e) => ({ key: e.key, name: e.name, color: e.color, yAxisId: 'util' })),
+    { key: 'memUsage', name: memLabel, color: COLORS.yellow, dasharray: '6 3', yAxisId: 'util' },
+    { key: 'gt0Freq', name: 'GT0 MHz', color: COLORS.text, dasharray: '6 4', yAxisId: 'freq' },
+    { key: 'gt1Freq', name: 'GT1 MHz', color: COLORS.textMuted, dasharray: '4 4', yAxisId: 'freq' },
+  ]
+
+  const powerLines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
+    { key: 'gpuPower', name: 'GPU Power W', color: COLORS.accent },
+    { key: 'pkgPower', name: 'Pkg Power W', color: COLORS.orange, dasharray: '5 3' },
+  ]
+
+  return (
+    <Card
+      style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginBottom: 16 }}
+      bodyStyle={{ padding: 16 }}
+    >
+      {/* Chart 1: Engine utilization + Mem% + Frequency */}
+      <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
+        {series.label} — Engine Utilization &amp; GT Frequency
+      </Text>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+        {engineLines.map((l) => (
+          <LegendToggleItem
+            key={l.key}
+            value={l.name}
+            color={l.color}
+            hidden={hidden.has(l.key)}
+            onClick={() => toggle(l.key)}
+          />
+        ))}
+      </div>
+      <div style={{ width: '100%', height: 300 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+            <XAxis
+              dataKey="timestamp"
+              tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+              minTickGap={36}
+              tickFormatter={formatHistoryAxisTick}
+            />
+            <YAxis
+              yAxisId="util"
+              domain={[0, 100]}
+              tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+              tickFormatter={(val: string | number) => `${val}%`}
+            />
+            <YAxis
+              yAxisId="freq"
+              orientation="right"
+              tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+            />
+            <Tooltip
+              contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+            />
+            {engineLines.map((l) => (
+              <Line
+                key={l.key}
+                type="monotone"
+                yAxisId={l.yAxisId}
+                dataKey={l.key}
+                name={l.name}
+                stroke={l.color}
+                strokeDasharray={l.dasharray}
+                dot={false}
+                strokeWidth={2}
+                hide={hidden.has(l.key)}
+              />
+            ))}
+            <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Chart 2: Power */}
+      <Text style={{ color: COLORS.textMuted, display: 'block', marginTop: 16, marginBottom: 6 }}>
+        {series.label} — Power (W)
+      </Text>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+        {powerLines.map((l) => (
+          <LegendToggleItem
+            key={l.key}
+            value={l.name}
+            color={l.color}
+            hidden={hidden.has(l.key)}
+            onClick={() => toggle(l.key)}
+          />
+        ))}
+      </div>
+      <div style={{ width: '100%', height: 180 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+            <XAxis
+              dataKey="timestamp"
+              tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+              minTickGap={36}
+              tickFormatter={formatHistoryAxisTick}
+            />
+            <YAxis
+              tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+              tickFormatter={(val: string | number) => `${val}W`}
+            />
+            <Tooltip
+              contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+              formatter={(val: number) => [`${typeof val === 'number' ? val.toFixed(2) : val} W`]}
+            />
+            {powerLines.map((l) => (
+              <Line
+                key={l.key}
+                type="monotone"
+                dataKey={l.key}
+                name={l.name}
+                stroke={l.color}
+                strokeDasharray={l.dasharray}
+                dot={false}
+                strokeWidth={2}
+                hide={hidden.has(l.key)}
+              />
+            ))}
+            <Brush dataKey="timestamp" height={20} stroke={COLORS.accent} travellerWidth={8} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </Card>
+  )
 }
 
 export default function HistoryDashboard({ active }: Props) {
@@ -255,9 +492,18 @@ export default function HistoryDashboard({ active }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [lastFetchAt, setLastFetchAt] = useState<string | null>(null)
 
+  const customRangeReady = useMemo(() => {
+    if (rangePreset !== 'custom') return true
+    const start = customRange?.[0]
+    const end = customRange?.[1]
+    return Boolean(start && end && end.unix() >= start.unix())
+  }, [rangePreset, customRange])
+
   const fetchHistory = useCallback(async () => {
     if (!active) return
+    if (rangePreset === 'custom' && !customRangeReady) return
     setLoading(true)
+    setHistory(null)
 
     const nowSec = Math.floor(Date.now() / 1000)
     let startTime: number | null = null
@@ -277,10 +523,12 @@ export default function HistoryDashboard({ active }: Props) {
       endTime = nowSec
     }
 
+    const queryLimit = Math.max(limit, estimateRequiredLimit(rangePreset, customRange))
+
     try {
       const data = await api.getHistory({
         snapshotType: 'dynamic',
-        limit,
+        limit: queryLimit,
         startTime,
         endTime,
       })
@@ -292,12 +540,13 @@ export default function HistoryDashboard({ active }: Props) {
     } finally {
       setLoading(false)
     }
-  }, [active, limit, rangePreset, customRange])
+  }, [active, limit, rangePreset, customRange, customRangeReady])
 
   useEffect(() => {
     if (!active) return
+    if (rangePreset === 'custom' && !customRangeReady) return
     fetchHistory()
-  }, [active, fetchHistory])
+  }, [active, fetchHistory, rangePreset, customRangeReady])
 
   const dynamicItems = useMemo<HistorySnapshotItem[]>(
     () => (history?.items ?? []).filter((item: HistorySnapshotItem) => item.snapshot_type === 'dynamic'),
@@ -306,6 +555,16 @@ export default function HistoryDashboard({ active }: Props) {
 
   const commonTrendPoints = useMemo(() => buildCommonTrendPoints(dynamicItems), [dynamicItems])
   const gpuTrendSeries = useMemo(() => buildGpuTrendSeries(dynamicItems), [dynamicItems])
+
+  const [commonHidden, setCommonHidden] = useState<Set<string>>(new Set())
+  const toggleCommon = useCallback((key: string) => {
+    setCommonHidden((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
 
   const rangeHint = useMemo(() => {
     if (rangePreset !== 'custom') return `Range: ${rangePreset}`
@@ -341,11 +600,18 @@ export default function HistoryDashboard({ active }: Props) {
 
           {rangePreset === 'custom' && (
             <DatePicker.RangePicker
-              showTime
+              showTime={{ format: 'HH:mm' }}
               allowClear
+              format="MM-DD HH:mm"
               value={customRange}
-              onChange={(values: [Dayjs | null, Dayjs | null] | null) => {
-                setCustomRange(values ?? null)
+              onCalendarChange={(values) => {
+                // Auto-apply as soon as both dates are selected, no need to click OK
+                if (values?.[0] && values?.[1]) {
+                  setCustomRange([values[0], values[1]])
+                }
+              }}
+              onChange={(values) => {
+                setCustomRange(values ? [values[0], values[1]] : null)
               }}
             />
           )}
@@ -357,7 +623,7 @@ export default function HistoryDashboard({ active }: Props) {
             options={LIMIT_OPTIONS.map((val) => ({ label: `${val} rows`, value: val }))}
           />
 
-          <Button icon={<ReloadOutlined />} onClick={() => fetchHistory()}>
+          <Button icon={<ReloadOutlined />} onClick={() => fetchHistory()} disabled={rangePreset === 'custom' && !customRangeReady}>
             Manual Refresh
           </Button>
         </Space>
@@ -368,63 +634,83 @@ export default function HistoryDashboard({ active }: Props) {
       </Text>
 
       <Card
-        style={{
-          background: COLORS.panelBg,
-          border: `1px solid ${COLORS.border}`,
-          borderRadius: 6,
-        }}
+        style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6 }}
         bodyStyle={{ padding: 16 }}
       >
-        <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 10 }}>
-          History curves (System Pressure / Disk / Network + CPU / Memory / Disk / Network / NPU Utilization)
+        <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
+          History Trends — System &amp; Resource Utilization
         </Text>
 
-        <div style={{ width: '100%', height: 380 }}>
-          {loading ? (
-            <div style={{ color: COLORS.textMuted, paddingTop: 48, textAlign: 'center' }}>Loading history...</div>
-          ) : commonTrendPoints.length === 0 ? (
-            <Empty description="No history data" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-          ) : (
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={commonTrendPoints} margin={{ top: 8, right: 20, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="timestamp"
-                  tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                  minTickGap={36}
-                  tickFormatter={(val: string | number) => String(val).slice(-8)}
-                />
-                <YAxis
-                  domain={[0, 100]}
-                  tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                  tickFormatter={(val: string | number) => `${val}%`}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: COLORS.panelBg,
-                    border: `1px solid ${COLORS.border}`,
-                    color: COLORS.text,
-                  }}
-                />
-                <Legend wrapperStyle={{ color: COLORS.textMuted }} />
-                <Line type="monotone" dataKey="systemPressure" name="System Pressure %" stroke={COLORS.orange} dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="diskPressure" name="System Disk %" stroke={COLORS.red} strokeDasharray="5 3" dot={false} strokeWidth={1.9} />
-                <Line type="monotone" dataKey="networkPressure" name="System Network %" stroke={COLORS.green} strokeDasharray="5 3" dot={false} strokeWidth={1.9} />
-                <Line type="monotone" dataKey="cpuUtilization" name="CPU Utilization %" stroke={COLORS.accent} dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="memoryUtilization" name="Memory Utilization %" stroke={COLORS.yellow} dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="diskUtilization" name="Disk Utilization %" stroke={COLORS.red} dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="networkUtilization" name="Network Utilization %" stroke={COLORS.green} dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="npuUtilization" name="NPU Utilization %" stroke={COLORS.text} dot={false} strokeWidth={1.8} />
-                <Brush
-                  dataKey="timestamp"
-                  height={24}
-                  stroke={COLORS.accent}
-                  travellerWidth={8}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+        {/* Common chart toggle legend */}
+        {commonTrendPoints.length > 0 && (() => {
+          const lines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
+            { key: 'systemPressure', name: 'System Pressure %', color: COLORS.orange },
+            { key: 'systemDisk', name: 'Disk Pressure %', color: COLORS.red, dasharray: '5 3' },
+            { key: 'systemNetwork', name: 'Network Pressure %', color: COLORS.green, dasharray: '5 3' },
+            { key: 'cpuUtilization', name: 'CPU Utilization %', color: COLORS.accent },
+            { key: 'memoryUtilization', name: 'Memory Utilization %', color: COLORS.yellow },
+            { key: 'diskUtilization', name: 'Disk Utilization %', color: '#e07b54' },
+            { key: 'diskIops', name: 'Disk IOPS', color: '#9b8cff' },
+            { key: 'networkUtilization', name: 'Network Utilization %', color: '#73bf69' },
+            { key: 'npuUtilization', name: 'NPU Utilization %', color: COLORS.textMuted },
+          ]
+          return (
+            <>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+                {lines.map((l) => (
+                  <LegendToggleItem
+                    key={l.key}
+                    value={l.name}
+                    color={l.color}
+                    hidden={commonHidden.has(l.key)}
+                    onClick={() => toggleCommon(l.key)}
+                  />
+                ))}
+              </div>
+              <div style={{ width: '100%', height: 360 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={commonTrendPoints} margin={{ top: 8, right: 20, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+                    <XAxis
+                      dataKey="timestamp"
+                      tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                      minTickGap={36}
+                      tickFormatter={formatHistoryAxisTick}
+                    />
+                    <YAxis
+                      domain={[0, 100]}
+                      tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                      tickFormatter={(val: string | number) => `${val}%`}
+                    />
+                    <Tooltip
+                      contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                    />
+                    {lines.map((l) => (
+                      <Line
+                        key={l.key}
+                        type="monotone"
+                        dataKey={l.key}
+                        name={l.name}
+                        stroke={l.color}
+                        strokeDasharray={l.dasharray}
+                        dot={false}
+                        strokeWidth={2}
+                        hide={commonHidden.has(l.key)}
+                      />
+                    ))}
+                    <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </>
+          )
+        })()}
+        {loading && (
+          <div style={{ color: COLORS.textMuted, paddingTop: 48, textAlign: 'center' }}>Loading history...</div>
+        )}
+        {!loading && commonTrendPoints.length === 0 && (
+          <Empty description="No history data" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        )}
       </Card>
 
       <div style={{ marginTop: 16 }}>
@@ -452,95 +738,7 @@ export default function HistoryDashboard({ active }: Props) {
           </Card>
         ) : (
           gpuTrendSeries.map((series: GpuTrendSeries) => (
-            <Card
-              key={series.id}
-              style={{
-                background: COLORS.panelBg,
-                border: `1px solid ${COLORS.border}`,
-                borderRadius: 6,
-                marginBottom: 16,
-              }}
-              bodyStyle={{ padding: 16 }}
-            >
-              <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 10 }}>
-                {series.label} - Engine Utilization & GT Frequency
-              </Text>
-
-              <div style={{ width: '100%', height: 340 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={series.points} margin={{ top: 8, right: 20, left: 0, bottom: 0 }}>
-                    <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
-                    <XAxis
-                      dataKey="timestamp"
-                      tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                      minTickGap={36}
-                      tickFormatter={(val: string | number) => String(val).slice(-8)}
-                    />
-                    <YAxis
-                      yAxisId="util"
-                      domain={[0, 100]}
-                      tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                      tickFormatter={(val: string | number) => `${val}%`}
-                    />
-                    <YAxis
-                      yAxisId="freq"
-                      orientation="right"
-                      tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                      tickFormatter={(val: string | number) => `${val}`}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        background: COLORS.panelBg,
-                        border: `1px solid ${COLORS.border}`,
-                        color: COLORS.text,
-                      }}
-                    />
-                    <Legend wrapperStyle={{ color: COLORS.textMuted }} />
-
-                    {ENGINE_CURVE_META.map((engine) => (
-                      <Line
-                        key={engine.key}
-                        type="monotone"
-                        yAxisId="util"
-                        dataKey={engine.key}
-                        name={engine.name}
-                        stroke={engine.color}
-                        dot={false}
-                        strokeWidth={2}
-                      />
-                    ))}
-
-                    <Line
-                      type="monotone"
-                      yAxisId="freq"
-                      dataKey="gt0Freq"
-                      name="GT0 MHz"
-                      stroke={COLORS.text}
-                      strokeDasharray="6 4"
-                      dot={false}
-                      strokeWidth={1.8}
-                    />
-                    <Line
-                      type="monotone"
-                      yAxisId="freq"
-                      dataKey="gt1Freq"
-                      name="GT1 MHz"
-                      stroke={COLORS.textMuted}
-                      strokeDasharray="4 4"
-                      dot={false}
-                      strokeWidth={1.8}
-                    />
-
-                    <Brush
-                      dataKey="timestamp"
-                      height={24}
-                      stroke={COLORS.accent}
-                      travellerWidth={8}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </Card>
+            <GpuHistoryCard key={series.id} series={series} />
           ))
         )}
       </div>

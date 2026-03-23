@@ -104,8 +104,7 @@ class PmtTelemetry:
 
         # Check if PMT sysfs exists
         if not os.path.exists(self.pmt_root):
-            LOG.error('PMT sysfs interface not found at %s', self.pmt_root)
-            sys.exit(1)
+            raise RuntimeError(f'PMT sysfs interface not found at {self.pmt_root}')
 
         for telem_dir in os.listdir(self.pmt_root):
             if not telem_dir.startswith('telem'):
@@ -146,8 +145,7 @@ class PmtTelemetry:
                 break
 
         if self.cpu_gen is None:
-            LOG.error('No CPU telemetry devices found with known GUIDs')
-            sys.exit(1)
+            raise RuntimeError('No CPU telemetry devices found with known GUIDs')
 
         LOG.debug('CPU generation detected: %s', self.cpu_gen)
 

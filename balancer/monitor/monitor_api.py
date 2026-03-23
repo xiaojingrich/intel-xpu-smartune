@@ -372,7 +372,7 @@ def get_history():
                 retmsg="limit must be an integer"
             )
 
-        limit = max(1, min(limit, 1000))
+        limit = max(1, min(limit, 20000))
 
         start_raw = (request.args.get('start_time') or '').strip()
         end_raw = (request.args.get('end_time') or '').strip()

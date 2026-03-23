@@ -27,6 +27,8 @@ KEY_FILE = './b_server.key'
 
 _service_lock = Lock()
 _service = None  # 单例服务实例
+_shutdown_lock = Lock()
+_shutdown_started = False
 
 
 class DynamicService:
@@ -96,10 +98,30 @@ def start_service():
 
 
 def _handle_signal(signum, frame):
-    if _service:
-        _service.shutdown()
+    # Keep signal handler minimal and async-signal-safe: no logging/subprocess here.
+    # Actual shutdown is handled in main() finally block.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
+def _shutdown_service_once():
+    global _shutdown_started
+    with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
+
+    try:
+        if _service:
+            _service.shutdown()
+    except Exception as exc:
+        logger.error(f"Service shutdown failed: {exc}")
+
+    try:
         reset_app_status()
-    raise SystemExit(0)
+    except Exception as exc:
+        logger.error(f"Reset app status failed during shutdown: {exc}")
 
 
 def reset_app_status():
@@ -742,7 +764,12 @@ def main():
         app._service_initialized = True
 
     ssl_context = (CERT_FILE, KEY_FILE)
-    app.run(host="127.0.0.1", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
+    try:
+        app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _shutdown_service_once()
 
 
 if __name__ == "__main__":

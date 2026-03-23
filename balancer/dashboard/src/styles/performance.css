@@ -375,6 +375,18 @@
   min-height: 260px;
 }
 
+.perf-trend-card--compact {
+  min-height: 232px;
+}
+
+.perf-trend-card--compact .perf-trend-head {
+  margin-bottom: 8px;
+}
+
+.perf-trend-card--compact .perf-trend-body {
+  gap: 12px;
+}
+
 .perf-trend-head {
   display: flex;
   justify-content: space-between;
@@ -396,14 +408,29 @@
   align-items: center;
 }
 
+.perf-trend-body--split {
+  align-items: flex-start;
+}
+
+.perf-trend-body--center {
+  align-items: center;
+}
+
 .perf-trend-subtitle {
-  color: #8e9ab3 !important;
+  color: #b6c7ea !important;
   font-size: 11px;
-  display: block;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  line-height: 1.35;
+  max-height: calc(1.35em * 2);
   margin-bottom: 8px;
-  white-space: nowrap;
+  white-space: normal;
   overflow: hidden;
   text-overflow: ellipsis;
+  word-break: break-word;
+  cursor: help;
 }
 
 .perf-trend-main {
@@ -428,6 +455,18 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px 14px;
+}
+
+.perf-detail-grid--compact {
+  gap: 6px 10px;
+}
+
+.perf-detail-grid--compact .perf-detail-label {
+  font-size: 9px;
+}
+
+.perf-detail-grid--compact .perf-detail-value {
+  font-size: 11px;
 }
 
 .perf-detail-item {
@@ -660,19 +699,29 @@
 
 .perf-engine-current-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
   margin-top: 8px;
 }
 
 .perf-engine-current-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  border: 1px solid rgba(90, 169, 255, 0.22);
-  border-radius: 8px;
-  background: rgba(9, 16, 28, 0.45);
-  padding: 6px 8px;
+  gap: 5px;
+}
+
+.perf-engine-current-bar-track {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.perf-engine-current-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.35s ease;
 }
 
 .perf-engine-grid {

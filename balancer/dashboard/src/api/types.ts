@@ -9,6 +9,8 @@ export interface DiskDeviceData {
   is_busy: boolean
   read_kb_per_sec: number
   write_kb_per_sec: number
+  read_iops?: number
+  write_iops?: number
 }
 
 export interface DiskData {
@@ -108,6 +110,8 @@ export interface StaticInfoData {
   driver: {
     kernel_version: string | null
     kernel_cmdline: string | null
+    guc_fw?: string[]
+    huc_fw?: string[]
     mesa: PackageInfo
     opencl: PackageInfo
     level_zero: PackageInfo
@@ -124,6 +128,8 @@ export interface StaticInfoData {
       min_mhz: number | null
       max_mhz: number | null
       per_core_mhz: Array<number | null>
+      p_core_freq_mhz?: { min_mhz: number | null; max_mhz: number | null } | null
+      e_core_freq_mhz?: { min_mhz: number | null; max_mhz: number | null } | null
     }
   }
   memory: {
@@ -151,12 +157,20 @@ export interface StaticInfoData {
     count: number
     engines: Record<string, string[]>
     freq_bounds_mhz: Record<string, { min_mhz: number | null; max_mhz: number | null }>
+    gt_freq_bounds_mhz?: Record<string, {
+      gt0?: { min_mhz: number | null; max_mhz: number | null }
+      gt1?: { min_mhz: number | null; max_mhz: number | null }
+    }>
     vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null }>
     pcie: Record<string, { current_speed: string | null; current_width: string | null; max_speed: string | null; max_width: string | null }>
+    eu_count?: Record<string, number | null>
+    pci_addresses?: Record<string, string>
   }
   npu: {
     names: string[]
-    freq_bounds_mhz: Record<string, { min_mhz: number | null; max_mhz: number | null }>
+    freq_bounds_mhz: Record<string, { min_mhz?: number | null; max_mhz: number | null }>
+    pciid?: string | null
+    driver_version?: string | null
   }
 }
 

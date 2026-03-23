@@ -42,7 +42,7 @@ export const api = {
   getDynamicInfo: () => get<DynamicInfoData>('/monitor/dynamic_info'),
   getHistory: (options: HistoryQueryOptions = {}) => {
     const snapshotType = options.snapshotType ?? 'dynamic'
-    const limit = Math.max(1, Math.min(options.limit ?? 100, 1000))
+    const limit = Math.max(1, Math.min(options.limit ?? 100, 20000))
     const params = new URLSearchParams({
       snapshot_type: snapshotType,
       limit: String(limit),

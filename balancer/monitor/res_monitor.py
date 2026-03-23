@@ -24,7 +24,7 @@ class ResourceMonitor:
         """初始化资源监视器"""
         self.config = b_config
         self.cpu_cores = os.cpu_count() or 16
-        self.prev_io = psutil.disk_io_counters()
+        self.prev_io = psutil.disk_io_counters(perdisk=True)
         self.prev_time = time.time()
         # 桌面应用信息
         try:
@@ -483,17 +483,60 @@ class ResourceMonitor:
             }
         }
         """
-        usage_data = self.get_disk_io_usage()['disk_io']
-        speed_data = self.get_disk_io_speed()['disk_io']
+        disks = self.get_physical_disks()
+        curr_io = psutil.disk_io_counters(perdisk=True)
+        curr_time = time.time()
 
-        # 合并结果
+        prev_io = self.prev_io if isinstance(self.prev_io, dict) else {}
+        time_elapsed = curr_time - self.prev_time
+
         merged_result = {}
-        for disk in usage_data.keys():
+        for disk in disks:
+            curr = curr_io.get(disk)
+            prev = prev_io.get(disk)
+            if not curr or not prev or time_elapsed <= 0:
+                merged_result[disk] = {
+                    'utilization': 0.0,
+                    'is_busy': False,
+                    'read_kb_per_sec': 0.0,
+                    'write_kb_per_sec': 0.0,
+                    'read_iops': 0.0,
+                    'write_iops': 0.0,
+                }
+                continue
+
+            read_kb = (curr.read_bytes - prev.read_bytes) / 1024
+            write_kb = (curr.write_bytes - prev.write_bytes) / 1024
+            read_kb_per_sec = max(0.0, read_kb / time_elapsed)
+            write_kb_per_sec = max(0.0, write_kb / time_elapsed)
+            read_iops = max(0.0, (curr.read_count - prev.read_count) / time_elapsed)
+            write_iops = max(0.0, (curr.write_count - prev.write_count) / time_elapsed)
+
+            # Prefer device busy_time/io_time if available; fallback to read+write time.
+            prev_busy = getattr(prev, 'busy_time', None)
+            curr_busy = getattr(curr, 'busy_time', None)
+            if prev_busy is None or curr_busy is None:
+                prev_busy = getattr(prev, 'io_time', None)
+                curr_busy = getattr(curr, 'io_time', None)
+
+            if prev_busy is not None and curr_busy is not None:
+                busy_delta_ms = curr_busy - prev_busy
+            else:
+                busy_delta_ms = (curr.read_time - prev.read_time) + (curr.write_time - prev.write_time)
+
+            utilization = min(100.0, max(0.0, 100.0 * busy_delta_ms / (time_elapsed * 1000.0)))
+
             merged_result[disk] = {
-                **usage_data[disk],  # 包含 utilization 和 is_busy
-                **speed_data.get(disk, {})  # 包含 read/write_kb_per_sec
+                'utilization': round(utilization, 2),
+                'is_busy': utilization > self.config.disk_utilization_threshold,
+                'read_kb_per_sec': round(read_kb_per_sec, 2),
+                'write_kb_per_sec': round(write_kb_per_sec, 2),
+                'read_iops': round(read_iops, 2),
+                'write_iops': round(write_iops, 2),
             }
 
+        self.prev_io = curr_io
+        self.prev_time = curr_time
         return {'disk_io': merged_result}
 
     def is_disk_io_stressed(self, device: str = None, threshold: float = None) -> dict:
