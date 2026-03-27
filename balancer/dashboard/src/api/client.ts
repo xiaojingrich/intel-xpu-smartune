@@ -13,6 +13,7 @@ import type {
   DynamicInfoData,
   HistoryData,
   HistoryQueryOptions,
+  HistoryRetentionData,
   SetControlPayload,
   AppIdPayload,
   SetPriorityPayload,
@@ -65,6 +66,10 @@ export const api = {
 
     return get<HistoryData>(`/monitor/history?${params.toString()}`)
   },
+
+  getHistoryRetention: () => get<HistoryRetentionData>('/monitor/history/retention'),
+  setHistoryRetention: (days: number) =>
+    post<{ retention_days: number; deleted: number }>('/monitor/history/retention', { retention_days: days }),
 
   getApps: () => post<AppListData>('/app/get_apps'),
   getControlledApps: () => post<AppListData>('/app/get_controlled_app'),

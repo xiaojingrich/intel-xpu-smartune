@@ -44,15 +44,17 @@ import '../styles/performance.css'
 
 const { Text, Title } = Typography
 
-const REFRESH_INTERVAL_OPTIONS: Array<{ label: string; value: number }> = [
+// UI-selectable refresh intervals for dynamic_info polling.
+// The backend pre-caches data every ~2 s, so polls at any interval are cheap.
+const DEFAULT_REFRESH_INTERVAL_MS = 2000
+const REFRESH_INTERVAL_OPTIONS = [
   { label: '1s', value: 1000 },
   { label: '2s', value: 2000 },
   { label: '3s', value: 3000 },
   { label: '5s', value: 5000 },
 ]
-const DEFAULT_REFRESH_INTERVAL_MS = 3000
-const MIN_REFRESH_INTERVAL_MS = Math.min(...REFRESH_INTERVAL_OPTIONS.map((option) => option.value))
-const TREND_STORAGE_MAX_POINTS = Math.round((5 * 60 * 1000) / MIN_REFRESH_INTERVAL_MS)
+// Store enough points for 5 min at the fastest polling rate (1 s = 300 points)
+const TREND_STORAGE_MAX_POINTS = 300
 const ENGINE_ORDER = ['ccs', 'rcs', 'bcs', 'vcs', 'vecs'] as const
 
 const PERF_COLORS = {
@@ -1988,15 +1990,12 @@ export default function SystemOverview({ active }: Props) {
     }
   }, [gpuFilter, gpuDevices])
 
-  const oneMinPoints = useMemo(
-    () => Math.max(1, Math.round((60 * 1000) / refreshIntervalMs)),
-    [refreshIntervalMs],
-  )
-  const fiveMinPoints = useMemo(
-    () => Math.max(1, Math.round((5 * 60 * 1000) / refreshIntervalMs)),
-    [refreshIntervalMs],
-  )
-  const trendPoints = trendWindow === '1m' ? oneMinPoints : fiveMinPoints
+  // Trend window: number of points = window duration / polling interval
+  const trendPoints = useMemo(() => {
+    const windowMs = trendWindow === '1m' ? 60_000 : 5 * 60_000
+    return Math.max(1, Math.round(windowMs / refreshIntervalMs))
+  }, [trendWindow, refreshIntervalMs])
+
   const getSeries = useCallback(
     (key: string) => {
       const values = trends[key] || []
@@ -2337,6 +2336,7 @@ export default function SystemOverview({ active }: Props) {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Space size={6}>
+            {loadingDynamic ? <Spin size="small" /> : <Badge status="processing" color={COLORS.green} />}
             <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>Refresh</Text>
             <Segmented
               size="small"
@@ -2345,8 +2345,6 @@ export default function SystemOverview({ active }: Props) {
               onChange={(value) => setRefreshIntervalMs(Number(value))}
             />
           </Space>
-          <Badge status="processing" color={COLORS.green} />
-          <Text style={{ color: COLORS.textMuted, fontSize: 12 }}>Streaming</Text>
           {dynamicInfo?.collected_at && (
             <Tag style={{ fontSize: 10, color: COLORS.textMuted, borderColor: COLORS.border }}>
               {dynamicInfo.collected_at}
@@ -2772,7 +2770,7 @@ export default function SystemOverview({ active }: Props) {
       </Row>
       )}
 
-      {loadingDynamic && !dynamicInfo && (
+      {!dynamicInfo && (
         <div style={{ marginTop: 16 }}>
           <Spin size="small" />
         </div>

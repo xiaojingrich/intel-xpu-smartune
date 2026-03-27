@@ -36,14 +36,16 @@ _STATIC_CACHE_LOCK = threading.Lock()
 
 _NET_RUNTIME_STATE: Dict[str, Any] = {"ts": None, "bytes": {}}
 _QMASSA_STATE: Dict[str, Any] = {
-    "process": None,
     "json_path": None,
     "last_start": 0.0,
     "last_parsed": None,
     "last_invalid_json_log_ts": 0.0,
+    "last_failure_ts": 0.0,
 }
 _QMASSA_LOCK = threading.Lock()
 _QMASSA_SHUTDOWN = False
+_QMASSA_RETRY_BACKOFF_SEC = 60   # seconds to wait before retrying after a confirmed failure
+_QMASSA_STARTUP_GRACE_SEC = 10   # seconds after launch before the process is expected to be visible
 _QMASSA_MAX_JSON_BYTES = 8 * 1024 * 1024
 _QMASSA_MAX_STATES = 600
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
@@ -1198,23 +1200,139 @@ def _get_qmassa_binary() -> Optional[str]:
     return None
 
 
+def _find_qmassa_pids(qmassa_bin: str) -> List[int]:
+    """Return the PIDs of all running qmassa daemon processes.
+
+    Uses ``pgrep -f`` (full-cmdline text search, same as ``ps -f``) as the
+    primary strategy, because some daemons replace ``argv[0]`` with just the
+    basename after a double-fork, which defeats an exact path comparison.
+
+    Falls back to psutil with relaxed matching when ``pgrep`` is unavailable.
+    """
+    qmassa_name = os.path.basename(qmassa_bin)
+    pids: List[int] = []
+
+    # ── Strategy 1: pgrep -f  (matches full /proc/[pid]/cmdline text) ─────
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", qmassa_bin],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            for token in result.stdout.split():
+                try:
+                    pids.append(int(token))
+                except ValueError:
+                    pass
+            if pids:
+                return pids
+    except Exception:
+        pass
+
+    # ── Strategy 2: psutil with relaxed matching ───────────────────────────
+    try:
+        for p in psutil.process_iter(['pid', 'name', 'cmdline', 'status']):
+            try:
+                info = p.info
+                if info.get('status') == psutil.STATUS_ZOMBIE:
+                    continue
+                cmdline = info.get('cmdline') or []
+                name = info.get('name') or ''
+
+                # Full path in argv[0]  (most common case)
+                if cmdline and cmdline[0] == qmassa_bin:
+                    pids.append(p.pid)
+                    continue
+                # Basename in argv[0]   (daemon rewrote its argv)
+                if cmdline and os.path.basename(cmdline[0]) == qmassa_name:
+                    pids.append(p.pid)
+                    continue
+                # Full path anywhere in cmdline (some daemons re-exec)
+                if cmdline and any(arg == qmassa_bin for arg in cmdline[1:]):
+                    pids.append(p.pid)
+                    continue
+                # Empty cmdline matched by process name (kernel thread style)
+                if not cmdline and name == qmassa_name:
+                    pids.append(p.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+
+    return pids
+
+
+def _find_qmassa_process(qmassa_bin: str) -> Optional[int]:
+    """Return the PID of a running qmassa daemon, or ``None`` if not found."""
+    pids = _find_qmassa_pids(qmassa_bin)
+    return pids[0] if pids else None
+
+
+def _kill_qmassa_processes(qmassa_bin: str) -> None:
+    """Send SIGTERM to every running qmassa process found in the process table."""
+    for pid in _find_qmassa_pids(qmassa_bin):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.debug("Failed to terminate qmassa pid %d: %s", pid, exc)
+
+
 def _ensure_qmassa_running() -> Optional[str]:
     global _QMASSA_SHUTDOWN
     with _QMASSA_LOCK:
         if _QMASSA_SHUTDOWN:
             return None
-        proc = _QMASSA_STATE.get("process")
-        if proc and proc.poll() is None:
-            return _QMASSA_STATE.get("json_path")
 
         qmassa_bin = _get_qmassa_binary()
         if not qmassa_bin:
             return None
 
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         json_path = os.path.join("/tmp", "qmassa-metrics.json")
+
+        # Fast path: process is already visible in the OS process table.
+        # This correctly handles daemonization: the original launcher exits,
+        # but the real daemon lives under a different PID.
+        if _find_qmassa_process(qmassa_bin) is not None:
+            if _QMASSA_STATE.get("json_path") != json_path:
+                _QMASSA_STATE["json_path"] = json_path
+            return json_path
+
+        now = time.time()
+        last_start = _QMASSA_STATE.get("last_start") or 0.0
+        last_failure = _QMASSA_STATE.get("last_failure_ts") or 0.0
+
+        # Within startup grace window: qmassa was just launched and may still
+        # be daemonizing / writing its PID.  Return json_path optimistically;
+        # _get_qmassa_output() handles the case where the file doesn't exist
+        # yet, so no data is lost — we just get empty results for a few seconds.
+        if last_start and now - last_start < _QMASSA_STARTUP_GRACE_SEC:
+            return json_path
+
+        # Grace period elapsed and the process is still not visible — genuine failure.
+        if last_start and not last_failure:
+            last_failure = now
+            _QMASSA_STATE["last_failure_ts"] = now
+            _QMASSA_STATE["last_start"] = 0.0
+            logger.warning(
+                "qmassa failed to start, binary: %s; will retry in %ds",
+                qmassa_bin, _QMASSA_RETRY_BACKOFF_SEC,
+            )
+
+        # Respect retry backoff after a confirmed failure.
+        if last_failure and now - last_failure < _QMASSA_RETRY_BACKOFF_SEC:
+            return None
+
+        # Launch qmassa.  We do NOT block to verify — if the binary daemonizes
+        # the launcher exits immediately and the daemon may take a few seconds
+        # to appear in the process table.  The startup grace window above
+        # handles this without triggering a false failure.
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         try:
-            proc = subprocess.Popen(
+            subprocess.Popen(
                 [qmassa_bin, "-x", "-t", json_path],
                 cwd=repo_root,
                 stdin=subprocess.DEVNULL,
@@ -1222,19 +1340,14 @@ def _ensure_qmassa_running() -> Optional[str]:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            # Give it a moment and check it didn't immediately exit
-            import time as _time
-            _time.sleep(0.3)
-            if proc.poll() is not None:
-                logger.warning("qmassa exited immediately (code %s), binary: %s", proc.returncode, qmassa_bin)
-                return None
-            _QMASSA_STATE["process"] = proc
             _QMASSA_STATE["json_path"] = json_path
-            _QMASSA_STATE["last_start"] = time.time()
-            logger.info("qmassa started: %s", qmassa_bin)
+            _QMASSA_STATE["last_start"] = now
+            _QMASSA_STATE["last_failure_ts"] = 0.0
+            logger.info("qmassa launched: %s", qmassa_bin)
             return json_path
         except Exception as exc:
-            logger.debug("Failed to start qmassa: %s", exc)
+            _QMASSA_STATE["last_failure_ts"] = now
+            logger.debug("Failed to launch qmassa: %s", exc)
             return None
 
 
@@ -1242,27 +1355,20 @@ def shutdown_qmassa() -> None:
     global _QMASSA_SHUTDOWN
     _QMASSA_SHUTDOWN = True
 
-    proc = None
     json_path = None
+    qmassa_bin = _get_qmassa_binary()
 
     with _QMASSA_LOCK:
-        proc = _QMASSA_STATE.get("process")
         json_path = _QMASSA_STATE.get("json_path")
-        _QMASSA_STATE["process"] = None
         _QMASSA_STATE["json_path"] = None
         _QMASSA_STATE["last_start"] = 0.0
         _QMASSA_STATE["last_parsed"] = None
+        _QMASSA_STATE["last_failure_ts"] = 0.0
 
-    if proc and proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=1)
-        except Exception:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=1)
-            except Exception as exc:
-                logger.debug("Failed to stop qmassa process group: %s", exc)
+    # Kill the daemon by scanning the process table (the original Popen handle
+    # is not reliable because qmassa daemonizes and the launcher exits first).
+    if qmassa_bin:
+        _kill_qmassa_processes(qmassa_bin)
 
     if json_path and os.path.exists(json_path):
         try:
@@ -1271,9 +1377,95 @@ def shutdown_qmassa() -> None:
             logger.debug("Failed to remove qmassa output file %s: %s", json_path, exc)
 
 
+_QMASSA_COMPACT_THRESHOLD = 10   # compact when states array exceeds this count
+_QMASSA_COMPACT_KEEP = 5         # keep this many most-recent states after compaction
+
+
 def _compact_qmassa_json_if_needed(json_path: str, raw_data: str) -> str:
-    # Compaction disabled: keep qmassa output in original form.
-    return raw_data
+    """Compact the qmassa JSON file if its states array has grown too large.
+
+    qmassa appends monitoring snapshots to a ``"states"`` array in the output
+    file, which causes the file to grow unboundedly over time.  This function
+    rewrites the file to keep only the most recent
+    ``_QMASSA_COMPACT_KEEP`` states whenever the array exceeds
+    ``_QMASSA_COMPACT_THRESHOLD`` entries.
+
+    The rewrite is best-effort: any exception (e.g. a concurrent write from
+    qmassa) is silently swallowed and the original data is returned unchanged.
+
+    Returns the (possibly compacted) raw JSON string.
+    """
+    try:
+        payload = json.loads(raw_data)
+    except Exception:
+        return raw_data
+
+    states = payload.get("states") or []
+    if len(states) <= _QMASSA_COMPACT_THRESHOLD:
+        return raw_data
+
+    payload["states"] = states[-_QMASSA_COMPACT_KEEP:]
+    compacted = json.dumps(payload, ensure_ascii=False)
+    try:
+        # Write atomically via a sibling temp file then rename so the file is
+        # never seen in a half-written state by concurrent readers.
+        tmp_path = json_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(compacted)
+        os.replace(tmp_path, json_path)
+        logger.debug(
+            "Compacted qmassa JSON: %d → %d states (%d bytes)",
+            len(states),
+            len(payload["states"]),
+            len(compacted),
+        )
+    except Exception as exc:
+        logger.debug("Failed to compact qmassa JSON file: %s", exc)
+
+    return compacted
+
+
+_QMASSA_JSON_READ_RETRIES = 3        # attempts before treating file as invalid
+_QMASSA_JSON_READ_RETRY_DELAY = 0.05  # seconds (50 ms) between read attempts
+
+
+def _read_qmassa_json(json_path: str) -> Optional[Dict[str, Any]]:
+    """Read and parse the qmassa JSON output file, retrying on transient I/O races.
+
+    qmassa rewrites its output file in-place (non-atomic), so the monitor may
+    catch a partial write.  Rather than immediately surfacing that as an error,
+    we retry a handful of times with a short delay, which is almost always
+    enough to wait for the write to complete.
+
+    After a successful parse the file is compacted when necessary to prevent
+    the ``states`` array from growing unboundedly on disk.
+
+    Returns the parsed dict on success, or ``None`` if all attempts fail.
+    """
+    for attempt in range(_QMASSA_JSON_READ_RETRIES):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = f.read()
+        except OSError:
+            return None
+
+        if not data or not data.strip():
+            # File is empty — qmassa may still be starting up; retry.
+            if attempt < _QMASSA_JSON_READ_RETRIES - 1:
+                time.sleep(_QMASSA_JSON_READ_RETRY_DELAY)
+            continue
+
+        parsed = _parse_qmassa_json(data)
+        if parsed is not None:
+            # Compact the file in the background to prevent unbounded growth.
+            _compact_qmassa_json_if_needed(json_path, data)
+            return parsed
+
+        # JSON is invalid — likely a partial write; wait and retry.
+        if attempt < _QMASSA_JSON_READ_RETRIES - 1:
+            time.sleep(_QMASSA_JSON_READ_RETRY_DELAY)
+
+    return None
 
 
 def _get_qmassa_output() -> Dict[str, Any]:
@@ -1284,20 +1476,17 @@ def _get_qmassa_output() -> Dict[str, Any]:
         return {"available": False, "raw": None, "parsed": None, "error": f"{json_path} not found"}
 
     try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = f.read()
-        if not data or not data.strip():
-            return {"available": False, "raw": None, "parsed": None, "error": "qmassa output empty"}
-
-        parsed = _parse_qmassa_json(data)
+        parsed = _read_qmassa_json(json_path)
 
         with _QMASSA_LOCK:
             cached = _QMASSA_STATE.get("last_parsed")
             if parsed is None:
+                # All retry attempts failed — file is genuinely invalid right now.
+                # Log at most once every 30 s to avoid flooding the log.
                 now = time.time()
                 last_log_ts = float(_QMASSA_STATE.get("last_invalid_json_log_ts") or 0.0)
                 if now - last_log_ts >= 30.0:
-                    logger.debug("qmassa output not valid JSON yet (likely being written), will retry")
+                    logger.debug("qmassa output could not be parsed after retries; using cached data")
                     _QMASSA_STATE["last_invalid_json_log_ts"] = now
                 if cached:
                     return {

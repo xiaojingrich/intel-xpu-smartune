@@ -356,3 +356,10 @@ export interface HistoryQueryOptions {
   startTime?: number | null
   endTime?: number | null
 }
+
+export interface HistoryRetentionData {
+  retention_days: number
+  default_days: number
+  min_days: number
+  max_days: number
+}

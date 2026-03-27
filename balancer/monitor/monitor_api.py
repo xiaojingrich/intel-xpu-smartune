@@ -13,8 +13,10 @@
 
 
 import json
+import os
 import threading
 import time
+from typing import Any, Dict, Optional
 from flask import Blueprint, request
 
 import psutil
@@ -30,6 +32,59 @@ monitor_bp = Blueprint('monitor', __name__, url_prefix='/monitor')
 _resource_monitor = None
 _network_monitor = None
 _system_pressure_monitor = None
+
+# ---------------------------------------------------------------------------
+# Background auto-refresh cache for /dynamic_info
+# ---------------------------------------------------------------------------
+# A daemon thread pre-collects dynamic_info every _DYNAMIC_INFO_REFRESH_INTERVAL_SEC
+# seconds.  The REST endpoint simply returns the cached value, making each poll
+# response near-instant regardless of how frequently the UI calls it.
+# This is the same pattern used by SystemPressureMonitor._start_auto_refresh.
+_DYNAMIC_INFO_REFRESH_INTERVAL_SEC: float = 2.0   # background collection interval
+_DYNAMIC_INFO_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+_DYNAMIC_INFO_CACHE_LOCK = threading.Lock()
+_dynamic_info_refresh_started = False
+_dynamic_info_refresh_start_lock = threading.Lock()
+
+
+def _start_dynamic_info_auto_refresh() -> None:
+    """Start the background thread that pre-caches dynamic_info.
+
+    Idempotent: calling more than once has no effect.  The thread collects
+    fresh metrics every ``_DYNAMIC_INFO_REFRESH_INTERVAL_SEC`` seconds and
+    stores the result in ``_DYNAMIC_INFO_CACHE`` so that API requests return
+    immediately without blocking on expensive metric collection.
+    """
+    global _dynamic_info_refresh_started
+    with _dynamic_info_refresh_start_lock:
+        if _dynamic_info_refresh_started:
+            return
+        _dynamic_info_refresh_started = True
+
+    def refresh_loop() -> None:
+        while True:
+            loop_start = time.time()
+            try:
+                monitor = _get_resource_monitor()
+                spm = _get_system_pressure_monitor()
+                net = _get_network_monitor()
+                data = collect_dynamic_info(
+                    resource_monitor=monitor,
+                    system_pressure_monitor=spm,
+                    network_monitor=net,
+                )
+                with _DYNAMIC_INFO_CACHE_LOCK:
+                    _DYNAMIC_INFO_CACHE["data"] = data
+                    _DYNAMIC_INFO_CACHE["ts"] = time.time()
+            except Exception as exc:
+                logger.debug("dynamic_info auto-refresh error: %s", exc)
+            elapsed = time.time() - loop_start
+            # Always sleep at least 0.1 s to avoid a tight loop if collection
+            # finishes faster than expected (e.g. an exception path).
+            time.sleep(max(0.1, _DYNAMIC_INFO_REFRESH_INTERVAL_SEC - elapsed))
+
+    t = threading.Thread(target=refresh_loop, daemon=True, name="dynamic-info-refresh")
+    t.start()
 
 
 def _get_resource_monitor() -> ResourceMonitor:
@@ -66,6 +121,106 @@ def register_system_pressure_monitor(spm) -> None:
     """
     global _system_pressure_monitor
     _system_pressure_monitor = spm
+
+
+# ---------------------------------------------------------------------------
+# Snapshot retention settings and background cleanup
+# ---------------------------------------------------------------------------
+# MonitorSnapshot rows are written every few seconds; without periodic cleanup
+# the database grows without bound.  A background thread runs an hourly sweep
+# and deletes rows older than _SNAPSHOT_RETENTION_DAYS days.
+#
+# The retention period is user-configurable via the History tab and persisted
+# in a small JSON file alongside the database so the setting survives restarts.
+
+_SNAPSHOT_RETENTION_DEFAULT_DAYS: int = 3
+_SNAPSHOT_RETENTION_MIN_DAYS: int = 1
+_SNAPSHOT_RETENTION_MAX_DAYS: int = 7
+_SNAPSHOT_CLEANUP_INTERVAL_SEC: float = 3600.0  # run cleanup every hour
+
+# Path of the settings file — stored in the project root alongside the database.
+_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "monitor_settings.json")
+_SETTINGS_LOCK = threading.Lock()
+
+# In-memory copy; populated by _load_retention_settings() on first use.
+_retention_days: Optional[int] = None
+_cleanup_started = False
+_cleanup_start_lock = threading.Lock()
+
+
+def _load_retention_settings() -> int:
+    """Load retention days from the settings file.  Returns the loaded value (or default)."""
+    global _retention_days
+    with _SETTINGS_LOCK:
+        if _retention_days is not None:
+            return _retention_days
+        try:
+            with open(_SETTINGS_FILE, "r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            days = int(cfg.get("snapshot_retention_days", _SNAPSHOT_RETENTION_DEFAULT_DAYS))
+            days = max(_SNAPSHOT_RETENTION_MIN_DAYS, min(days, _SNAPSHOT_RETENTION_MAX_DAYS))
+        except Exception:
+            days = _SNAPSHOT_RETENTION_DEFAULT_DAYS
+        _retention_days = days
+        return days
+
+
+def _save_retention_settings(days: int) -> None:
+    """Persist retention days to the settings file and update the in-memory value."""
+    global _retention_days
+    days = max(_SNAPSHOT_RETENTION_MIN_DAYS, min(int(days), _SNAPSHOT_RETENTION_MAX_DAYS))
+    with _SETTINGS_LOCK:
+        _retention_days = days
+        try:
+            existing: Dict[str, Any] = {}
+            try:
+                with open(_SETTINGS_FILE, "r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+            except Exception:
+                pass
+            existing["snapshot_retention_days"] = days
+            tmp = _SETTINGS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(existing, fh)
+            os.replace(tmp, _SETTINGS_FILE)
+        except Exception as exc:
+            logger.warning("Failed to save monitor settings: %s", exc)
+
+
+def _run_snapshot_cleanup() -> None:
+    """Delete MonitorSnapshot rows older than the configured retention period."""
+    days = _load_retention_settings()
+    try:
+        deleted = MonitorSnapshot.delete_older_than(days)
+        if deleted:
+            logger.info("Snapshot cleanup: deleted %d rows older than %d day(s)", deleted, days)
+        else:
+            logger.debug("Snapshot cleanup: no rows to delete (retention = %d day(s))", days)
+    except Exception as exc:
+        logger.warning("Snapshot cleanup failed: %s", exc)
+
+
+def _start_snapshot_cleanup_task() -> None:
+    """Start the background thread that periodically deletes old snapshots.
+
+    Idempotent — calling more than once has no effect.
+    """
+    global _cleanup_started
+    with _cleanup_start_lock:
+        if _cleanup_started:
+            return
+        _cleanup_started = True
+
+    def cleanup_loop() -> None:
+        # Run once at startup (with a short delay to let the server settle),
+        # then every _SNAPSHOT_CLEANUP_INTERVAL_SEC seconds.
+        time.sleep(30)
+        while True:
+            _run_snapshot_cleanup()
+            time.sleep(_SNAPSHOT_CLEANUP_INTERVAL_SEC)
+
+    t = threading.Thread(target=cleanup_loop, daemon=True, name="snapshot-cleanup")
+    t.start()
 
 
 @monitor_bp.route('/cpu', methods=['GET', 'POST'])
@@ -563,6 +718,11 @@ def get_dynamic_info():
     """
     Return dynamic system metrics snapshot.
 
+    The background auto-refresh thread keeps the cache up to date so this
+    endpoint responds immediately without blocking on metric collection.  On
+    the very first request (before the cache is populated) it falls back to
+    collecting synchronously.
+
     Response data:
         {
             "cpu": { ... },
@@ -575,26 +735,38 @@ def get_dynamic_info():
             "collected_at": <str>
         }
     """
-    try:
-        monitor = _get_resource_monitor()
-        spm = _get_system_pressure_monitor()
-        net = _get_network_monitor()
-        data = collect_dynamic_info(resource_monitor=monitor, system_pressure_monitor=spm, network_monitor=net)
-        return construct_response(
-            data=data,
-            retmsg="Successfully retrieved dynamic system info"
-        )
-    except Exception as e:
-        logger.error(f"get_dynamic_info failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
+    _start_dynamic_info_auto_refresh()
+
+    with _DYNAMIC_INFO_CACHE_LOCK:
+        data = _DYNAMIC_INFO_CACHE.get("data")
+
+    if data is None:
+        # Cache not yet populated — collect synchronously on first call.
+        try:
+            monitor = _get_resource_monitor()
+            spm = _get_system_pressure_monitor()
+            net = _get_network_monitor()
+            data = collect_dynamic_info(resource_monitor=monitor, system_pressure_monitor=spm, network_monitor=net)
+            with _DYNAMIC_INFO_CACHE_LOCK:
+                _DYNAMIC_INFO_CACHE["data"] = data
+                _DYNAMIC_INFO_CACHE["ts"] = time.time()
+        except Exception as e:
+            logger.error(f"get_dynamic_info failed: {str(e)}")
+            return construct_response(
+                data={},
+                retcode=RetCode.EXCEPTION_ERROR,
+                retmsg=str(e)
+            )
+
+    return construct_response(
+        data=data,
+        retmsg="Successfully retrieved dynamic system info"
+    )
 
 
 @monitor_bp.route('/history', methods=['GET'])
 def get_history():
+    _start_snapshot_cleanup_task()
     try:
         snapshot_type = (request.args.get('snapshot_type') or '').strip().lower()
         if snapshot_type in ('', 'all'):
@@ -692,6 +864,90 @@ def get_history():
         )
     except Exception as e:
         logger.error(f"get_history failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/history/retention', methods=['GET'])
+def get_history_retention():
+    """Return the current MonitorSnapshot retention period and allowed options.
+
+    Response data:
+        {
+            "retention_days": <int>,        // current setting (1-7)
+            "default_days": <int>,          // built-in default (3)
+            "min_days": <int>,              // minimum allowed (1)
+            "max_days": <int>               // maximum allowed (7)
+        }
+    """
+    _start_snapshot_cleanup_task()
+    return construct_response(
+        data={
+            'retention_days': _load_retention_settings(),
+            'default_days': _SNAPSHOT_RETENTION_DEFAULT_DAYS,
+            'min_days': _SNAPSHOT_RETENTION_MIN_DAYS,
+            'max_days': _SNAPSHOT_RETENTION_MAX_DAYS,
+        },
+        retmsg="Successfully retrieved retention settings"
+    )
+
+
+@monitor_bp.route('/history/retention', methods=['POST'])
+def set_history_retention():
+    """Update the MonitorSnapshot retention period and optionally trigger an immediate cleanup.
+
+    Request body:
+        {
+            "retention_days": <int>   // required, 1-7
+        }
+
+    Response data:
+        {
+            "retention_days": <int>,
+            "deleted": <int>          // rows deleted by the immediate cleanup sweep
+        }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        days_raw = body.get('retention_days')
+        if days_raw is None:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="retention_days is required"
+            )
+        try:
+            days = int(days_raw)
+        except (TypeError, ValueError):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="retention_days must be an integer"
+            )
+        if not (_SNAPSHOT_RETENTION_MIN_DAYS <= days <= _SNAPSHOT_RETENTION_MAX_DAYS):
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg=f"retention_days must be between {_SNAPSHOT_RETENTION_MIN_DAYS} and {_SNAPSHOT_RETENTION_MAX_DAYS}"
+            )
+
+        _save_retention_settings(days)
+        _start_snapshot_cleanup_task()
+
+        # Run an immediate cleanup sweep so the new policy takes effect right away.
+        deleted = MonitorSnapshot.delete_older_than(days)
+        if deleted:
+            logger.info("Retention updated to %d day(s); immediate cleanup deleted %d row(s)", days, deleted)
+
+        return construct_response(
+            data={'retention_days': days, 'deleted': deleted},
+            retmsg=f"Retention set to {days} day(s)"
+        )
+    except Exception as e:
+        logger.error(f"set_history_retention failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,

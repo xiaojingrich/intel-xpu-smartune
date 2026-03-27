@@ -207,6 +207,21 @@ class MonitorSnapshot(DataBaseModel):
                 print(f"Error querying monitor snapshots: {e}")
                 return []
 
+    @classmethod
+    def delete_older_than(cls, days: int) -> int:
+        """Delete snapshots whose ``create_time`` is older than ``days`` days.
+
+        Returns the number of rows deleted, or 0 on error.
+        """
+        cutoff = int(time.time()) - max(1, int(days)) * 86400
+        with db_lock:
+            try:
+                with db.atomic():
+                    return cls.delete().where(cls.create_time < cutoff).execute()
+            except (IntegrityError, OperationalError) as e:
+                print(f"Error deleting old monitor snapshots: {e}")
+                return 0
+
 
 def init_database():
     db.create_tables([AIAppPriority, MonitorSnapshot])  # Add other tables as needed

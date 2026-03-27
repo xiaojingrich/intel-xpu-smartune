@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Card, DatePicker, Empty, Segmented, Select, Space, Typography } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
+import { Alert, Button, Card, DatePicker, Divider, Empty, Popover, Segmented, Select, Space, Typography, message } from 'antd'
+import { ReloadOutlined, SettingOutlined } from '@ant-design/icons'
 import {
   Brush,
   CartesianGrid,
@@ -13,7 +13,7 @@ import {
 } from 'recharts'
 import dayjs, { type Dayjs } from 'dayjs'
 import { api } from '../api/client'
-import type { DynamicInfoData, HistoryData, HistorySnapshotItem, QmassaDevice } from '../api/types'
+import type { DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, QmassaDevice } from '../api/types'
 import { COLORS } from '../styles/theme'
 
 const { Text, Title } = Typography
@@ -492,6 +492,12 @@ export default function HistoryDashboard({ active }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [lastFetchAt, setLastFetchAt] = useState<string | null>(null)
 
+  // Retention settings state
+  const [retention, setRetention] = useState<HistoryRetentionData | null>(null)
+  const [pendingRetentionDays, setPendingRetentionDays] = useState<number | null>(null)
+  const [savingRetention, setSavingRetention] = useState(false)
+  const [messageApi, messageContextHolder] = message.useMessage()
+
   const customRangeReady = useMemo(() => {
     if (rangePreset !== 'custom') return true
     const start = customRange?.[0]
@@ -548,6 +554,41 @@ export default function HistoryDashboard({ active }: Props) {
     fetchHistory()
   }, [active, fetchHistory, rangePreset, customRangeReady])
 
+  const fetchRetention = useCallback(async () => {
+    if (!active) return
+    try {
+      const data = await api.getHistoryRetention()
+      setRetention(data)
+      setPendingRetentionDays(data.retention_days)
+    } catch {
+      // Non-critical — ignore errors silently
+    }
+  }, [active])
+
+  useEffect(() => {
+    if (!active) return
+    fetchRetention()
+  }, [active, fetchRetention])
+
+  const handleSaveRetention = useCallback(async () => {
+    if (pendingRetentionDays === null) return
+    setSavingRetention(true)
+    try {
+      const result = await api.setHistoryRetention(pendingRetentionDays)
+      setRetention((prev) => prev ? { ...prev, retention_days: result.retention_days } : prev)
+      const msg = result.deleted
+        ? `Retention set to ${result.retention_days} day(s). ${result.deleted} old record(s) deleted.`
+        : `Retention set to ${result.retention_days} day(s).`
+      messageApi.success(msg)
+      // Refresh history so the UI reflects any newly-removed rows.
+      fetchHistory()
+    } catch (e: unknown) {
+      messageApi.error(e instanceof Error ? e.message : 'Failed to save retention setting')
+    } finally {
+      setSavingRetention(false)
+    }
+  }, [pendingRetentionDays, messageApi, fetchHistory])
+
   const dynamicItems = useMemo<HistorySnapshotItem[]>(
     () => (history?.items ?? []).filter((item: HistorySnapshotItem) => item.snapshot_type === 'dynamic'),
     [history],
@@ -576,6 +617,7 @@ export default function HistoryDashboard({ active }: Props) {
 
   return (
     <div style={{ padding: '16px 0' }}>
+      {messageContextHolder}
       {error && (
         <Alert
           message="History API Error"
@@ -626,11 +668,55 @@ export default function HistoryDashboard({ active }: Props) {
           <Button icon={<ReloadOutlined />} onClick={() => fetchHistory()} disabled={rangePreset === 'custom' && !customRangeReady}>
             Manual Refresh
           </Button>
+
+          <Popover
+            trigger="click"
+            title="History Data Retention"
+            content={
+              <div style={{ minWidth: 260 }}>
+                <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 8 }}>
+                  Snapshots older than the selected period are automatically deleted
+                  (once at startup and then every hour). Changing the setting triggers
+                  an immediate cleanup.
+                </Text>
+                <Divider style={{ margin: '8px 0' }} />
+                <Space>
+                  <Text style={{ color: COLORS.text }}>Retain for:</Text>
+                  <Select
+                    value={pendingRetentionDays ?? retention?.retention_days ?? 3}
+                    onChange={setPendingRetentionDays}
+                    style={{ width: 110 }}
+                    options={Array.from(
+                      { length: (retention?.max_days ?? 7) - (retention?.min_days ?? 1) + 1 },
+                      (_, i) => {
+                        const d = (retention?.min_days ?? 1) + i
+                        return { value: d, label: `${d} day${d === 1 ? '' : 's'}` }
+                      },
+                    )}
+                  />
+                  <Button
+                    type="primary"
+                    size="small"
+                    loading={savingRetention}
+                    disabled={
+                      pendingRetentionDays === null ||
+                      pendingRetentionDays === retention?.retention_days
+                    }
+                    onClick={handleSaveRetention}
+                  >
+                    Save
+                  </Button>
+                </Space>
+              </div>
+            }
+          >
+            <Button icon={<SettingOutlined />} />
+          </Popover>
         </Space>
       </div>
 
       <Text style={{ color: COLORS.textMuted, fontSize: 12, display: 'block', marginBottom: 12 }}>
-        {rangeHint}{lastFetchAt ? ` | Last fetch: ${lastFetchAt}` : ''}
+        {rangeHint}{lastFetchAt ? ` | Last fetch: ${lastFetchAt}` : ''}{retention ? ` | Retention: ${retention.retention_days} day${retention.retention_days === 1 ? '' : 's'}` : ''}
       </Text>
 
       <Card
