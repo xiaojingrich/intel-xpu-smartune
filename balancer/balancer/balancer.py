@@ -204,10 +204,13 @@ class DynamicBalancer:
 
                 # 当队列不为空时立即处理，为空时每10s检查一次
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
+                    # Use consume_peak_pressure_level() instead of get_current_pressure_level()
+                    # so that transient "critical" spikes that occurred while the
+                    # idle_check_interval gate was closed are never silently dropped.
                     if policy == "separated":
-                        pressure, _, is_disk_io_stressed, *__ = self.controlManager.get_current_pressure_level()
+                        pressure, _, is_disk_io_stressed = self.controlManager.consume_peak_pressure_level()
                     else:  # policy == "combined"
-                        pressure, *_ = self.controlManager.get_current_pressure_level()
+                        pressure, *_ = self.controlManager.consume_peak_pressure_level()
                         is_disk_io_stressed = False
 
                     last_check_time = current_time

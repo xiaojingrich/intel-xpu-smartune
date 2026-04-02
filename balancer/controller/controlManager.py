@@ -34,6 +34,11 @@ class ControlManager:
         """ Get system pressure level, score, disk pressure status, and PSI data. """
         return self.system_pressure_monitor.get_current_pressure_level()
 
+    def consume_peak_pressure_level(self) -> tuple:
+        """ Return the highest pressure level seen since the last call and reset the peak.
+        Used by the balancer loop to avoid missing transient critical spikes. """
+        return self.system_pressure_monitor.consume_peak_pressure_level()
+
     def update_network_pressure_level(self, network_data):
         """ Get network pressure level based on network data. """
         return self.system_pressure_monitor.update_network_pressure_level(network_data)

@@ -1,10 +1,6 @@
 import axios from 'axios'
 import type {
   ApiResponse,
-  NetworkData,
-  PressureData,
-  TopConsumersData,
-  TopDiskIoConsumersData,
   AppResourceStatsData,
   AppDiskIoStatsData,
   ProcessListData,
@@ -39,10 +35,6 @@ async function post<T>(url: string, body: object = {}): Promise<T> {
 }
 
 export const api = {
-  getNetwork: () => get<NetworkData>('/monitor/network'),
-  getPressure: () => get<PressureData>('/monitor/pressure'),
-  getTopConsumers: () => get<TopConsumersData>('/monitor/top_consumers'),
-  getTopDiskIoConsumers: () => get<TopDiskIoConsumersData>('/monitor/top_disk_io_consumers'),
   getAppResourceStats: (n = 10) => get<AppResourceStatsData>(`/monitor/app_resource_stats?n=${n}`),
   getAppDiskIoStats: (n = 10) => get<AppDiskIoStatsData>(`/monitor/app_disk_io_stats?n=${n}`),
   getProcesses: () => get<ProcessListData>('/monitor/processes'),

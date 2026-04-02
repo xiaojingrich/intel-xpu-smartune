@@ -223,315 +223,6 @@ def _start_snapshot_cleanup_task() -> None:
     t.start()
 
 
-@monitor_bp.route('/cpu', methods=['GET', 'POST'])
-# NOTE: This route is not called by the dashboard client (client.ts).
-# CPU data is served via /monitor/dynamic_info.
-def get_cpu():
-    """
-    Return current CPU usage statistics.
-
-    Response data:
-        {
-            "count": <int>,        # number of logical CPU cores
-            "usage": <float>,      # overall CPU usage in percent (0-100)
-            "available": <float>,  # remaining CPU capacity in percent (0-100)
-            "is_busy": <bool>      # True when usage exceeds the configured threshold
-        }
-    """
-    try:
-        monitor = _get_resource_monitor()
-        usage = monitor.get_resource_usage()
-        return construct_response(
-            data=usage['cpu'],
-            retmsg="Successfully retrieved CPU usage"
-        )
-    except Exception as e:
-        logger.error(f"get_cpu failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/memory', methods=['GET'])
-# NOTE: This route is not called by the dashboard client (client.ts).
-# Memory data is served via /monitor/dynamic_info.
-def get_memory():
-    """
-    Return current memory usage statistics.
-
-    Response data:
-        {
-            "total_gb": <float>,        # total physical memory in GB
-            "usage": <float>,           # memory usage in percent (0-100)
-            "available_ratio": <float>, # fraction of memory still available (0-1)
-            "is_busy": <bool>           # True when usage exceeds the configured threshold
-        }
-    """
-    try:
-        monitor = _get_resource_monitor()
-        usage = monitor.get_resource_usage()
-        return construct_response(
-            data=usage['memory'],
-            retmsg="Successfully retrieved memory usage"
-        )
-    except Exception as e:
-        logger.error(f"get_memory failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/disk', methods=['GET'])
-# NOTE: This route is not called by the dashboard client (client.ts).
-# Disk IO stress data is served via /monitor/dynamic_info.
-def get_disk():
-    """
-    Return disk I/O statistics and stress assessment.
-
-    Response data:
-        {
-            "disk_io": {
-                "<device>": {
-                    "utilization": <float>,       # disk utilization in percent (0-100)
-                    "is_busy": <bool>,            # True when utilization exceeds threshold
-                    "read_kb_per_sec": <float>,   # read throughput in KB/s
-                    "write_kb_per_sec": <float>   # write throughput in KB/s
-                },
-                ...
-            },
-            "is_stressed": <bool>,          # True when disk I/O is under stress
-            "stressed_disks": [<str>, ...], # list of stressed device names
-            "iowait": <float>               # system iowait percentage
-        }
-    """
-    try:
-        monitor = _get_resource_monitor()
-        disk_stress = monitor.is_disk_io_stressed()
-        disk_stats = monitor.get_disk_stats()
-        return construct_response(
-            data={
-                **disk_stats,
-                'is_stressed': disk_stress['is_stressed'],
-                'stressed_disks': disk_stress['stressed_disks'],
-                'iowait': disk_stress['iowait'],
-            },
-            retmsg="Successfully retrieved disk I/O stats"
-        )
-    except Exception as e:
-        logger.error(f"get_disk failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/network', methods=['GET'])
-def get_network():
-    """
-    Return current network utilization with pressure levels.
-
-    Response data:
-        {
-            "rx": <float>,       # receive-side utilization (0-1, fraction of max bandwidth)
-            "tx": <float>,       # transmit-side utilization (0-1, fraction of max bandwidth)
-            "rx_level": <str>,   # pressure level for rx: "low"/"medium"/"high"/"critical"
-            "tx_level": <str>    # pressure level for tx: "low"/"medium"/"high"/"critical"
-        }
-    """
-    try:
-        net_monitor = _get_network_monitor()
-        network_data = net_monitor.get_current_pressure()
-        spm = _get_system_pressure_monitor()
-        tx_level, rx_level, tx_val, rx_val = spm.update_network_pressure_level(network_data)
-        return construct_response(
-            data={
-                'rx': rx_val,
-                'tx': tx_val,
-                'rx_level': rx_level,
-                'tx_level': tx_level,
-            },
-            retmsg="Successfully retrieved network pressure"
-        )
-    except Exception as e:
-        logger.error(f"get_network failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/pressure', methods=['GET'])
-def get_pressure():
-    """
-    Return overall system pressure level with PSI metrics.
-
-    Response data:
-        {
-            "level": <str>,              # overall level: "low"/"medium"/"high"/"critical"
-            "score": <float>,            # composite pressure score (0-1)
-            "is_disk_io_stressed": <bool>,
-            "cpu": <float>,              # CPU PSI pressure (0-1)
-            "memory": <float>,           # memory PSI pressure (0-1)
-            "io": <float>                # I/O PSI pressure (0-1)
-        }
-    """
-    try:
-        spm = _get_system_pressure_monitor()
-        level, score, is_disk_io_stressed, psi_data = spm.get_current_pressure_level()
-        return construct_response(
-            data={
-                'level': level,
-                'score': score,
-                'is_disk_io_stressed': is_disk_io_stressed,
-                'cpu': psi_data.get('cpu', 0.0),
-                'memory': psi_data.get('memory', 0.0),
-                'io': psi_data.get('io', 0.0),
-            },
-            retmsg="Successfully retrieved system pressure"
-        )
-    except Exception as e:
-        logger.error(f"get_pressure failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/summary', methods=['GET'])
-# NOTE: This route is not called by the dashboard client (client.ts).
-# Use /monitor/dynamic_info for a comprehensive resource snapshot instead.
-def get_summary():
-    """
-    Return a combined snapshot of all system resource statistics.
-
-    Response data:
-        {
-            "cpu": { ... },      # same as GET /monitor/cpu
-            "memory": { ... },   # same as GET /monitor/memory
-            "disk": { ... },     # same as GET /monitor/disk
-            "network": { ... },  # same as GET /monitor/network
-            "pressure": { ... }  # same as GET /monitor/pressure
-        }
-    """
-    try:
-        monitor = _get_resource_monitor()
-        net_monitor = _get_network_monitor()
-
-        resource_usage = monitor.get_resource_usage()
-        disk_stats = monitor.get_disk_stats()
-        net_pressure = net_monitor.get_current_pressure()
-
-        try:
-            psi_pressure = PSIMonitor().get_current_pressure()
-        except Exception as psi_err:
-            logger.warning(f"PSI unavailable: {psi_err}")
-            psi_pressure = {'cpu': 0.0, 'memory': 0.0, 'io': 0.0}
-
-        summary = {
-            'cpu': resource_usage['cpu'],
-            'memory': resource_usage['memory'],
-            'disk': disk_stats,
-            'network': net_pressure,
-            'pressure': psi_pressure,
-        }
-        return construct_response(
-            data=summary,
-            retmsg="Successfully retrieved system summary"
-        )
-    except Exception as e:
-        logger.error(f"get_summary failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/top_consumers', methods=['GET'])
-def get_top_consumers():
-    """
-    Return the top resource-consuming processes along with their matched application info.
-
-    Response data:
-        [
-            {
-                "process": {
-                    "pid": <int>,
-                    "name": <str>,
-                    "cmdline": <str>,
-                    "score": <float>,
-                    "cpu_avg": <float>,
-                    "mem_rss": <float>,
-                    "io_read_rate": <float>
-                },
-                "app": <dict|null>  # matched desktop/systemd/cgroup app info
-            },
-            ...
-        ]
-    """
-    try:
-        monitor = _get_resource_monitor()
-        consumers, reach_threshold = monitor.get_top_resource_consumers()
-        return construct_response(
-            data={
-                'consumers': consumers,
-                'reach_threshold': reach_threshold,
-            },
-            retmsg="Successfully retrieved top resource consumers"
-        )
-    except Exception as e:
-        logger.error(f"get_top_consumers failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
-
-
-@monitor_bp.route('/top_disk_io_consumers', methods=['GET'])
-def get_top_disk_io_consumers():
-    """
-    Return the top disk I/O-consuming processes along with their matched application info.
-
-    Response data:
-        {
-            "consumers": [
-                {
-                    "process": {
-                        "pid": <int>,
-                        "name": <str>,
-                        "cmdline": <str>,
-                        "score": <float>,
-                        "io_read_rate": <float>,   # MB/s
-                        "io_write_rate": <float>   # MB/s
-                    },
-                    "app": <dict|null>
-                },
-                ...
-            ]
-        }
-    """
-    try:
-        monitor = _get_resource_monitor()
-        consumers = monitor.get_top_disk_io_consumers()
-        return construct_response(
-            data={'consumers': consumers},
-            retmsg="Successfully retrieved top disk I/O consumers"
-        )
-    except Exception as e:
-        logger.error(f"get_top_disk_io_consumers failed: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
 
 
 @monitor_bp.route('/app_resource_stats', methods=['GET'])
@@ -963,6 +654,19 @@ def set_history_retention():
         )
 
 
+
+# Numeric ordering for pressure levels used by the peak-latch logic.
+# Higher numbers represent higher pressure.  "unknown" ranks below every
+# real level so that it never masks a valid reading.
+_LEVEL_ORDER: Dict[str, int] = {
+    "unknown":  -1,
+    "low":       0,
+    "medium":    1,
+    "high":      2,
+    "critical":  3,
+}
+
+
 class SystemPressureMonitor:
     """ Manages overall system pressure state based on PSI and resource usage,
     with auto-refresh and disk I/O stress tracking."""
@@ -975,11 +679,18 @@ class SystemPressureMonitor:
         self._current_level = None
         self.is_current_disk_io_stressed = False
         self.score = 0.0
-        self._psi_data = {}
+        self._disk_io_stress: dict = {}
         self._last_update_time = 0
         self._CACHE_TTL = config.regular_update_sys_pressure_time
         self._is_limited_app_dominant = False
         self._update_lock = threading.Lock()
+
+        # Peak-latch fields: track the highest pressure seen since the balancer
+        # last called consume_peak_pressure_level().  They only rise (never fall)
+        # during each refresh cycle so that transient spikes cannot be silently
+        # skipped by the balancer's idle_check_interval gate.
+        self._peak_level = None
+        self._peak_disk_io_stressed = False
 
         self._start_auto_refresh()
 
@@ -1001,7 +712,17 @@ class SystemPressureMonitor:
         """线程安全的更新操作"""
         if self._update_lock.acquire(blocking=False):
             try:
-                self._current_level, self.score, self.is_current_disk_io_stressed, self._psi_data = self._update_pressure_level()
+                new_level, score, disk_io_stressed, disk_io_stress = self._update_pressure_level()
+                self._current_level = new_level
+                self.score = score
+                self.is_current_disk_io_stressed = disk_io_stressed
+                self._disk_io_stress = disk_io_stress
+                # Peak latch: only raise the peak, never lower it.  The balancer
+                # resets the peak via consume_peak_pressure_level().
+                if _LEVEL_ORDER.get(new_level, -1) > _LEVEL_ORDER.get(self._peak_level, -1):
+                    self._peak_level = new_level
+                if disk_io_stressed:
+                    self._peak_disk_io_stressed = True
             finally:
                 self._update_lock.release()
 
@@ -1019,18 +740,59 @@ class SystemPressureMonitor:
             logger.debug(f"disk_io={disk_io}")
             level = self.analyzer.get_pressure_level(score, self.config.thresholds)
             self._last_update_time = time.time()
-            return level, score, disk_io.get("is_stressed", False), psi_data
+            return level, score, disk_io.get("is_stressed", False), disk_io
         except Exception as e:
             logger.error("Failed to update pressure level: %s", str(e))
             return "unknown", 0.0, False, {}
 
     def get_current_pressure_level(self) -> tuple:
         """获取当前压力等级
-        返回: (level, score, is_disk_io_stressed, psi_data)
+        返回: (level, score, is_disk_io_stressed)
         """
         logger.debug("Current PSI level: %s (pressure: %.2f), disk io stressed: %s", self._current_level, self.score,
                      self.is_current_disk_io_stressed)
-        return self._current_level, self.score, self.is_current_disk_io_stressed, self._psi_data
+        return self._current_level, self.score, self.is_current_disk_io_stressed
+
+    def consume_peak_pressure_level(self) -> tuple:
+        """Return the highest pressure level seen since the last call, then reset the peak.
+
+        Returns (peak_level, score, peak_disk_io_stressed).
+
+        The balancer calls this instead of get_current_pressure_level() so that
+        transient spikes (e.g. a brief "critical" window that resolves before the
+        idle_check_interval gate opens) are never silently dropped.  The peak is
+        reset to the current instantaneous level after each call, so the next call
+        starts fresh.  This decouples correctness from the relationship between
+        idle_check_interval, regular_update_sys_pressure_time, and the UI poll
+        interval — no dynamic coupling between those three clocks is required.
+
+        Note: get_current_pressure_level() is intentionally kept separate and is
+        still used by display/point-in-time paths (UI, appIntercept) that must NOT
+        consume or reset the peak.
+        """
+        with self._update_lock:
+            peak_level = self._peak_level if self._peak_level is not None else self._current_level
+            peak_disk_io = self._peak_disk_io_stressed
+            # Reset peak to current instantaneous values ready for the next window.
+            self._peak_level = self._current_level
+            self._peak_disk_io_stressed = self.is_current_disk_io_stressed
+        logger.debug(
+            "consume_peak: peak_level=%s, peak_disk_io=%s (current=%s)",
+            peak_level, peak_disk_io, self._current_level,
+        )
+        return peak_level, self.score, peak_disk_io
+
+    def get_disk_io_stress(self) -> dict:
+        """返回最近一次更新时缓存的磁盘 IO 压力详情（与 ResourceMonitor.is_disk_io_stressed 格式相同）。
+        返回:
+            {
+                "is_stressed": bool,
+                "stressed_disks": list[str],
+                "iowait": float,
+                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
+            }
+        """
+        return self._disk_io_stress
 
     def update_network_pressure_level(self, network_data):
         """

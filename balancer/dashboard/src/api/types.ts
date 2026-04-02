@@ -20,32 +20,12 @@ export interface DiskData {
   iowait?: number
 }
 
-export interface NetworkData {
-  rx: number
-  tx: number
-  rx_level?: string
-  tx_level?: string
-}
-
 export interface PressureData {
-  cpu: number
-  memory: number
-  io: number
   level?: string
   score?: number
   is_disk_io_stressed?: boolean
   network_rx?: number
   network_tx?: number
-}
-
-export interface ProcessInfo {
-  pid: number
-  name: string
-  cmdline: string
-  cpu_avg: number
-  memory_rss: number
-  io_read_rate: number
-  score?: number
 }
 
 export interface AppInfo {
@@ -63,29 +43,6 @@ export interface AppInfo {
   cgroup?: string
   is_running?: boolean
   is_pending?: boolean
-}
-
-export interface Consumer {
-  process: ProcessInfo
-  app: AppInfo
-}
-
-export interface DiskIoProcessInfo {
-  pid: number
-  name: string
-  cmdline: string
-  score: number
-  io_read_rate: number
-  io_write_rate: number
-}
-
-export interface DiskIoConsumer {
-  process: DiskIoProcessInfo
-  app: AppInfo | null
-}
-
-export interface TopDiskIoConsumersData {
-  consumers: DiskIoConsumer[]
 }
 
 export interface AppResourceEntry {
@@ -135,11 +92,6 @@ export interface ProcessEntry {
 export interface ProcessListData {
   count: number
   processes: ProcessEntry[]
-}
-
-export interface TopConsumersData {
-  consumers: Consumer[]
-  reach_threshold: boolean
 }
 
 export type AppListData = AppInfo[]

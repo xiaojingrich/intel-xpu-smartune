@@ -616,17 +616,19 @@ class ResourceMonitor:
             }
         }
 
-    def get_disk_stats(self) -> dict:
+    def _collect_disk_io_stats(self) -> dict:
         """
-        所有磁盘IO利用率和读写速度的统计结果
+        采集所有磁盘IO的原始统计数据（利用率、读写速度、IOPS）。
+        仅供内部使用, is_busy 判断由 is_disk_io_stressed 负责。
         :return:
         {
             "disk_io": {
                 "nvme0n1": {
                     "utilization": 45.2,
-                    "is_busy": True,
-                    "read_kb_per_sec": 1024 kB/s,
-                    "write_kb_per_sec": 512 kB/s,
+                    "read_kb_per_sec": 1024.0,
+                    "write_kb_per_sec": 512.0,
+                    "read_iops": 128.0,
+                    "write_iops": 64.0,
                 },
                 ...
             }
@@ -646,7 +648,6 @@ class ResourceMonitor:
             if not curr or not prev or time_elapsed <= 0:
                 merged_result[disk] = {
                     'utilization': 0.0,
-                    'is_busy': False,
                     'read_kb_per_sec': 0.0,
                     'write_kb_per_sec': 0.0,
                     'read_iops': 0.0,
@@ -677,7 +678,6 @@ class ResourceMonitor:
 
             merged_result[disk] = {
                 'utilization': round(utilization, 2),
-                'is_busy': utilization > self.config.disk_utilization_threshold,
                 'read_kb_per_sec': round(read_kb_per_sec, 2),
                 'write_kb_per_sec': round(write_kb_per_sec, 2),
                 'read_iops': round(read_iops, 2),
@@ -704,10 +704,10 @@ class ResourceMonitor:
                 "is_stressed": bool,               # 整体是否紧张
                 "stressed_disks": list[str],       # 紧张的磁盘列表
                 "iowait": float,                   # CPU 的 I/O 等待时间（%）
-                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, is_busy}}
+                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
             }
         """
-        disk_stats = self.get_disk_stats()["disk_io"]
+        disk_stats = self._collect_disk_io_stats()["disk_io"]
 
         # CPU iowait
         iowait = psutil.cpu_times_percent().iowait

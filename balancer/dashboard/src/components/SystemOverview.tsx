@@ -1889,9 +1889,6 @@ export default function SystemOverview({ active }: Props) {
       setErrorDynamic(null)
 
       const updates: Record<string, number | null> = {
-        'pressure:cpu': normalizePercent(data.pressure?.cpu),
-        'pressure:memory': normalizePercent(data.pressure?.memory),
-        'pressure:io': normalizePercent(data.pressure?.io),
         'pressure:score': isNumber(data.pressure?.score) ? data.pressure.score! * 100 : null,
         'pressure:network:rx': isNumber(data.pressure?.network_rx) ? data.pressure.network_rx! * 100 : null,
         'pressure:network:tx': isNumber(data.pressure?.network_tx) ? data.pressure.network_tx! * 100 : null,
@@ -1912,10 +1909,7 @@ export default function SystemOverview({ active }: Props) {
         updates['npu:memory_mb'] = typeof npuRawParsed.memory_bytes === 'number' ? (npuRawParsed.memory_bytes as number) / (1024 * 1024) : null
       }
 
-      const pressureValues = [updates['pressure:cpu'], updates['pressure:memory'], updates['pressure:io']].filter(isNumber)
-      updates['pressure:peak'] = isNumber(updates['pressure:score'])
-        ? updates['pressure:score']
-        : pressureValues.length ? Math.max(...pressureValues) : null
+      updates['pressure:peak'] = updates['pressure:score'] ?? null
 
       data.cpu.per_core_usage.forEach((value, index) => {
         updates[`cpu:core:${index}`] = normalizePercent(value)
@@ -2210,9 +2204,6 @@ export default function SystemOverview({ active }: Props) {
     : null
   const maxDiskUtil = busiestDisk ? normalizePercent(busiestDisk[1]?.utilization) : null
 
-  const pressureCpu = normalizePercent(dynamicInfo?.pressure?.cpu)
-  const pressureMemory = normalizePercent(dynamicInfo?.pressure?.memory)
-  const pressureIo = normalizePercent(dynamicInfo?.pressure?.io)
   const cpuUsagePct = normalizePercent(dynamicInfo?.cpu.usage_total ?? null)
   const memoryUsagePct = normalizePercent(dynamicInfo?.memory.usage_percent ?? null)
 
@@ -2420,7 +2411,7 @@ export default function SystemOverview({ active }: Props) {
               valuePct={systemPressurePct}
               subtitle={pressureLevel
                 ? `Level: ${pressureLevel.toUpperCase()} | Score: ${isNumber(pressureScore) ? (pressureScore / 100).toFixed(2) : 'N/A'}`
-                : `CPU PSI: ${formatPercent(pressureCpu, 0)} | Mem PSI: ${formatPercent(pressureMemory, 0)}`}
+                : undefined}
               description="Weighted composite score (PSI × resource usage)"
             />
           </Col>

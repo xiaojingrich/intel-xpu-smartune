@@ -28,7 +28,6 @@ import psutil
 from config.config import b_config
 from db.DatabaseModel import MonitorSnapshot
 from monitor.intel_npu_smi import PmtTelemetry, get_npu_processes
-from monitor import PSIMonitor
 from utils.logger import logger
 
 _STATIC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
@@ -2009,18 +2008,18 @@ def preload_static_info() -> Dict[str, Any]:
 
 
 def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None, network_monitor=None) -> Dict[str, Any]:
-    psi = PSIMonitor().get_current_pressure()
-
-    # Enrich pressure data from SystemPressureMonitor when available
+    # Build pressure metadata from SystemPressureMonitor when available.
+    # get_current_pressure_level() is a cheap cache read; the actual measurement
+    # is done by the SPM's own background refresh thread.
+    # Only the computed outputs (level, score, is_disk_io_stressed) are included —
+    # the raw PSI inputs used internally are not exposed here.
     pressure_extra: Dict[str, Any] = {}
     if system_pressure_monitor is not None:
         try:
-            level, score, is_disk_io_stressed, psi_data = system_pressure_monitor.get_current_pressure_level()
+            level, score, is_disk_io_stressed = system_pressure_monitor.get_current_pressure_level()
             pressure_extra['score'] = score
             pressure_extra['level'] = level
             pressure_extra['is_disk_io_stressed'] = is_disk_io_stressed
-            if psi_data:
-                psi = psi_data  # use the cached PSI from the monitor
         except Exception as e:
             logger.warning(f"SystemPressureMonitor unavailable: {e}")
 
@@ -2033,15 +2032,32 @@ def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None, ne
         except Exception as e:
             logger.warning(f"NetworkMonitor unavailable: {e}")
 
-    disk_stats = resource_monitor.get_disk_stats() if resource_monitor else {}
+    # Use the disk IO result already cached inside the SPM (same measurement cycle)
+    # to avoid a redundant is_disk_io_stressed() call.
+    disk_stats = {}
+    if system_pressure_monitor is not None:
+        try:
+            disk_stress = system_pressure_monitor.get_disk_io_stress()
+            if disk_stress:
+                disk_stats = {
+                    'disk_io': disk_stress.get('details', {}),
+                    'is_stressed': disk_stress.get('is_stressed', False),
+                    'stressed_disks': disk_stress.get('stressed_disks', []),
+                    'iowait': disk_stress.get('iowait', 0.0),
+                }
+        except Exception as e:
+            logger.warning(f"Disk stress check unavailable via SPM: {e}")
 
-    # Add disk IO stress assessment
-    if resource_monitor is not None:
+    if not disk_stats and resource_monitor is not None:
+        # Fallback when SPM is unavailable or its cache is empty
         try:
             disk_stress = resource_monitor.is_disk_io_stressed()
-            disk_stats['is_stressed'] = disk_stress.get('is_stressed', False)
-            disk_stats['stressed_disks'] = disk_stress.get('stressed_disks', [])
-            disk_stats['iowait'] = disk_stress.get('iowait', 0.0)
+            disk_stats = {
+                'disk_io': disk_stress.get('details', {}),
+                'is_stressed': disk_stress.get('is_stressed', False),
+                'stressed_disks': disk_stress.get('stressed_disks', []),
+                'iowait': disk_stress.get('iowait', 0.0),
+            }
         except Exception as e:
             logger.warning(f"Disk stress check unavailable: {e}")
 
@@ -2051,7 +2067,7 @@ def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None, ne
         "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "cpu": _get_cpu_dynamic(),
         "memory": _get_memory_dynamic(),
-        "pressure": {**psi, **pressure_extra},
+        "pressure": pressure_extra,
         "network": _get_network_runtime_bw(),
         "disk": disk_stats,
         "gpu": {
