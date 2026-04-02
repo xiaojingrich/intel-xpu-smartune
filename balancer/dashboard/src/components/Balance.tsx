@@ -82,7 +82,7 @@ function PriorityTag({ priority }: { priority?: string }) {
   )
 }
 
-export default function AppManagement({ active }: Props) {
+export default function Balance({ active }: Props) {
   const [allApps, setAllApps] = useState<AppInfo[]>([])
   const [controlledApps, setControlledApps] = useState<AppInfo[]>([])
   const [pendingApps, setPendingApps] = useState<AppInfo[]>([])

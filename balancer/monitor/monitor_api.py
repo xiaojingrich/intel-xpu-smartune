@@ -224,6 +224,8 @@ def _start_snapshot_cleanup_task() -> None:
 
 
 @monitor_bp.route('/cpu', methods=['GET', 'POST'])
+# NOTE: This route is not called by the dashboard client (client.ts).
+# CPU data is served via /monitor/dynamic_info.
 def get_cpu():
     """
     Return current CPU usage statistics.
@@ -253,6 +255,8 @@ def get_cpu():
 
 
 @monitor_bp.route('/memory', methods=['GET'])
+# NOTE: This route is not called by the dashboard client (client.ts).
+# Memory data is served via /monitor/dynamic_info.
 def get_memory():
     """
     Return current memory usage statistics.
@@ -282,6 +286,8 @@ def get_memory():
 
 
 @monitor_bp.route('/disk', methods=['GET'])
+# NOTE: This route is not called by the dashboard client (client.ts).
+# Disk IO stress data is served via /monitor/dynamic_info.
 def get_disk():
     """
     Return disk I/O statistics and stress assessment.
@@ -399,6 +405,8 @@ def get_pressure():
 
 
 @monitor_bp.route('/summary', methods=['GET'])
+# NOTE: This route is not called by the dashboard client (client.ts).
+# Use /monitor/dynamic_info for a comprehensive resource snapshot instead.
 def get_summary():
     """
     Return a combined snapshot of all system resource statistics.

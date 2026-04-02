@@ -38,6 +38,7 @@ import type {
   DynamicInfoData,
   QmassaDevice,
   QmassaFreq,
+  DiskDeviceData,
 } from '../api/types'
 import { usePolling } from '../hooks/usePolling'
 import '../styles/performance.css'
@@ -1928,6 +1929,10 @@ export default function SystemOverview({ active }: Props) {
         ? Math.max(...dynamicDiskDevices.map((disk) => normalizePercent(disk.utilization) || 0))
         : null
 
+      Object.entries(data.disk?.disk_io || {}).forEach(([diskName, diskData]) => {
+        updates[`disk:${diskName}:util`] = normalizePercent(diskData.utilization)
+      })
+
       const primaryInterface = typeof staticInfo?.io.primary_interface === 'string'
         ? staticInfo.io.primary_interface
         : null
@@ -2195,7 +2200,7 @@ export default function SystemOverview({ active }: Props) {
         ? `${staticInfo.gpu.count} GPU | ${staticInfo.gpu.names.join(' / ') || 'Unknown'}`
         : 'No data')
 
-  const diskDevices = dynamicInfo?.disk?.disk_io ? Object.entries(dynamicInfo.disk.disk_io) : []
+  const diskDevices: [string, DiskDeviceData][] = dynamicInfo?.disk?.disk_io ? Object.entries(dynamicInfo.disk.disk_io) : []
   const busiestDisk = diskDevices.length
     ? [...diskDevices].sort((a, b) => {
         const left = normalizePercent(a[1]?.utilization) || 0
@@ -2223,6 +2228,23 @@ export default function SystemOverview({ active }: Props) {
   const diskIsStressed = dynamicInfo?.disk?.is_stressed ?? false
   const diskIoWait = isNumber(dynamicInfo?.disk?.iowait) ? (dynamicInfo.disk.iowait as number) : null
   const diskStressedList = dynamicInfo?.disk?.stressed_disks ?? []
+
+  // Per-disk busy summary for Disk IO Pressure gauge
+  const diskBusyNames = diskDevices.filter(([, d]) => d.is_busy).map(([n]) => n)
+  const diskTotalCount = diskDevices.length
+  const diskBusyCount = diskBusyNames.length
+  const diskBusyRatio = diskTotalCount > 0 ? diskBusyCount / diskTotalCount : null
+  const diskBusyPct = diskBusyRatio !== null ? diskBusyRatio * 100 : null
+  // Use low/medium/high/critical labels with thresholds matching config.yaml (0.4/0.6/0.8/1.0)
+  const diskBusyLevelLabel = diskTotalCount === 0 || diskBusyRatio === null
+    ? 'NO DATA'
+    : diskBusyRatio < 0.4
+      ? 'LOW'
+      : diskBusyRatio < 0.6
+        ? 'MEDIUM'
+        : diskBusyRatio < 0.8
+          ? 'HIGH'
+          : 'CRITICAL'
 
   // Network pressure: use NetworkMonitor pressure fractions (0-1) when available
   const networkRxPressure = isNumber(dynamicInfo?.pressure?.network_rx) ? (dynamicInfo.pressure.network_rx as number) * 100 : null
@@ -2308,6 +2330,13 @@ export default function SystemOverview({ active }: Props) {
     [staticInfo?.disk.device_count, staticInfo?.disk.devices]
   )
 
+  // Map disk name → size_gb for use in per-disk TrendPanels
+  const diskSizeLookup = useMemo(() => {
+    const map: Record<string, number | null> = {}
+    staticInfo?.disk.devices?.forEach((d) => { map[d.name] = d.size_gb })
+    return map
+  }, [staticInfo?.disk.devices])
+
   const diskSnapshotMeta = busiestDisk?.[0]
     ? `${busiestDisk[0]} | Total ${diskStaticTotalText} | ${staticInfo?.disk.device_count ?? '?'} device(s)`
     : staticInfo?.disk
@@ -2369,18 +2398,18 @@ export default function SystemOverview({ active }: Props) {
           </Space>
         </div>
         <Row gutter={[16, 12]}>
-          {/* Disk IO Pressure: arc gauge with max disk utilization; stress info in subtitle */}
+          {/* Disk IO Pressure: fraction of busy disks; subtitle lists busy vs OK devices */}
           <Col xs={24} md={8}>
             <PressurePointerGauge
               title="Disk IO Pressure"
-              valuePct={maxDiskUtil}
-              levelLabel={diskIsStressed ? 'STRESSED' : isNumber(maxDiskUtil) ? undefined : 'NO DATA'}
+              valuePct={diskBusyPct}
+              levelLabel={diskBusyLevelLabel}
               subtitle={[
-                diskIsStressed ? '⚠ Stressed' : 'Normal',
+                diskBusyCount > 0 ? `Busy: ${diskBusyNames.join(', ')}` : null,
+                diskTotalCount > 0 ? `${diskBusyCount}/${diskTotalCount} disks busy` : null,
                 isNumber(diskIoWait) ? `iowait: ${diskIoWait.toFixed(1)}%` : null,
-                diskStressedList.length > 0 ? diskStressedList.join(', ') : null,
               ].filter(Boolean).join(' | ')}
-              description="Max disk utilization across all devices"
+              description="Fraction of busy disks across all devices"
             />
           </Col>
 
@@ -2479,28 +2508,6 @@ export default function SystemOverview({ active }: Props) {
 
         <Col xs={24} md={12} xl={8}>
           <TrendPanel
-            title="Disk IO"
-            accent={PERF_COLORS.disk}
-            value={maxDiskUtil}
-            unit="%"
-            status={busiestDisk ? (busiestDisk[1].is_busy ? 'Busy' : 'OK') : undefined}
-            statusColor={busiestDisk?.[1].is_busy ? COLORS.red : COLORS.green}
-            series={getSeries('util:disk')}
-            subtitle={diskSnapshotMeta}
-            details={[
-              { label: 'Read', value: formatMetric(busiestDisk?.[1].read_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
-              { label: 'Write', value: formatMetric(busiestDisk?.[1].write_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
-              { label: 'Read IOPS', value: formatMetric(busiestDisk?.[1].read_iops, 'IOPS', 1), source: 'dynamic' },
-              { label: 'Write IOPS', value: formatMetric(busiestDisk?.[1].write_iops, 'IOPS', 1), source: 'dynamic' },
-              { label: 'Utilization', value: formatPercent(busiestDisk?.[1].utilization), source: 'dynamic' },
-            ]}
-            sparkMode={sparkMode}
-            trendWindow={trendWindow}
-          />
-        </Col>
-
-        <Col xs={24} md={12} xl={8}>
-          <TrendPanel
             title="Network"
             accent={PERF_COLORS.network}
             value={networkUtilMax}
@@ -2561,23 +2568,47 @@ export default function SystemOverview({ active }: Props) {
           />
         </Col>
 
-        <Col xs={24} md={12} xl={8}>
-          <TrendPanel
-            title="GPU (iGPU + dGPU)"
-            accent={PERF_COLORS.gpu}
-            value={gpuAggregateUtil}
-            unit="%"
-            status={gpuCombinedStatus}
-            statusColor={gpuCombinedStatusColor}
-            series={getSeries('gpu:aggregate')}
-            multiSeries={gpuUtilizationSeries}
-            splitBars={gpuSplitBars}
-            subtitle={gpuSnapshotMeta}
-            details={gpuCombinedDetails}
-            sparkMode={sparkMode}
-            trendWindow={trendWindow}
-          />
-        </Col>
+        {gpuDevices.length === 0 ? null : gpuDevices.map((device, index) => (
+          <Col xs={24} md={12} xl={8} key={device.id}>
+            <TrendPanel
+              title={device.label}
+              accent={GPU_UTIL_COLORS[index % GPU_UTIL_COLORS.length]}
+              value={device.utilization}
+              unit="%"
+              status={device.status !== 'Offline' ? device.status : undefined}
+              statusColor={device.statusColor}
+              series={getSeries(`gpu:${device.id}:util`)}
+              subtitle={(() => {
+                const parts: string[] = []
+                if (device.driver !== 'N/A') parts.push(device.driver)
+                if (device.label === 'iGPU' && isNumber(device.euCount)) parts.push(`EU ${device.euCount}`)
+                if (device.pcieLink.current_speed) parts.push(`PCIe ${formatPcieLink(device.pcieLink.current_speed, device.pcieLink.current_width, device.pcieLink.max_speed, device.pcieLink.max_width)}`)
+                return parts.length ? parts.join(' | ') : device.name
+              })()}
+              details={[
+                {
+                  label: 'GT0 Freq',
+                  value: formatMetric(device.frequencies.gt0?.act_mhz ?? device.frequencies.gt0?.cur_mhz, 'MHz', 0),
+                  source: 'dynamic',
+                },
+                {
+                  label: 'GT1 Freq',
+                  value: formatMetric(device.frequencies.gt1?.act_mhz ?? device.frequencies.gt1?.cur_mhz, 'MHz', 0),
+                  source: 'dynamic',
+                },
+                { label: 'GPU Power', value: formatMetric(device.powerGpu, 'W', 2), source: 'dynamic' },
+                { label: 'Pkg Power', value: formatMetric(device.powerPkg, 'W', 2), source: 'dynamic' },
+                {
+                  label: device.label === 'iGPU' ? 'Sys Mem' : 'VRAM',
+                  value: formatPercent(device.vramUsage),
+                  source: 'dynamic',
+                },
+              ]}
+              sparkMode={sparkMode}
+              trendWindow={trendWindow}
+            />
+          </Col>
+        ))}
 
         <Col xs={24} md={12} xl={8}>
           <TrendPanel
@@ -2603,6 +2634,31 @@ export default function SystemOverview({ active }: Props) {
             trendWindow={trendWindow}
           />
         </Col>
+
+        {diskDevices.map(([diskName, diskData]) => (
+          <Col xs={24} md={12} xl={8} key={diskName}>
+            <TrendPanel
+              title={`Disk: ${diskName}`}
+              accent={PERF_COLORS.disk}
+              value={normalizePercent(diskData.utilization)}
+              unit="%"
+              status={diskData.is_busy ? 'Busy' : 'OK'}
+              statusColor={diskData.is_busy ? COLORS.red : COLORS.green}
+              series={getSeries(`disk:${diskName}:util`)}
+              subtitle={diskName}
+              details={[
+                { label: 'Size', value: formatMetric(diskSizeLookup[diskName], 'GB', 2), source: 'static' },
+                { label: 'Read', value: formatMetric(diskData.read_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
+                { label: 'Write', value: formatMetric(diskData.write_kb_per_sec, 'KB/s', 1), source: 'dynamic' },
+                { label: 'Read IOPS', value: formatMetric(diskData.read_iops, 'IOPS', 1), source: 'dynamic' },
+                { label: 'Write IOPS', value: formatMetric(diskData.write_iops, 'IOPS', 1), source: 'dynamic' },
+                { label: 'Utilization', value: formatPercent(diskData.utilization), source: 'dynamic' },
+              ]}
+              sparkMode={sparkMode}
+              trendWindow={trendWindow}
+            />
+          </Col>
+        ))}
 
       </Row>
 

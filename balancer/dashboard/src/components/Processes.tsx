@@ -39,7 +39,7 @@ function formatMemory(kb: number): string {
   return `${(kb / 1024 / 1024).toFixed(2)} GB`
 }
 
-export default function ProcessResources({ active }: Props) {
+export default function Processes({ active }: Props) {
   const [allRows, setAllRows] = useState<ProcessEntry[]>([])
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(true)

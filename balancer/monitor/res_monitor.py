@@ -571,19 +571,6 @@ class ResourceMonitor:
         total_memory_mb = round(mem.total / (1024 ** 2), 2)  # 转换为MB并保留2位小数
         return total_memory_mb
 
-    def disk_utilization(self, device='nvme0n1', interval=1):
-        """获取单个磁盘的利用率（%）"""
-        cnt1 = psutil.disk_io_counters(perdisk=True).get(device)
-        time1 = time.time()
-        time.sleep(interval)
-        cnt2 = psutil.disk_io_counters(perdisk=True).get(device)
-        time2 = time.time()
-        if not cnt1 or not cnt2:
-            return 0.0
-        delta_time = (time2 - time1) * 1000  # 毫秒
-        busy_time = (cnt2.read_time - cnt1.read_time) + (cnt2.write_time - cnt1.write_time)
-        return min(100.0, 100 * busy_time / delta_time)
-
     def get_physical_disks(self):
         """获取所有物理磁盘设备名"""
         cmd = ["lsblk", "-d", "-o", "NAME,TYPE", "-n"]
@@ -628,59 +615,6 @@ class ResourceMonitor:
                 'is_busy': mem_usage > self.config.memory_busy_threshold
             }
         }
-
-    def get_disk_io_usage(self) -> dict:
-        # 获取所有物理磁盘的利用率
-        disks = self.get_physical_disks()
-        disk_utils = {}
-        for disk in disks:
-            disk_utils[disk] = {
-                'utilization': round(self.disk_utilization(disk), 2),
-                'is_busy': False
-            }
-
-        # 判断磁盘是否繁忙（基于利用率）
-        for disk in disk_utils:
-            disk_utils[disk]['is_busy'] = disk_utils[disk]['utilization'] > self.config.disk_utilization_threshold
-
-        return {'disk_io': disk_utils}
-
-    def get_disk_io_speed(self) -> dict:
-        """获取所有物理磁盘的读写速度（KB/s），基于 prev_time/prev_io 模式"""
-        disks = self.get_physical_disks()
-        curr_io = psutil.disk_io_counters(perdisk=True)
-        curr_time = time.time()
-        time_elapsed = curr_time - self.prev_time
-
-        result = {}
-        for disk in disks:
-            # 初始化 prev_io 如果不存在
-            if not hasattr(self, 'prev_io') or disk not in self.prev_io:
-                self.prev_io = curr_io
-                self.prev_time = curr_time
-                result[disk] = {'read_kb_per_sec': 0.0, 'write_kb_per_sec': 0.0}
-                continue
-
-            # 计算读写速度
-            if time_elapsed > 0:
-                read_kb = (curr_io[disk].read_bytes - self.prev_io[disk].read_bytes) / 1024
-                write_kb = (curr_io[disk].write_bytes - self.prev_io[disk].write_bytes) / 1024
-                read_kb_per_sec = read_kb / time_elapsed
-                write_kb_per_sec = write_kb / time_elapsed
-            else:
-                read_kb_per_sec = write_kb_per_sec = 0.0
-
-            result[disk] = {
-                'read_kb_per_sec': round(read_kb_per_sec, 2),
-                'write_kb_per_sec': round(write_kb_per_sec, 2)
-            }
-
-        # 更新状态
-        self.prev_io = curr_io
-        self.prev_time = curr_time
-
-        # logger.debug(f"Disk IO speeds: {result}")
-        return {'disk_io': result}
 
     def get_disk_stats(self) -> dict:
         """
@@ -758,14 +692,19 @@ class ResourceMonitor:
         """
         判断磁盘 I/O 是否紧张
         :param device: 指定磁盘（如 'nvme0n1'），默认检查所有磁盘
-        :param threshold: 自定义是否紧张阈值，否则用config中的配置
+        :param threshold: 自定义利用率阈值，否则用config中的配置
+
+        判断逻辑：
+          - 磁盘繁忙（is_busy）：利用率超过 disk_utilization_threshold 且吞吐量超过 disk_io_throughput_threshold_kb
+          - 整体紧张（is_stressed）：有磁盘繁忙 AND CPU iowait 超过 disk_iowait_threshold
+            （两个条件须同时满足，避免误判）
 
         :return:
             {
                 "is_stressed": bool,               # 整体是否紧张
                 "stressed_disks": list[str],       # 紧张的磁盘列表
                 "iowait": float,                   # CPU 的 I/O 等待时间（%）
-                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec}}
+                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, is_busy}}
             }
         """
         disk_stats = self.get_disk_stats()["disk_io"]
@@ -774,7 +713,8 @@ class ResourceMonitor:
         iowait = psutil.cpu_times_percent().iowait
 
         busy_threshold = threshold or self.config.disk_utilization_threshold
-        speed_threshold = 100 * 1024  # 100 MB/s = 102400 KB/s（可根据需求调整）
+        speed_threshold = self.config.disk_io_throughput_threshold_kb
+        iowait_threshold = self.config.disk_iowait_threshold
 
         stressed_disks = []
         details = {}
@@ -783,15 +723,17 @@ class ResourceMonitor:
             if device and disk != device:
                 continue
 
+            # 利用率高且吞吐量高，才认为该磁盘繁忙
             is_busy = (
-                    stats["utilization"] > busy_threshold and  # 利用率高
-                    (stats["read_kb_per_sec"] + stats["write_kb_per_sec"]) > speed_threshold  # 吞吐量高
+                stats["utilization"] > busy_threshold and
+                (stats["read_kb_per_sec"] + stats["write_kb_per_sec"]) > speed_threshold
             )
             details[disk] = {**stats, "is_busy": is_busy}
             if is_busy:
                 stressed_disks.append(disk)
 
-        is_stressed = bool(stressed_disks) and iowait > 10  # 10%
+        # 有磁盘繁忙 AND iowait 高，才认为磁盘 IO 整体紧张
+        is_stressed = bool(stressed_disks) and iowait > iowait_threshold
 
         return {
             "is_stressed": is_stressed,

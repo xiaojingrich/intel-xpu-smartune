@@ -10,8 +10,8 @@ import {
 } from '@ant-design/icons'
 import SystemOverview from './components/SystemOverview'
 import AppResources from './components/AppResources'
-import ProcessResources from './components/ProcessResources'
-import AppManagement from './components/AppManagement'
+import Processes from './components/Processes'
+import Balance from './components/Balance'
 import HistoryDashboard from './components/HistoryDashboard'
 import About from './components/About'
 import { COLORS } from './styles/theme'
@@ -27,7 +27,7 @@ export default function App() {
       label: (
         <Space>
           <DashboardOutlined />
-          Monitor
+          System Overview
         </Space>
       ),
       children: <SystemOverview active={activeTab === '1'} />,
@@ -47,10 +47,10 @@ export default function App() {
       label: (
         <Space>
           <NodeIndexOutlined />
-          Process Resources
+          Processes
         </Space>
       ),
-      children: <ProcessResources active={activeTab === '3'} />,
+      children: <Processes active={activeTab === '3'} />,
     },
     {
       key: '4',
@@ -60,7 +60,7 @@ export default function App() {
           Balancer
         </Space>
       ),
-      children: <AppManagement active={activeTab === '4'} />,
+      children: <Balance active={activeTab === '4'} />,
     },
     {
       key: '5',
