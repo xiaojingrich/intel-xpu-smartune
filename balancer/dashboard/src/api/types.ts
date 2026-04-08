@@ -170,6 +170,7 @@ export interface StaticInfoData {
     network_speeds_mbps: Record<string, number>
     network_peak_mbps: number | null
     primary_interface: string
+    valid_nics: Array<{ name: string; speed_mbps: number }>
   }
   disk: {
     device_count: number

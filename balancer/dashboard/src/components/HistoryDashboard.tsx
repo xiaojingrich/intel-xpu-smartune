@@ -24,18 +24,40 @@ interface Props {
 
 type EngineKey = 'vcs' | 'vecs' | 'ccs' | 'rcs' | 'bcs'
 
-interface CommonTrendPoint {
+interface PressureTrendPoint {
   timestamp: string
   ts: number
   systemPressure: number | null
-  systemDisk: number | null
-  systemNetwork: number | null
+  diskPressure: number | null
+  networkPressure: number | null
+}
+
+interface CpuMemTrendPoint {
+  timestamp: string
+  ts: number
   cpuUtilization: number | null
+  pCoreUtilization: number | null
+  eCoreUtilization: number | null
   memoryUtilization: number | null
-  diskUtilization: number | null
-  diskIops: number | null
-  networkUtilization: number | null
+}
+
+interface DiskTrendPoint {
+  timestamp: string
+  ts: number
+  [diskName: string]: string | number | null
+}
+
+interface NetworkTrendPoint {
+  timestamp: string
+  ts: number
+  [nicName: string]: string | number | null
+}
+
+interface NpuTrendPoint {
+  timestamp: string
+  ts: number
   npuUtilization: number | null
+  npuFreqMhz: number | null
 }
 
 interface GpuTrendPoint {
@@ -64,11 +86,6 @@ type RangePreset = '5m' | '15m' | '1h' | '6h' | '24h' | 'custom'
 
 interface HistoryNetworkExtra {
   utilization_percent?: number | null
-}
-
-interface HistoryDiskExtra {
-  utilization?: number | null
-  total_iops?: number | null
 }
 
 interface HistoryNpuSmiExtra {
@@ -126,6 +143,12 @@ function formatHistoryAxisTick(val: string | number): string {
   return text
 }
 
+const DISK_COLORS = ['#e07b54', '#73bf69', COLORS.accent, COLORS.yellow, COLORS.red, '#b877db', '#56c8d8']
+const NETWORK_COLORS = ['#73bf69', COLORS.accent, '#e07b54', COLORS.yellow, '#b877db', '#56c8d8', COLORS.red]
+
+// Fixed per-metric colors for disk and network charts
+const METRIC_COLORS = { util: '#56c8d8', read: '#73bf69', write: '#e07b54', rx: '#73bf69', tx: '#e07b54' }
+
 const ENGINE_CURVE_META: Array<{ key: EngineKey; name: string; color: string }> = [
   { key: 'vcs', name: 'VCS %', color: COLORS.accent },
   { key: 'vecs', name: 'VECS %', color: COLORS.green },
@@ -144,6 +167,15 @@ function toNumber(value: unknown): number | null {
   if (typeof value !== 'number' || Number.isNaN(value)) return null
   return value
 }
+
+/** Shared tooltip formatter — limits displayed precision to `digits` decimal places */
+function tooltipFmt(digits = 2) {
+  return (val: number, name: string) => {
+    if (typeof val !== 'number' || Number.isNaN(val)) return [val, name]
+    return [Number(val.toFixed(digits)), name]
+  }
+}
+const tooltipFmt2 = tooltipFmt(2)
 
 function isNumber(value: number | null): value is number {
   return typeof value === 'number' && Number.isFinite(value)
@@ -172,31 +204,17 @@ function getPressurePeak(dynamic: DynamicInfoData | null): number | null {
   return Math.max(...values)
 }
 
-function getDiskUsage(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.disk) return null
-  const disk = dynamic.disk as DynamicInfoData['disk'] & HistoryDiskExtra
-
-  const summarized = normalizePercent(disk.utilization)
-  if (summarized != null) return summarized
-
-  const diskItems = Object.values(disk.disk_io || {})
-  const values = diskItems
-    .map((item) => normalizePercent(item?.utilization))
-    .filter(isNumber)
-  if (!values.length) return null
-  return Math.max(...values)
-}
-
-function getDiskIops(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.disk) return null
-  const disk = dynamic.disk as DynamicInfoData['disk'] & HistoryDiskExtra
-  return toNumber(disk.total_iops)
-}
-
 function getNetworkUsage(dynamic: DynamicInfoData | null): number | null {
-  if (!dynamic?.network) return null
+  if (!dynamic) return null
   const network = dynamic.network as DynamicInfoData['network'] & HistoryNetworkExtra
-  return normalizePercent(network.utilization_percent)
+  const utilization = normalizePercent(network?.utilization_percent)
+  if (utilization != null) return utilization
+  // Fallback: NetworkMonitor rx/tx fractions (0-1) stored in the pressure section.
+  const p = dynamic.pressure as { network_rx?: unknown; network_tx?: unknown } | undefined
+  const rx = normalizePercent(p?.network_rx)
+  const tx = normalizePercent(p?.network_tx)
+  const vals = [rx, tx].filter((v): v is number => v != null)
+  return vals.length > 0 ? Math.max(...vals) : null
 }
 
 function getNpuUsage(dynamic: DynamicInfoData | null): number | null {
@@ -226,29 +244,134 @@ function getGpuLabel(device: QmassaDevice, index: number): string {
   return `${role}${pci}`
 }
 
-function buildCommonTrendPoints(items: HistorySnapshotItem[]): CommonTrendPoint[] {
-  return [...items]
-    .reverse()
-    .map((item) => {
-      const dynamic = toDynamicData(item)
-      const { ts, label } = buildTimestamp(item)
-      const pressureIo = normalizePercent(dynamic?.pressure?.io)
-      const networkUsage = getNetworkUsage(dynamic)
-      const diskUsage = getDiskUsage(dynamic)
-      return {
-        timestamp: label,
-        ts,
-        systemPressure: getPressurePeak(dynamic),
-        systemDisk: pressureIo,
-        systemNetwork: networkUsage,
-        cpuUtilization: normalizePercent(dynamic?.cpu?.usage_total),
-        memoryUtilization: normalizePercent(dynamic?.memory?.usage_percent),
-        diskUtilization: diskUsage,
-        diskIops: getDiskIops(dynamic),
-        networkUtilization: networkUsage,
-        npuUtilization: getNpuUsage(dynamic),
+function buildPressureTrendPoints(items: HistorySnapshotItem[]): PressureTrendPoint[] {
+  return [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    return {
+      timestamp: label,
+      ts,
+      systemPressure: getPressurePeak(dynamic),
+      diskPressure: normalizePercent(dynamic?.pressure?.io),
+      networkPressure: normalizePercent(getNetworkUsage(dynamic)),
+    }
+  })
+}
+
+function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[] {
+  return [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    return {
+      timestamp: label,
+      ts,
+      cpuUtilization: normalizePercent(dynamic?.cpu?.usage_total),
+      pCoreUtilization: normalizePercent(dynamic?.cpu?.p_core_usage),
+      eCoreUtilization: normalizePercent(dynamic?.cpu?.e_core_usage),
+      memoryUtilization: normalizePercent(dynamic?.memory?.usage_percent),
+    }
+  })
+}
+
+function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrendPoint[]; diskNames: string[] } {
+  const diskNameSet = new Set<string>()
+  const points = [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    const point: DiskTrendPoint = { timestamp: label, ts }
+
+    const disk = dynamic?.disk as (DynamicInfoData['disk'] & {
+      per_disk?: Record<string, { util?: number | null; read_mb?: number | null; write_mb?: number | null } | number | null>
+    }) | undefined
+    const perDisk = disk?.per_disk
+    if (perDisk && typeof perDisk === 'object') {
+      for (const [name, val] of Object.entries(perDisk)) {
+        diskNameSet.add(name)
+        if (val && typeof val === 'object' && ('util' in val || 'read_mb' in val)) {
+          // New format
+          point[`${name}:util`] = normalizePercent(val.util)
+          point[`${name}:read`] = toNumber(val.read_mb)
+          point[`${name}:write`] = toNumber(val.write_mb)
+        } else {
+          // Old format: single utilization number
+          point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
+          point[`${name}:read`] = null
+          point[`${name}:write`] = null
+        }
       }
-    })
+    } else if (disk?.disk_io) {
+      for (const [name, diskData] of Object.entries(disk.disk_io)) {
+        diskNameSet.add(name)
+        point[`${name}:util`] = normalizePercent(diskData?.utilization)
+        point[`${name}:read`] = toNumber(diskData?.read_kb_per_sec != null ? diskData.read_kb_per_sec / 1024 : null)
+        point[`${name}:write`] = toNumber(diskData?.write_kb_per_sec != null ? diskData.write_kb_per_sec / 1024 : null)
+      }
+    }
+    return point
+  })
+  return { points, diskNames: Array.from(diskNameSet).sort() }
+}
+
+function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: NetworkTrendPoint[]; nicNames: string[] } {
+  const nicNameSet = new Set<string>()
+  const points = [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    const point: NetworkTrendPoint = { timestamp: label, ts }
+
+    const network = dynamic?.network as (DynamicInfoData['network'] & {
+      per_nic?: Record<string, { util?: number | null; rx_mbps?: number | null; tx_mbps?: number | null; rx?: number | null; tx?: number | null } | number | null>
+    }) | undefined
+    const perNic = network?.per_nic
+    if (perNic && typeof perNic === 'object') {
+      for (const [name, val] of Object.entries(perNic)) {
+        nicNameSet.add(name)
+        if (val && typeof val === 'object') {
+          point[`${name}:util`] = normalizePercent(val.util ?? (val.rx != null || val.tx != null ? Math.max(val.rx ?? 0, val.tx ?? 0) : null))
+          point[`${name}:rx`] = toNumber(val.rx_mbps) ?? null
+          point[`${name}:tx`] = toNumber(val.tx_mbps) ?? null
+        } else {
+          // Old format: single utilization number
+          point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
+          point[`${name}:rx`] = null
+          point[`${name}:tx`] = null
+        }
+      }
+    } else {
+      // Fallback: use aggregated utilization_percent as single line
+      const aggUtil = normalizePercent((network as DynamicInfoData['network'] & HistoryNetworkExtra)?.utilization_percent)
+      if (aggUtil != null) {
+        nicNameSet.add('total')
+        point['total:util'] = aggUtil
+        point['total:rx'] = null
+        point['total:tx'] = null
+      }
+    }
+    return point
+  })
+  return { points, nicNames: Array.from(nicNameSet).sort() }
+}
+
+function getNpuFreqMhz(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.npu?.npu_smi) return null
+  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { frequency_mhz?: number | null; parsed?: Record<string, unknown> | null }
+  // Try top-level first (from history payload), then parsed
+  const direct = toNumber(npuSmi.frequency_mhz)
+  if (direct != null) return direct
+  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.frequency_mhz as number | null)
+}
+
+function buildNpuTrendPoints(items: HistorySnapshotItem[]): NpuTrendPoint[] {
+  return [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    return {
+      timestamp: label,
+      ts,
+      npuUtilization: getNpuUsage(dynamic),
+      npuFreqMhz: getNpuFreqMhz(dynamic),
+    }
+  })
 }
 
 function isIntegratedGpu(device: QmassaDevice): boolean {
@@ -307,12 +430,15 @@ function LegendToggleItem({
   color,
   hidden,
   onClick,
+  dasharray,
 }: {
   value: string
   color: string
   hidden: boolean
   onClick: () => void
+  dasharray?: string
 }) {
+  const lineColor = hidden ? COLORS.border : color
   return (
     <span
       onClick={onClick}
@@ -326,16 +452,9 @@ function LegendToggleItem({
         userSelect: 'none',
       }}
     >
-      <span
-        style={{
-          display: 'inline-block',
-          width: 24,
-          height: 3,
-          borderRadius: 2,
-          background: hidden ? COLORS.border : color,
-          verticalAlign: 'middle',
-        }}
-      />
+      <svg width={24} height={6} style={{ verticalAlign: 'middle' }}>
+        <line x1={0} y1={3} x2={24} y2={3} stroke={lineColor} strokeWidth={2.5} strokeDasharray={dasharray} />
+      </svg>
       <span style={{ color: hidden ? 'rgba(174,191,223,0.3)' : COLORS.textMuted, fontSize: 11, textDecoration: hidden ? 'line-through' : 'none' }}>{value}</span>
     </span>
   )
@@ -363,7 +482,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
 
   const powerLines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
     { key: 'gpuPower', name: 'GPU Power W', color: COLORS.accent },
-    { key: 'pkgPower', name: 'Pkg Power W', color: COLORS.orange, dasharray: '5 3' },
+    { key: 'pkgPower', name: 'Card Power W', color: COLORS.orange, dasharray: '5 3' },
   ]
 
   return (
@@ -383,6 +502,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
             color={l.color}
             hidden={hidden.has(l.key)}
             onClick={() => toggle(l.key)}
+            dasharray={l.dasharray}
           />
         ))}
       </div>
@@ -409,6 +529,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
             />
             <Tooltip
               contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+              formatter={tooltipFmt2}
             />
             {engineLines.map((l) => (
               <Line
@@ -441,6 +562,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
             color={l.color}
             hidden={hidden.has(l.key)}
             onClick={() => toggle(l.key)}
+            dasharray={l.dasharray}
           />
         ))}
       </div>
@@ -460,7 +582,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
             />
             <Tooltip
               contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
-              formatter={(val: number) => [`${typeof val === 'number' ? val.toFixed(2) : val} W`]}
+              formatter={(val: number, name: string) => [`${typeof val === 'number' ? val.toFixed(2) : val} W`, name]}
             />
             {powerLines.map((l) => (
               <Line
@@ -594,12 +716,48 @@ export default function HistoryDashboard({ active }: Props) {
     [history],
   )
 
-  const commonTrendPoints = useMemo(() => buildCommonTrendPoints(dynamicItems), [dynamicItems])
+  const pressureTrendPoints = useMemo(() => buildPressureTrendPoints(dynamicItems), [dynamicItems])
+  const cpuMemTrendPoints = useMemo(() => buildCpuMemTrendPoints(dynamicItems), [dynamicItems])
+  const { points: diskTrendPoints, diskNames } = useMemo(() => buildDiskTrendPoints(dynamicItems), [dynamicItems])
+  const { points: networkTrendPoints, nicNames } = useMemo(() => buildNetworkTrendPoints(dynamicItems), [dynamicItems])
+  const npuTrendPoints = useMemo(() => buildNpuTrendPoints(dynamicItems), [dynamicItems])
   const gpuTrendSeries = useMemo(() => buildGpuTrendSeries(dynamicItems), [dynamicItems])
 
-  const [commonHidden, setCommonHidden] = useState<Set<string>>(new Set())
-  const toggleCommon = useCallback((key: string) => {
-    setCommonHidden((prev) => {
+  const hasNpuData = useMemo(() => npuTrendPoints.some((p) => p.npuUtilization != null || p.npuFreqMhz != null), [npuTrendPoints])
+
+  const [pressureHidden, setPressureHidden] = useState<Set<string>>(new Set())
+  const togglePressure = useCallback((key: string) => {
+    setPressureHidden((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
+  const [cpuMemHidden, setCpuMemHidden] = useState<Set<string>>(new Set())
+  const toggleCpuMem = useCallback((key: string) => {
+    setCpuMemHidden((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
+  const [diskHidden, setDiskHidden] = useState<Set<string>>(new Set())
+  const toggleDisk = useCallback((key: string) => {
+    setDiskHidden((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
+  const [networkHidden, setNetworkHidden] = useState<Set<string>>(new Set())
+  const toggleNetwork = useCallback((key: string) => {
+    setNetworkHidden((prev) => {
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
       else next.add(key)
@@ -719,26 +877,19 @@ export default function HistoryDashboard({ active }: Props) {
         {rangeHint}{lastFetchAt ? ` | Last fetch: ${lastFetchAt}` : ''}{retention ? ` | Retention: ${retention.retention_days} day${retention.retention_days === 1 ? '' : 's'}` : ''}
       </Text>
 
+      {/* System Pressure */}
       <Card
         style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6 }}
         bodyStyle={{ padding: 16 }}
       >
         <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
-          History Trends — System &amp; Resource Utilization
+          System Pressure
         </Text>
-
-        {/* Common chart toggle legend */}
-        {commonTrendPoints.length > 0 && (() => {
+        {pressureTrendPoints.length > 0 && (() => {
           const lines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
-            { key: 'systemPressure', name: 'System Pressure %', color: COLORS.orange },
-            { key: 'systemDisk', name: 'Disk Pressure %', color: COLORS.red, dasharray: '5 3' },
-            { key: 'systemNetwork', name: 'Network Pressure %', color: COLORS.green, dasharray: '5 3' },
-            { key: 'cpuUtilization', name: 'CPU Utilization %', color: COLORS.accent },
-            { key: 'memoryUtilization', name: 'Memory Utilization %', color: COLORS.yellow },
-            { key: 'diskUtilization', name: 'Disk Utilization %', color: '#e07b54' },
-            { key: 'diskIops', name: 'Disk IOPS', color: '#9b8cff' },
-            { key: 'networkUtilization', name: 'Network Utilization %', color: '#73bf69' },
-            { key: 'npuUtilization', name: 'NPU Utilization %', color: COLORS.textMuted },
+            { key: 'systemPressure', name: 'System Pressure %', color: COLORS.accent },
+            { key: 'diskPressure', name: 'Disk Pressure %', color: COLORS.red, dasharray: '5 3' },
+            { key: 'networkPressure', name: 'Network Pressure %', color: COLORS.green, dasharray: '5 3' },
           ]
           return (
             <>
@@ -748,14 +899,15 @@ export default function HistoryDashboard({ active }: Props) {
                     key={l.key}
                     value={l.name}
                     color={l.color}
-                    hidden={commonHidden.has(l.key)}
-                    onClick={() => toggleCommon(l.key)}
+                    hidden={pressureHidden.has(l.key)}
+                    onClick={() => togglePressure(l.key)}
+                    dasharray={l.dasharray}
                   />
                 ))}
               </div>
-              <div style={{ width: '100%', height: 360 }}>
+              <div style={{ width: '100%', height: 280 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={commonTrendPoints} margin={{ top: 8, right: 20, left: 0, bottom: 0 }}>
+                  <LineChart data={pressureTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                     <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
                     <XAxis
                       dataKey="timestamp"
@@ -770,6 +922,7 @@ export default function HistoryDashboard({ active }: Props) {
                     />
                     <Tooltip
                       contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                      formatter={tooltipFmt2}
                     />
                     {lines.map((l) => (
                       <Line
@@ -781,7 +934,7 @@ export default function HistoryDashboard({ active }: Props) {
                         strokeDasharray={l.dasharray}
                         dot={false}
                         strokeWidth={2}
-                        hide={commonHidden.has(l.key)}
+                        hide={pressureHidden.has(l.key)}
                       />
                     ))}
                     <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
@@ -794,11 +947,319 @@ export default function HistoryDashboard({ active }: Props) {
         {loading && (
           <div style={{ color: COLORS.textMuted, paddingTop: 48, textAlign: 'center' }}>Loading history...</div>
         )}
-        {!loading && commonTrendPoints.length === 0 && (
+        {!loading && pressureTrendPoints.length === 0 && (
           <Empty description="No history data" image={Empty.PRESENTED_IMAGE_SIMPLE} />
         )}
       </Card>
 
+      {/* CPU & Memory Utilization */}
+      {!loading && cpuMemTrendPoints.length > 0 && (
+        <Card
+          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+          bodyStyle={{ padding: 16 }}
+        >
+          <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
+            CPU &amp; Memory Utilization
+          </Text>
+          {(() => {
+            const lines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
+              { key: 'cpuUtilization', name: 'CPU Total %', color: COLORS.accent },
+              { key: 'pCoreUtilization', name: 'P-Core %', color: COLORS.orange, dasharray: '6 3' },
+              { key: 'eCoreUtilization', name: 'E-Core %', color: COLORS.green, dasharray: '6 3' },
+              { key: 'memoryUtilization', name: 'Memory %', color: COLORS.yellow },
+            ]
+            return (
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+                  {lines.map((l) => (
+                    <LegendToggleItem
+                      key={l.key}
+                      value={l.name}
+                      color={l.color}
+                      hidden={cpuMemHidden.has(l.key)}
+                      onClick={() => toggleCpuMem(l.key)}
+                      dasharray={l.dasharray}
+                    />
+                  ))}
+                </div>
+                <div style={{ width: '100%', height: 280 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={cpuMemTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="timestamp"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        minTickGap={36}
+                        tickFormatter={formatHistoryAxisTick}
+                      />
+                      <YAxis
+                        domain={[0, 100]}
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        tickFormatter={(val: string | number) => `${val}%`}
+                      />
+                      <Tooltip
+                        contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                        formatter={tooltipFmt2}
+                      />
+                      {lines.map((l) => (
+                        <Line
+                          key={l.key}
+                          type="monotone"
+                          dataKey={l.key}
+                          name={l.name}
+                          stroke={l.color}
+                          strokeDasharray={l.dasharray}
+                          dot={false}
+                          strokeWidth={2}
+                          hide={cpuMemHidden.has(l.key)}
+                        />
+                      ))}
+                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </>
+            )
+          })()}
+        </Card>
+      )}
+
+      {/* Disk — Utilization & Bandwidth per device */}
+      {!loading && diskNames.length > 0 && diskNames.map((diskName) => {
+        const diskLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
+          { key: `${diskName}:util`, name: 'Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
+          { key: `${diskName}:read`, name: 'Read MB/s', color: METRIC_COLORS.read, yAxisId: 'bw' },
+          { key: `${diskName}:write`, name: 'Write MB/s', color: METRIC_COLORS.write, yAxisId: 'bw' },
+        ]
+        return (
+        <Card
+          key={`disk-${diskName}`}
+          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+          bodyStyle={{ padding: 16 }}
+        >
+          <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
+            Disk I/O ({diskName})
+          </Text>
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+                  {diskLines.map((l) => (
+                    <LegendToggleItem
+                      key={l.key}
+                      value={l.name}
+                      color={l.color}
+                      hidden={diskHidden.has(l.key)}
+                      onClick={() => toggleDisk(l.key)}
+                      dasharray={l.dasharray}
+                    />
+                  ))}
+                </div>
+                <div style={{ width: '100%', height: 300 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={diskTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="timestamp"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        minTickGap={36}
+                        tickFormatter={formatHistoryAxisTick}
+                      />
+                      <YAxis
+                        yAxisId="util"
+                        domain={[0, 100]}
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        tickFormatter={(val: string | number) => `${val}%`}
+                      />
+                      <YAxis
+                        yAxisId="bw"
+                        orientation="right"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
+                        label={{ value: 'MB/s', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
+                      />
+                      <Tooltip
+                        contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                        formatter={tooltipFmt2}
+                      />
+                      {diskLines.map((l) => (
+                        <Line
+                          key={l.key}
+                          type="monotone"
+                          yAxisId={l.yAxisId}
+                          dataKey={l.key}
+                          name={l.name}
+                          stroke={l.color}
+                          strokeDasharray={l.dasharray}
+                          dot={false}
+                          strokeWidth={2}
+                          hide={diskHidden.has(l.key)}
+                        />
+                      ))}
+                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </>
+        </Card>
+        )
+      })}
+
+      {/* Network — Utilization & Bandwidth per NIC */}
+      {!loading && nicNames.length > 0 && nicNames.map((nicName) => {
+        const nicLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
+          { key: `${nicName}:util`, name: 'Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
+          { key: `${nicName}:rx`, name: 'RX Mbps', color: METRIC_COLORS.rx, yAxisId: 'bw' },
+          { key: `${nicName}:tx`, name: 'TX Mbps', color: METRIC_COLORS.tx, yAxisId: 'bw' },
+        ]
+        return (
+        <Card
+          key={`net-${nicName}`}
+          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+          bodyStyle={{ padding: 16 }}
+        >
+          <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
+            Network I/O ({nicName})
+          </Text>
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+                  {nicLines.map((l) => (
+                    <LegendToggleItem
+                      key={l.key}
+                      value={l.name}
+                      color={l.color}
+                      hidden={networkHidden.has(l.key)}
+                      onClick={() => toggleNetwork(l.key)}
+                      dasharray={l.dasharray}
+                    />
+                  ))}
+                </div>
+                <div style={{ width: '100%', height: 300 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={networkTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="timestamp"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        minTickGap={36}
+                        tickFormatter={formatHistoryAxisTick}
+                      />
+                      <YAxis
+                        yAxisId="util"
+                        domain={[0, 100]}
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        tickFormatter={(val: string | number) => `${val}%`}
+                      />
+                      <YAxis
+                        yAxisId="bw"
+                        orientation="right"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
+                        label={{ value: 'Mbps', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
+                      />
+                      <Tooltip
+                        contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                        formatter={tooltipFmt2}
+                      />
+                      {nicLines.map((l) => (
+                        <Line
+                          key={l.key}
+                          type="monotone"
+                          yAxisId={l.yAxisId}
+                          dataKey={l.key}
+                          name={l.name}
+                          stroke={l.color}
+                          strokeDasharray={l.dasharray}
+                          dot={false}
+                          strokeWidth={2}
+                          hide={networkHidden.has(l.key)}
+                        />
+                      ))}
+                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </>
+        </Card>
+        )
+      })}
+
+      {/* NPU Utilization & Frequency */}
+      {!loading && hasNpuData && (
+        <Card
+          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+          bodyStyle={{ padding: 16 }}
+        >
+          <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
+            NPU — Utilization &amp; Frequency
+          </Text>
+          {(() => {
+            const npuLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
+              { key: 'npuUtilization', name: 'NPU Utilization %', color: COLORS.accent, yAxisId: 'util' },
+              { key: 'npuFreqMhz', name: 'NPU Freq MHz', color: COLORS.orange, dasharray: '6 3', yAxisId: 'freq' },
+            ]
+            return (
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
+                  {npuLines.map((l) => (
+                    <LegendToggleItem
+                      key={l.key}
+                      value={l.name}
+                      color={l.color}
+                      hidden={false}
+                      onClick={() => {}}
+                      dasharray={l.dasharray}
+                    />
+                  ))}
+                </div>
+                <div style={{ width: '100%', height: 260 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={npuTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="timestamp"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        minTickGap={36}
+                        tickFormatter={formatHistoryAxisTick}
+                      />
+                      <YAxis
+                        yAxisId="util"
+                        domain={[0, 100]}
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        tickFormatter={(val: string | number) => `${val}%`}
+                      />
+                      <YAxis
+                        yAxisId="freq"
+                        orientation="right"
+                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                        label={{ value: 'MHz', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
+                      />
+                      <Tooltip
+                        contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                        formatter={tooltipFmt2}
+                      />
+                      {npuLines.map((l) => (
+                        <Line
+                          key={l.key}
+                          type="monotone"
+                          yAxisId={l.yAxisId}
+                          dataKey={l.key}
+                          name={l.name}
+                          stroke={l.color}
+                          strokeDasharray={l.dasharray}
+                          dot={false}
+                          strokeWidth={2}
+                        />
+                      ))}
+                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </>
+            )
+          })()}
+        </Card>
+      )}
+
+      {/* GPU History */}
       <div style={{ marginTop: 16 }}>
         {loading ? (
           <Card

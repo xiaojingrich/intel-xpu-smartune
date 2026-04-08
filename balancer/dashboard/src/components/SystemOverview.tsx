@@ -61,7 +61,7 @@ const ENGINE_ORDER = ['ccs', 'rcs', 'bcs', 'vcs', 'vecs'] as const
 const PERF_COLORS = {
   cpu: '#4cc9f0',
   memory: '#f9c74f',
-  disk: '#ff6b6b',
+  disk: '#56c8d8',
   network: '#2dd4bf',
   gpu: '#5aa9ff',
   npu: '#7ae582',
@@ -114,6 +114,7 @@ interface GpuDeviceView {
   powerPkg: number | null
   vramUsage: number | null
   euCount: number | null
+  pciId: string | null
   pcieLink: {
     current_speed: string | null
     current_width: string | null
@@ -134,7 +135,7 @@ function isNumber(value: number | null | undefined): value is number {
 
 function normalizePercent(value?: number | null): number | null {
   if (!isNumber(value)) return null
-  return value <= 1 ? value * 100 : value
+  return value
 }
 
 function formatNumber(value: number | null, decimals = 1): string {
@@ -144,8 +145,7 @@ function formatNumber(value: number | null, decimals = 1): string {
 
 function formatPercent(value?: number | null, decimals = 1): string {
   if (!isNumber(value)) return 'N/A'
-  const normalized = value <= 1 ? value * 100 : value
-  return `${normalized.toFixed(decimals)}%`
+  return `${value.toFixed(decimals)}%`
 }
 
 function formatMetric(value?: number | null, unit?: string, decimals = 1): string {
@@ -405,6 +405,9 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     const cardPciAddr = staticInfo?.gpu.pci_addresses?.[cardKey]  // e.g. "0000:03:00.0"
     const shortBdf = cardPciAddr ? cardPciAddr.replace(/^[0-9a-f]{4}:/i, '').toLowerCase() : null
     const staticName = (shortBdf && nameByBdf[shortBdf]) || staticInfo?.gpu.names[index]
+    // Extract PCIe vendor:device ID e.g. "8086:7d55" from lspci name
+    const pciIdMatch = staticName?.match(/\[([0-9a-f]{4}:[0-9a-f]{4})\]\s*(?:\(rev|$)/i)
+    const pciId = pciIdMatch ? pciIdMatch[1] : null
 
     devices.push({
       id,
@@ -432,6 +435,7 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
       powerPkg: qdev?.power_w?.pkg ?? null,
       vramUsage,
       euCount: staticInfo?.gpu.eu_count?.[cardKey] ?? null,
+      pciId,
       pcieLink: {
         current_speed: staticInfo?.gpu.pcie?.[cardKey]?.current_speed ?? null,
         current_width: staticInfo?.gpu.pcie?.[cardKey]?.current_width ?? null,
@@ -818,6 +822,8 @@ function DualAxisSparkline({
   freqAxis,
   utilTickCount = 5,
   freqTickCount = 4,
+  showUtil = true,
+  showFreq = true,
 }: {
   utilData: Array<number | null>
   freqData: Array<number | null>
@@ -832,6 +838,8 @@ function DualAxisSparkline({
   freqAxis: { min: number; max: number }
   utilTickCount?: number
   freqTickCount?: number
+  showUtil?: boolean
+  showFreq?: boolean
 }) {
   const id = useId()
   const padding = { top: 8, right: 34, bottom: 14, left: 30 }
@@ -950,8 +958,8 @@ function DualAxisSparkline({
       <text x={chartLeft} y={height - 2} textAnchor="start" className="perf-spark-axis">{xStartLabel || ''}</text>
       <text x={chartRight} y={height - 2} textAnchor="end" className="perf-spark-axis">{xEndLabel || ''}</text>
 
-      {utilPath && <path d={utilPath} fill="none" stroke={utilStroke} strokeWidth="1.8" />}
-      {freqPath && <path d={freqPath} fill="none" stroke={freqStroke} strokeWidth="1.8" />}
+      {freqPath && showFreq !== false && <path d={freqPath} fill="none" stroke={freqStroke} strokeWidth="1.8" opacity={showUtil === false ? 1 : 0.7} />}
+      {utilPath && showUtil !== false && <path d={utilPath} fill="none" stroke={utilStroke} strokeWidth="1.8" />}
     </svg>
   )
 }
@@ -1117,6 +1125,7 @@ function TrendPanel({
   secondaryChartGap = 10,
   detailTopMargin = 12,
   hideTotalBar,
+  primaryChartLabel,
 }: {
   title: string
   accent: string
@@ -1142,6 +1151,7 @@ function TrendPanel({
   primaryChartHeight?: number
   secondaryChartGap?: number
   detailTopMargin?: number
+  primaryChartLabel?: string
 }) {
   const gaugeValue = isNumber(value) ? Math.max(0, Math.min(value, 100)) : 0
   const hasValue = isNumber(value)
@@ -1267,6 +1277,10 @@ function TrendPanel({
               />
             </>
           ) : (
+            <>
+            {primaryChartLabel && (
+              <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginBottom: 4 }}>{primaryChartLabel}</Text>
+            )}
             <Sparkline
               data={series}
               width={320}
@@ -1276,7 +1290,11 @@ function TrendPanel({
               mode={sparkMode || 'compact'}
               xStartLabel={trendWindow ? `-${trendWindow}` : ''}
               xEndLabel="now"
+              yMin={0}
+              yMax={100}
+              yTickCount={5}
             />
+            </>
           )}
           {secondaryChart && secondaryChartPosition !== 'top' && (
             <div style={{ marginTop: secondaryChartGap }}>{secondaryChart}</div>
@@ -1335,6 +1353,8 @@ function CoreCell({
   const normalized = isNumber(usage) ? Math.max(0, Math.min(usage, 100)) : 0
   const barColor = normalized >= 80 ? COLORS.red : normalized >= 60 ? COLORS.orange : COLORS.accent
   const freqColor = PERF_COLORS.memory
+  const [showUtil, setShowUtil] = useState(true)
+  const [showFreq, setShowFreq] = useState(true)
 
   return (
     <div className="perf-core-item">
@@ -1351,13 +1371,21 @@ function CoreCell({
       </div>
 
       <div className="perf-core-trend-legend">
-        <span className="perf-core-legend-item">
-          <span className="perf-core-legend-dot" style={{ background: barColor }} />
-          Util %
+        <span
+          className="perf-core-legend-item"
+          style={{ cursor: 'pointer', opacity: showUtil ? 1 : 0.35, userSelect: 'none' }}
+          onClick={() => setShowUtil((v) => !v)}
+        >
+          <span className="perf-core-legend-dot" style={{ background: showUtil ? barColor : 'rgba(120,176,255,0.2)' }} />
+          <span style={{ textDecoration: showUtil ? 'none' : 'line-through' }}>Util %</span>
         </span>
-        <span className="perf-core-legend-item">
-          <span className="perf-core-legend-dot" style={{ background: freqColor }} />
-          Freq MHz
+        <span
+          className="perf-core-legend-item"
+          style={{ cursor: 'pointer', opacity: showFreq ? 1 : 0.35, userSelect: 'none' }}
+          onClick={() => setShowFreq((v) => !v)}
+        >
+          <span className="perf-core-legend-dot" style={{ background: showFreq ? freqColor : 'rgba(120,176,255,0.2)' }} />
+          <span style={{ textDecoration: showFreq ? 'none' : 'line-through' }}>Freq MHz</span>
         </span>
       </div>
 
@@ -1377,6 +1405,8 @@ function CoreCell({
           freqAxis={freqAxis}
           utilTickCount={5}
           freqTickCount={4}
+          showUtil={showUtil}
+          showFreq={showFreq}
         />
       </div>
     </div>
@@ -1407,11 +1437,9 @@ function ChartLegend({
               userSelect: 'none',
             }}
           >
-            <span style={{
-              display: 'inline-block', width: 20, height: 3, borderRadius: 2,
-              background: isHidden ? 'rgba(120,176,255,0.2)' : item.color,
-              verticalAlign: 'middle',
-            }} />
+            <svg width={20} height={6} style={{ verticalAlign: 'middle' }}>
+              <line x1={0} y1={3} x2={20} y2={3} stroke={isHidden ? 'rgba(120,176,255,0.2)' : item.color} strokeWidth={2.5} strokeDasharray={item.dasharray} />
+            </svg>
             <span style={{
               color: isHidden ? 'rgba(174,191,223,0.3)' : COLORS.textMuted,
               fontSize: 10,
@@ -1473,9 +1501,12 @@ function NpuDetailCard({
     <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
-        <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>
-            {npuName.replace(/^[^:]+:\s*/, '').replace(/\s*\[[0-9a-f]{4}:[0-9a-f]{4}\].*$/i, '').trim() || 'Intel NPU'}
+        <div>
+          <Text style={{ color: COLORS.text, fontSize: 13, fontWeight: 600 }}>NPU</Text>
+          <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 2 }}>
+            {npuName.replace(/\s*\[[0-9a-f]{4}:[0-9a-f]{4}\]\s*$/i, '').trim() || 'Intel NPU'}
           </Text>
+        </div>
         <div style={{ textAlign: 'right' }}>
           <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block' }}>Util</Text>
           <Text style={{ color: PERF_COLORS.npu, fontSize: 22, fontWeight: 700 }}>
@@ -1497,6 +1528,9 @@ function NpuDetailCard({
           mode="axis"
           xStartLabel=""
           xEndLabel="now"
+          yMin={0}
+          yMax={100}
+          yTickCount={5}
         />
       </div>
 
@@ -1578,12 +1612,12 @@ function GpuDeviceCard({
 
   const freqSeries = [
     { key: `${device.id}-gt0-act`, label: 'GT0', data: gt0FreqSeries, stroke: PERF_COLORS.gpu },
-    { key: `${device.id}-gt1-act`, label: 'GT1', data: gt1FreqSeries, stroke: PERF_COLORS.memory },
+    { key: `${device.id}-gt1-act`, label: 'GT1', data: gt1FreqSeries, stroke: '#e07b54' },
   ]
 
   const powerSeries = [
     { key: `${device.id}-power-gpu`, label: 'GPU', data: gpuPowerSeries, stroke: PERF_COLORS.cpu },
-    { key: `${device.id}-power-pkg`, label: 'Pkg', data: pkgPowerSeries, stroke: PERF_COLORS.pressure },
+    { key: `${device.id}-power-pkg`, label: 'Card', data: pkgPowerSeries, stroke: PERF_COLORS.pressure },
   ]
 
   const engineSeries = enginesToShow.map((engine) => ({
@@ -1598,12 +1632,13 @@ function GpuDeviceCard({
     const next = new Set(prev); next.has(key) ? next.delete(key) : next.add(key); return next
   }), [])
 
-  const gt0RangeText = device.gtFreqBounds.gt0
-    ? formatFreqRange(device.gtFreqBounds.gt0.min_mhz, device.gtFreqBounds.gt0.max_mhz)
-    : null
-  const gt1RangeText = device.gtFreqBounds.gt1
-    ? formatFreqRange(device.gtFreqBounds.gt1.min_mhz, device.gtFreqBounds.gt1.max_mhz)
-    : null
+  // Use static bounds first; fall back to dynamic qmassa min/max freq when static is missing
+  const gt0Min = device.gtFreqBounds.gt0?.min_mhz ?? device.frequencies.gt0?.min_mhz ?? null
+  const gt0Max = device.gtFreqBounds.gt0?.max_mhz ?? device.frequencies.gt0?.max_mhz ?? null
+  const gt1Min = device.gtFreqBounds.gt1?.min_mhz ?? device.frequencies.gt1?.min_mhz ?? null
+  const gt1Max = device.gtFreqBounds.gt1?.max_mhz ?? device.frequencies.gt1?.max_mhz ?? null
+  const gt0RangeText = (isNumber(gt0Min) || isNumber(gt0Max)) ? formatFreqRange(gt0Min, gt0Max) : null
+  const gt1RangeText = (isNumber(gt1Min) || isNumber(gt1Max)) ? formatFreqRange(gt1Min, gt1Max) : null
 
   return (
     <Card className="perf-card perf-rise" bodyStyle={{ padding: 16 }}>
@@ -1644,8 +1679,8 @@ function GpuDeviceCard({
       {/* Static info line */}
       <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 6 }}>
         {[
-          gt0RangeText ? `GT0 ${gt0RangeText}` : null,
-          gt1RangeText ? `GT1 ${gt1RangeText}` : null,
+          gt0RangeText ? `GT0 (Compute) ${gt0RangeText}` : null,
+          gt1RangeText ? `GT1 (Media) ${gt1RangeText}` : null,
           !gt0RangeText && !gt1RangeText && (device.freqBounds.min_mhz || device.freqBounds.max_mhz)
             ? `Freq ${formatFreqRange(device.freqBounds.min_mhz, device.freqBounds.max_mhz)}`
             : null,
@@ -1665,6 +1700,9 @@ function GpuDeviceCard({
           mode={sparkMode === 'compact' ? 'compact' : 'axis'}
           xStartLabel={`-${trendWindow}`}
           xEndLabel="now"
+          yMin={0}
+          yMax={100}
+          yTickCount={5}
         />
       </div>
 
@@ -1744,7 +1782,7 @@ function GpuDeviceCard({
             ...engineSeries.map((s) => ({ key: s.key, name: `${s.label} %`, color: s.stroke })),
             { key: 'mem', name: memLabel, color: COLORS.yellow, dasharray: '5 3' },
             { key: 'gt0', name: 'GT0 MHz', color: PERF_COLORS.gpu, dasharray: '6 4' },
-            { key: 'gt1', name: 'GT1 MHz', color: PERF_COLORS.memory, dasharray: '4 4' },
+            { key: 'gt1', name: 'GT1 MHz', color: '#e07b54', dasharray: '4 4' },
           ]
 
           return (
@@ -1778,7 +1816,7 @@ function GpuDeviceCard({
                       stroke={PERF_COLORS.gpu} strokeDasharray="6 4" dot={false} strokeWidth={1.5} isAnimationActive={false}
                       hide={hidden.has('gt0')} />
                     <Line yAxisId="mhz" type="monotone" dataKey="gt1" name="GT1 MHz"
-                      stroke={PERF_COLORS.memory} strokeDasharray="4 4" dot={false} strokeWidth={1.5} isAnimationActive={false}
+                      stroke={'#e07b54'} strokeDasharray="4 4" dot={false} strokeWidth={1.5} isAnimationActive={false}
                       hide={hidden.has('gt1')} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -1802,7 +1840,7 @@ function GpuDeviceCard({
           }))
           const chart2Items = [
             { key: 'gpuPower', name: 'GPU W', color: PERF_COLORS.cpu },
-            { key: 'pkgPower', name: 'Pkg W', color: PERF_COLORS.pressure, dasharray: '5 3' },
+            { key: 'pkgPower', name: 'Card W', color: PERF_COLORS.pressure, dasharray: '5 3' },
           ]
           return (
             <>
@@ -1824,7 +1862,7 @@ function GpuDeviceCard({
                     <Line type="monotone" dataKey="gpuPower" name="GPU W"
                       stroke={PERF_COLORS.cpu} dot={false} strokeWidth={1.8} isAnimationActive={false}
                       hide={hidden.has('gpuPower')} />
-                    <Line type="monotone" dataKey="pkgPower" name="Pkg W"
+                    <Line type="monotone" dataKey="pkgPower" name="Card W"
                       stroke={PERF_COLORS.pressure} strokeDasharray="5 3" dot={false} strokeWidth={1.5} isAnimationActive={false}
                       hide={hidden.has('pkgPower')} />
                   </LineChart>
@@ -1927,29 +1965,49 @@ export default function SystemOverview({ active }: Props) {
         updates[`disk:${diskName}:util`] = normalizePercent(diskData.utilization)
       })
 
-      const primaryInterface = typeof staticInfo?.io.primary_interface === 'string'
-        ? staticInfo.io.primary_interface
-        : null
-      const selectedNetwork = primaryInterface && data.network?.interfaces?.[primaryInterface]
-        ? data.network.interfaces[primaryInterface]
-        : data.network?.total
-      const selectedRx = isNumber(selectedNetwork?.rx_bytes_per_sec) ? selectedNetwork.rx_bytes_per_sec : null
-      const selectedTx = isNumber(selectedNetwork?.tx_bytes_per_sec) ? selectedNetwork.tx_bytes_per_sec : null
-      const selectedRxMbps = toMbps(selectedRx)
-      const selectedTxMbps = toMbps(selectedTx)
-
-      const totalBandwidthMbps = isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
-        ? staticInfo.io.network_peak_mbps
-        : null
-
-      const rxNetworkUtil = calcBandwidthUtilization(selectedRx, totalBandwidthMbps)
-      const txNetworkUtil = calcBandwidthUtilization(selectedTx, totalBandwidthMbps)
-      updates['util:network:rx'] = rxNetworkUtil
-      updates['util:network:tx'] = txNetworkUtil
-      updates['bw:network:rx_mbps'] = selectedRxMbps
-      updates['bw:network:tx_mbps'] = selectedTxMbps
-      const networkUtilValues = [rxNetworkUtil, txNetworkUtil].filter(isNumber)
-      updates['util:network'] = networkUtilValues.length ? Math.max(...networkUtilValues) : null
+      // Per-NIC trend data for each valid physical NIC
+      const validNics = staticInfo?.io.valid_nics || []
+      const allNetworkUtils: number[] = []
+      for (const nic of validNics) {
+        const nicName = nic.name
+        const nicData = data.network?.interfaces?.[nicName]
+        const nicRx = isNumber(nicData?.rx_bytes_per_sec) ? nicData.rx_bytes_per_sec : null
+        const nicTx = isNumber(nicData?.tx_bytes_per_sec) ? nicData.tx_bytes_per_sec : null
+        const rxMbps = toMbps(nicRx)
+        const txMbps = toMbps(nicTx)
+        // Store raw Mbps for bandwidth sparklines
+        updates[`bw:network:${nicName}:rx_mbps`] = rxMbps
+        updates[`bw:network:${nicName}:tx_mbps`] = txMbps
+        // Compute utilization against static NIC link speed
+        const nicSpeedMbps = nic.speed_mbps > 0 ? nic.speed_mbps : null
+        const nicRxUtil = isNumber(rxMbps) && isNumber(nicSpeedMbps) && nicSpeedMbps > 0 ? Math.min(rxMbps / nicSpeedMbps * 100, 100) : null
+        const nicTxUtil = isNumber(txMbps) && isNumber(nicSpeedMbps) && nicSpeedMbps > 0 ? Math.min(txMbps / nicSpeedMbps * 100, 100) : null
+        updates[`util:network:${nicName}:rx`] = nicRxUtil
+        updates[`util:network:${nicName}:tx`] = nicTxUtil
+        const nicUtils = [nicRxUtil, nicTxUtil].filter(isNumber)
+        const nicUtilMax = nicUtils.length ? Math.max(...nicUtils) : null
+        updates[`util:network:${nicName}`] = nicUtilMax
+        if (isNumber(nicUtilMax)) allNetworkUtils.push(nicUtilMax)
+      }
+      // Fallback: if no valid NICs, use aggregated total with static peak bandwidth
+      if (validNics.length === 0) {
+        const totalNet = data.network?.total
+        const fallbackRx = isNumber(totalNet?.rx_bytes_per_sec) ? totalNet.rx_bytes_per_sec : null
+        const fallbackTx = isNumber(totalNet?.tx_bytes_per_sec) ? totalNet.tx_bytes_per_sec : null
+        const rxMbps = toMbps(fallbackRx)
+        const txMbps = toMbps(fallbackTx)
+        updates['bw:network:rx_mbps'] = rxMbps
+        updates['bw:network:tx_mbps'] = txMbps
+        const staticPeakMbps = isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
+          ? staticInfo.io.network_peak_mbps : null
+        const rxUtil = isNumber(rxMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(rxMbps / staticPeakMbps * 100, 100) : null
+        const txUtil = isNumber(txMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(txMbps / staticPeakMbps * 100, 100) : null
+        updates['util:network:rx'] = rxUtil
+        updates['util:network:tx'] = txUtil
+        const fallbackUtils = [rxUtil, txUtil].filter(isNumber)
+        if (fallbackUtils.length) allNetworkUtils.push(Math.max(...fallbackUtils))
+      }
+      updates['util:network'] = allNetworkUtils.length ? Math.max(...allNetworkUtils) : null
 
       const gpuDevices = buildGpuDevices(staticInfo, data)
       const gpuUtils: number[] = []
@@ -2008,47 +2066,42 @@ export default function SystemOverview({ active }: Props) {
     return gpuDevices.filter((d) => d.id === gpuFilter)
   }, [gpuDevices, gpuFilter])
 
+  const validNics = useMemo(() => staticInfo?.io.valid_nics || [], [staticInfo?.io.valid_nics])
+
+  // Per-NIC series helper: generates utilization and bandwidth series for a given NIC name.
+  // When nicName is null, uses the legacy fallback keys (util:network:rx, bw:network:rx_mbps).
+  const getNetworkNicSeries = useCallback((nicName: string | null) => {
+    const rxUtilKey = nicName ? `util:network:${nicName}:rx` : 'util:network:rx'
+    const txUtilKey = nicName ? `util:network:${nicName}:tx` : 'util:network:tx'
+    const rxBwKey = nicName ? `bw:network:${nicName}:rx_mbps` : 'bw:network:rx_mbps'
+    const txBwKey = nicName ? `bw:network:${nicName}:tx_mbps` : 'bw:network:tx_mbps'
+
+    const utilSeries = [
+      { key: `${nicName || 'net'}-rx-util`, label: 'RX Util %', data: getSeries(rxUtilKey), stroke: PERF_COLORS.network },
+      { key: `${nicName || 'net'}-tx-util`, label: 'TX Util %', data: getSeries(txUtilKey), stroke: PERF_COLORS.gpu },
+    ]
+    const bwSeries = [
+      { key: `${nicName || 'net'}-rx-bw-kbps`, label: 'RX BW Kb/s', data: getSeries(rxBwKey).map((v) => (isNumber(v) ? v * 1000 : null)), stroke: PERF_COLORS.network },
+      { key: `${nicName || 'net'}-tx-bw-kbps`, label: 'TX BW Kb/s', data: getSeries(txBwKey).map((v) => (isNumber(v) ? v * 1000 : null)), stroke: PERF_COLORS.gpu },
+    ]
+    const bwValues = [...bwSeries[0].data, ...bwSeries[1].data].filter(isNumber)
+    const bwMax = bwValues.length ? Math.max(...bwValues) : 0
+    const bwAxisMax = Math.max(100, Math.ceil(bwMax / 100) * 100)
+
+    return { utilSeries, bwSeries, bwAxisMax }
+  }, [getSeries])
+
+  // Legacy series (used when no valid NICs or for fallback)
   const networkUtilizationSeries = useMemo(
-    () => [
-      {
-        key: 'rx-util',
-        label: 'RX Util %',
-        data: getSeries('util:network:rx'),
-        stroke: PERF_COLORS.network,
-      },
-      {
-        key: 'tx-util',
-        label: 'TX Util %',
-        data: getSeries('util:network:tx'),
-        stroke: PERF_COLORS.gpu,
-      },
-    ],
-    [getSeries],
+    () => getNetworkNicSeries(validNics.length === 1 ? validNics[0].name : null).utilSeries,
+    [getNetworkNicSeries, validNics],
   )
-
   const networkBandwidthKbpsSeries = useMemo(
-    () => [
-      {
-        key: 'rx-bw-kbps',
-        label: 'RX BW Kb/s',
-        data: getSeries('bw:network:rx_mbps').map((value) => (isNumber(value) ? value * 1000 : null)),
-        stroke: PERF_COLORS.network,
-      },
-      {
-        key: 'tx-bw-kbps',
-        label: 'TX BW Kb/s',
-        data: getSeries('bw:network:tx_mbps').map((value) => (isNumber(value) ? value * 1000 : null)),
-        stroke: PERF_COLORS.gpu,
-      },
-    ],
-    [getSeries],
+    () => getNetworkNicSeries(validNics.length === 1 ? validNics[0].name : null).bwSeries,
+    [getNetworkNicSeries, validNics],
   )
-
   const networkBandwidthKbpsAxisMax = useMemo(() => {
-    const values = [
-      ...networkBandwidthKbpsSeries[0].data,
-      ...networkBandwidthKbpsSeries[1].data,
-    ].filter(isNumber)
+    const values = [...networkBandwidthKbpsSeries[0].data, ...networkBandwidthKbpsSeries[1].data].filter(isNumber)
     const dynamicMax = values.length ? Math.max(...values) : 0
     if (dynamicMax <= 0) return 100
     return Math.max(100, Math.ceil(dynamicMax / 100) * 100)
@@ -2115,7 +2168,7 @@ export default function SystemOverview({ active }: Props) {
         source: 'dynamic' as DataSourceKind,
       },
       {
-        label: `${device.label} Pkg Power`,
+        label: `${device.label} Card Power`,
         value: formatMetric(device.powerPkg, 'W', 2),
         source: 'dynamic' as DataSourceKind,
       },
@@ -2149,38 +2202,64 @@ export default function SystemOverview({ active }: Props) {
       ? `${dynamicInfo.memory.total_gb.toFixed(1)} GB total`
       : 'No data'
 
+  // Build per-NIC render data
+  const networkNicCards = useMemo(() => {
+    if (!validNics.length) return []
+    return validNics.map((nic) => {
+      const nicName = nic.name
+      const nicData = dynamicInfo?.network?.interfaces?.[nicName]
+      const rxRate = isNumber(nicData?.rx_bytes_per_sec) ? nicData.rx_bytes_per_sec : null
+      const txRate = isNumber(nicData?.tx_bytes_per_sec) ? nicData.tx_bytes_per_sec : null
+      const bandwidth = nic.speed_mbps > 0 ? nic.speed_mbps : null
+      // Use static NIC link speed for utilization
+      const rxMbps = toMbps(rxRate)
+      const txMbps = toMbps(txRate)
+      const rxUtil = isNumber(rxMbps) && isNumber(bandwidth) && bandwidth > 0 ? Math.min(rxMbps / bandwidth * 100, 100) : null
+      const txUtil = isNumber(txMbps) && isNumber(bandwidth) && bandwidth > 0 ? Math.min(txMbps / bandwidth * 100, 100) : null
+      const utilValues = [rxUtil, txUtil].filter(isNumber)
+      const utilMax = utilValues.length ? Math.max(...utilValues) : null
+      return { nicName, bandwidth, rxRate, txRate, rxUtil, txUtil, utilMax }
+    })
+  }, [validNics, dynamicInfo])
+
+  // Fallback for when no valid NICs exist (keep legacy single-card behavior)
   const primaryInterfaceName = typeof staticInfo?.io.primary_interface === 'string'
     ? staticInfo.io.primary_interface
     : null
-  const selectedNetworkRates = primaryInterfaceName && dynamicInfo?.network?.interfaces?.[primaryInterfaceName]
+  const fallbackNetworkRates = primaryInterfaceName && dynamicInfo?.network?.interfaces?.[primaryInterfaceName]
     ? dynamicInfo.network.interfaces[primaryInterfaceName]
     : dynamicInfo?.network?.total
-  const selectedRxRate = isNumber(selectedNetworkRates?.rx_bytes_per_sec) ? selectedNetworkRates.rx_bytes_per_sec : null
-  const selectedTxRate = isNumber(selectedNetworkRates?.tx_bytes_per_sec) ? selectedNetworkRates.tx_bytes_per_sec : null
+  const fallbackRxRate = isNumber(fallbackNetworkRates?.rx_bytes_per_sec) ? fallbackNetworkRates.rx_bytes_per_sec : null
+  const fallbackTxRate = isNumber(fallbackNetworkRates?.tx_bytes_per_sec) ? fallbackNetworkRates.tx_bytes_per_sec : null
+  // Use static peak bandwidth for fallback utilization
+  const fbRxMbps = toMbps(fallbackRxRate)
+  const fbTxMbps = toMbps(fallbackTxRate)
+  const fbStaticPeakMbps = isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
+    ? staticInfo.io.network_peak_mbps : null
+  const fallbackRxUtil = isNumber(fbRxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbRxMbps / fbStaticPeakMbps * 100, 100) : null
+  const fallbackTxUtil = isNumber(fbTxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbTxMbps / fbStaticPeakMbps * 100, 100) : null
+  const fallbackUtilValues = [fallbackRxUtil, fallbackTxUtil].filter(isNumber)
+  const fallbackUtilMax = fallbackUtilValues.length ? Math.max(...fallbackUtilValues) : null
 
-  const totalBandwidthMbps = isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
-    ? staticInfo.io.network_peak_mbps
-    : null
+  // Aggregate network util across all NICs (for pressure gauge)
+  const nicUtilValues = networkNicCards.map((n) => n.utilMax).filter(isNumber)
+  const networkUtilMax = nicUtilValues.length
+    ? Math.max(...nicUtilValues)
+    : fallbackUtilMax
+  const rxNetworkUtil = networkNicCards.length ? networkNicCards[0].rxUtil : fallbackRxUtil
+  const txNetworkUtil = networkNicCards.length ? networkNicCards[0].txUtil : fallbackTxUtil
 
-  const rxNetworkUtil = calcBandwidthUtilization(selectedRxRate, totalBandwidthMbps)
-  const txNetworkUtil = calcBandwidthUtilization(selectedTxRate, totalBandwidthMbps)
-  const networkUtilValues = [rxNetworkUtil, txNetworkUtil].filter(isNumber)
-  const networkUtilMax = networkUtilValues.length ? Math.max(...networkUtilValues) : null
-
-  const networkSnapshotMeta = staticInfo?.io
-    ? [
-        `NIC ${formatPlain(staticInfo.io.nic_count)}`,
-        staticInfo.io.network_speeds_mbps
-          ? summarizeNetworkSpeeds(staticInfo.io.network_speeds_mbps)
-          : null,
-      ].filter(Boolean).join(' | ')
-    : (isNumber(rxNetworkUtil) || isNumber(txNetworkUtil))
-      ? `RX ${formatPercent(rxNetworkUtil, 1)} / TX ${formatPercent(txNetworkUtil, 1)}`
-      : 'No data'
-
-  const npuSnapshotMeta = staticInfo?.npu.names?.length
-    ? staticInfo.npu.names.join(', ')
-    : dynamicInfo?.npu.npu_smi.error || 'npu-smi'
+  const npuSnapshotMeta = (() => {
+    const parts: string[] = []
+    if (staticInfo?.npu.pciid) parts.push(`[${staticInfo.npu.pciid}]`)
+    const freqEntries = Object.values(staticInfo?.npu.freq_bounds_mhz || {})
+    const maxFreq = freqEntries.length ? freqEntries[0]?.max_mhz : null
+    if (isNumber(maxFreq)) parts.push(`Freq ${Math.round(maxFreq)} MHz`)
+    if (parts.length) return parts.join(' | ')
+    return staticInfo?.npu.names?.length
+      ? staticInfo.npu.names.join(', ')
+      : dynamicInfo?.npu.npu_smi.error || 'npu-smi'
+  })()
 
   const gpuSnapshotMeta = gpuDevices.length
     ? gpuDevices.map((d) => {
@@ -2497,67 +2576,136 @@ export default function SystemOverview({ active }: Props) {
           />
         </Col>
 
-        <Col xs={24} md={12} xl={8}>
-          <TrendPanel
-            title="Network"
-            accent={PERF_COLORS.network}
-            value={networkUtilMax}
-            unit="%"
-            status={isNumber(networkUtilMax) ? (networkUtilMax >= 80 ? 'Busy' : 'OK') : undefined}
-            statusColor={isNumber(networkUtilMax) && networkUtilMax >= 80 ? COLORS.red : PERF_COLORS.network}
-            series={getSeries('util:network')}
-            multiSeries={networkUtilizationSeries}
-            multiSeriesYMin={0}
-            multiSeriesYMax={100}
-            multiSeriesYTickCount={4}
-            splitBars={[
-              { key: 'rx-bar', label: 'RX', value: rxNetworkUtil, color: PERF_COLORS.network, sublabel: `${primaryInterfaceName || 'primary'} ${formatBytesRate(selectedRxRate)}` },
-              { key: 'tx-bar', label: 'TX', value: txNetworkUtil, color: PERF_COLORS.gpu, sublabel: `${primaryInterfaceName || 'primary'} ${formatBytesRate(selectedTxRate)}` },
-            ]}
-            subtitle={networkSnapshotMeta}
-            details={[
-              { label: 'Util (max)', value: formatPercent(networkUtilMax), source: 'dynamic' },
-              { label: `RX BW (${primaryInterfaceName || '?'})`, value: formatMetric(toMbps(selectedRxRate), 'Mb/s', 2), source: 'dynamic' },
-              { label: `TX BW (${primaryInterfaceName || '?'})`, value: formatMetric(toMbps(selectedTxRate), 'Mb/s', 2), source: 'dynamic' },
-            ]}
-            secondaryChart={(
-              <div>
-                <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginBottom: 4 }}>
-                  Bandwidth Trend (Kb/s)
-                </Text>
-                <div className="perf-series-legend" style={{ marginBottom: 6 }}>
-                  {networkBandwidthKbpsSeries.map((item) => (
-                    <span className="perf-series-legend-item" key={`network-bw-${item.key}`}>
-                      <span className="perf-series-legend-dot" style={{ background: item.stroke }} />
-                      {item.label}
-                    </span>
-                  ))}
+        {networkNicCards.length > 1 ? networkNicCards.map((nic) => {
+          const nicSeries = getNetworkNicSeries(nic.nicName)
+          return (
+            <Col xs={24} md={12} xl={8} key={`nic-${nic.nicName}`}>
+              <TrendPanel
+                title={`Network: ${nic.nicName}`}
+                accent={PERF_COLORS.network}
+                value={nic.utilMax}
+                unit="%"
+                status={isNumber(nic.utilMax) ? (nic.utilMax >= 80 ? 'Busy' : 'OK') : undefined}
+                statusColor={isNumber(nic.utilMax) && nic.utilMax >= 80 ? COLORS.red : PERF_COLORS.network}
+                series={getSeries(`util:network:${nic.nicName}`)}
+                splitBars={[
+                  { key: 'rx-bar', label: 'RX', value: nic.rxUtil, color: PERF_COLORS.network, sublabel: `${formatBytesRate(nic.rxRate)}` },
+                  { key: 'tx-bar', label: 'TX', value: nic.txUtil, color: PERF_COLORS.gpu, sublabel: `${formatBytesRate(nic.txRate)}` },
+                ]}
+                subtitle={`${formatNetworkSpeed(nic.bandwidth)}`}
+                details={[
+                  { label: 'Util', value: formatPercent(nic.utilMax), source: 'dynamic' },
+                  { label: 'RX BW', value: formatMetric(toMbps(nic.rxRate), 'Mb/s', 2), source: 'dynamic' },
+                  { label: 'TX BW', value: formatMetric(toMbps(nic.txRate), 'Mb/s', 2), source: 'dynamic' },
+                ]}
+                secondaryChart={(
+                  <div>
+                    <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginBottom: 4 }}>
+                      Bandwidth Trend (Kb/s)
+                    </Text>
+                    <div className="perf-series-legend" style={{ marginBottom: 6 }}>
+                      {nicSeries.bwSeries.map((item) => (
+                        <span className="perf-series-legend-item" key={`network-bw-${item.key}`}>
+                          <span className="perf-series-legend-dot" style={{ background: item.stroke }} />
+                          {item.label}
+                        </span>
+                      ))}
+                    </div>
+                    <MultiLineSparkline
+                      series={nicSeries.bwSeries}
+                      width={320}
+                      height={52}
+                      responsive
+                      mode={sparkMode === 'compact' ? 'compact' : 'axis'}
+                      xStartLabel={trendWindow ? `-${trendWindow}` : ''}
+                      xEndLabel="now"
+                      yMin={0}
+                      yMax={nicSeries.bwAxisMax}
+                      yTickCount={3}
+                    />
+                  </div>
+                )}
+                secondaryChartPosition="top"
+                compact
+                centerBody
+                compactDetails
+                primaryChartHeight={68}
+                secondaryChartGap={6}
+                detailTopMargin={2}
+                sparkMode={sparkMode}
+                trendWindow={trendWindow}
+                primaryChartLabel="Utilization Trend"
+              />
+            </Col>
+          )
+        }) : (
+          <Col xs={24} md={12} xl={8}>
+            <TrendPanel
+              title={networkNicCards.length === 1 ? `Network: ${networkNicCards[0].nicName}` : 'Network'}
+              accent={PERF_COLORS.network}
+              value={networkNicCards.length === 1 ? networkNicCards[0].utilMax : fallbackUtilMax}
+              unit="%"
+              status={isNumber(networkUtilMax) ? (networkUtilMax >= 80 ? 'Busy' : 'OK') : undefined}
+              statusColor={isNumber(networkUtilMax) && networkUtilMax >= 80 ? COLORS.red : PERF_COLORS.network}
+              series={getSeries(networkNicCards.length === 1 ? `util:network:${networkNicCards[0].nicName}` : 'util:network')}
+              splitBars={[
+                { key: 'rx-bar', label: 'RX', value: networkNicCards.length === 1 ? networkNicCards[0].rxUtil : fallbackRxUtil, color: PERF_COLORS.network, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate) },
+                { key: 'tx-bar', label: 'TX', value: networkNicCards.length === 1 ? networkNicCards[0].txUtil : fallbackTxUtil, color: PERF_COLORS.gpu, sublabel: formatBytesRate(networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate) },
+              ]}
+              subtitle={networkNicCards.length === 1
+                ? formatNetworkSpeed(networkNicCards[0].bandwidth)
+                : staticInfo?.io
+                  ? [
+                      `NIC ${formatPlain(staticInfo.io.nic_count)}`,
+                      staticInfo.io.network_speeds_mbps ? summarizeNetworkSpeeds(staticInfo.io.network_speeds_mbps) : null,
+                    ].filter(Boolean).join(' | ')
+                  : 'No data'
+              }
+              details={[
+                { label: 'Util', value: formatPercent(networkNicCards.length === 1 ? networkNicCards[0].utilMax : fallbackUtilMax), source: 'dynamic' },
+                { label: 'RX BW', value: formatMetric(toMbps(networkNicCards.length === 1 ? networkNicCards[0].rxRate : fallbackRxRate), 'Mb/s', 2), source: 'dynamic' },
+                { label: 'TX BW', value: formatMetric(toMbps(networkNicCards.length === 1 ? networkNicCards[0].txRate : fallbackTxRate), 'Mb/s', 2), source: 'dynamic' },
+              ]}
+              secondaryChart={(
+                <div>
+                  <Text style={{ color: COLORS.textMuted, fontSize: 11, display: 'block', marginBottom: 4 }}>
+                    Bandwidth Trend (Kb/s)
+                  </Text>
+                  <div className="perf-series-legend" style={{ marginBottom: 6 }}>
+                    {networkBandwidthKbpsSeries.map((item) => (
+                      <span className="perf-series-legend-item" key={`network-bw-${item.key}`}>
+                        <span className="perf-series-legend-dot" style={{ background: item.stroke }} />
+                        {item.label}
+                      </span>
+                    ))}
+                  </div>
+                  <MultiLineSparkline
+                    series={networkBandwidthKbpsSeries}
+                    width={320}
+                    height={52}
+                    responsive
+                    mode={sparkMode === 'compact' ? 'compact' : 'axis'}
+                    xStartLabel={trendWindow ? `-${trendWindow}` : ''}
+                    xEndLabel="now"
+                    yMin={0}
+                    yMax={networkBandwidthKbpsAxisMax}
+                    yTickCount={3}
+                  />
                 </div>
-                <MultiLineSparkline
-                  series={networkBandwidthKbpsSeries}
-                  width={320}
-                  height={52}
-                  responsive
-                  mode={sparkMode === 'compact' ? 'compact' : 'axis'}
-                  xStartLabel={trendWindow ? `-${trendWindow}` : ''}
-                  xEndLabel="now"
-                  yMin={0}
-                  yMax={networkBandwidthKbpsAxisMax}
-                  yTickCount={3}
-                />
-              </div>
-            )}
-            secondaryChartPosition="top"
-            compact
-            centerBody
-            compactDetails
-            primaryChartHeight={68}
-            secondaryChartGap={6}
-            detailTopMargin={2}
-            sparkMode={sparkMode}
-            trendWindow={trendWindow}
-          />
-        </Col>
+              )}
+              secondaryChartPosition="top"
+              compact
+              centerBody
+              compactDetails
+              primaryChartHeight={68}
+              secondaryChartGap={6}
+              detailTopMargin={2}
+              sparkMode={sparkMode}
+              trendWindow={trendWindow}
+              primaryChartLabel="Utilization Trend"
+            />
+          </Col>
+        )}
 
         {gpuDevices.length === 0 ? null : gpuDevices.map((device, index) => (
           <Col xs={24} md={12} xl={8} key={device.id}>
@@ -2572,8 +2720,12 @@ export default function SystemOverview({ active }: Props) {
               subtitle={(() => {
                 const parts: string[] = []
                 if (device.driver !== 'N/A') parts.push(device.driver)
-                if (device.label === 'iGPU' && isNumber(device.euCount)) parts.push(`EU ${device.euCount}`)
-                if (device.pcieLink.current_speed) parts.push(`PCIe ${formatPcieLink(device.pcieLink.current_speed, device.pcieLink.current_width, device.pcieLink.max_speed, device.pcieLink.max_width)}`)
+                if (device.pciId) parts.push(`[${device.pciId}]`)
+                if (isNumber(device.euCount)) parts.push(`EU ${device.euCount}`)
+                const gt0b = device.gtFreqBounds.gt0
+                const gt1b = device.gtFreqBounds.gt1
+                if (gt0b && (isNumber(gt0b.min_mhz) || isNumber(gt0b.max_mhz))) parts.push(`GT0 ${formatFreqRange(gt0b.min_mhz, gt0b.max_mhz)}`)
+                if (gt1b && (isNumber(gt1b.min_mhz) || isNumber(gt1b.max_mhz))) parts.push(`GT1 ${formatFreqRange(gt1b.min_mhz, gt1b.max_mhz)}`)
                 return parts.length ? parts.join(' | ') : device.name
               })()}
               details={[
@@ -2588,7 +2740,7 @@ export default function SystemOverview({ active }: Props) {
                   source: 'dynamic',
                 },
                 { label: 'GPU Power', value: formatMetric(device.powerGpu, 'W', 2), source: 'dynamic' },
-                { label: 'Pkg Power', value: formatMetric(device.powerPkg, 'W', 2), source: 'dynamic' },
+                { label: 'Card Power', value: formatMetric(device.powerPkg, 'W', 2), source: 'dynamic' },
                 {
                   label: device.label === 'iGPU' ? 'Sys Mem' : 'VRAM',
                   value: formatPercent(device.vramUsage),
@@ -2636,7 +2788,7 @@ export default function SystemOverview({ active }: Props) {
               status={diskData.is_busy ? 'Busy' : 'OK'}
               statusColor={diskData.is_busy ? COLORS.red : COLORS.green}
               series={getSeries(`disk:${diskName}:util`)}
-              subtitle={diskName}
+              subtitle={diskSizeLookup[diskName] != null ? `${formatMetric(diskSizeLookup[diskName], 'GB', 1)}` : undefined}
               details={[
                 { label: 'Size', value: formatMetric(diskSizeLookup[diskName], 'GB', 2), source: 'static' },
                 { label: 'Read', value: formatMetric(diskData.read_kb_per_sec, 'KB/s', 1), source: 'dynamic' },

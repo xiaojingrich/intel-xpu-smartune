@@ -745,6 +745,7 @@ class SystemPressureMonitor:
             logger.error("Failed to update pressure level: %s", str(e))
             return "unknown", 0.0, False, {}
 
+
     def get_current_pressure_level(self) -> tuple:
         """获取当前压力等级
         返回: (level, score, is_disk_io_stressed)

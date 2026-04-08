@@ -40,13 +40,13 @@ _QMASSA_STATE: Dict[str, Any] = {
     "last_parsed": None,
     "last_invalid_json_log_ts": 0.0,
     "last_failure_ts": 0.0,
+    "pid": None,
 }
 _QMASSA_LOCK = threading.Lock()
 _QMASSA_SHUTDOWN = False
 _QMASSA_RETRY_BACKOFF_SEC = 60   # seconds to wait before retrying after a confirmed failure
 _QMASSA_STARTUP_GRACE_SEC = 10   # seconds after launch before the process is expected to be visible
-_QMASSA_MAX_JSON_BYTES = 8 * 1024 * 1024
-_QMASSA_MAX_STATES = 600
+_QMASSA_MAX_FILE_BYTES = 10 * 1024 * 1024  # restart qmassa when output file exceeds 10 MB
 _CORE_CLASS_CACHE: Dict[str, Any] = {"cpu_count": None, "result": None}
 _DYNAMIC_SNAPSHOT_LOCK = threading.Lock()
 _DYNAMIC_SNAPSHOT_STATE: Dict[str, Any] = {"last_persist_ts": 0.0}
@@ -295,7 +295,17 @@ def _normalize_gpu_engines(engines: List[str]) -> List[str]:
     return [engine for engine in order if engine in normalized]
 
 
+def _parse_freq_val(raw: Optional[str]) -> Optional[float]:
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _get_gpu_freq_bounds(cards: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
+    """Legacy flat bounds (GT0 only) kept for backward compatibility."""
     result: Dict[str, Dict[str, Optional[float]]] = {}
     for card in cards:
         min_paths = [
@@ -314,9 +324,64 @@ def _get_gpu_freq_bounds(cards: List[str]) -> Dict[str, Dict[str, Optional[float
         max_val = _read_first_existing(max_paths)
         if min_val or max_val:
             result[os.path.basename(card)] = {
-                "min_mhz": float(min_val) if min_val and min_val.isdigit() else None,
-                "max_mhz": float(max_val) if max_val and max_val.isdigit() else None,
+                "min_mhz": _parse_freq_val(min_val),
+                "max_mhz": _parse_freq_val(max_val),
             }
+    return result
+
+
+def _get_gpu_gt_freq_bounds_sysfs(
+    cards: List[str],
+) -> Dict[str, Dict[str, Dict[str, Optional[float]]]]:
+    """Read per-GT frequency bounds directly from sysfs.
+
+    xe driver layout:   card/device/tile<N>/gt<N>/freq0/{min_freq,max_freq}
+    i915 driver layout: card/gt/gt<N>/{rps_min_freq_mhz,rps_max_freq_mhz}
+    """
+    result: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
+
+    for card in cards:
+        card_name = os.path.basename(card)
+        driver = _get_gpu_driver_name(card)
+        gt_bounds: Dict[str, Dict[str, Optional[float]]] = {}
+
+        if driver == "xe":
+            # xe: card/device/tile*/gt*/freq0/
+            tile_root = os.path.join(card, "device")
+            for tile_dir in sorted(glob.glob(os.path.join(tile_root, "tile*"))):
+                if not os.path.isdir(tile_dir):
+                    continue
+                for gt_dir in sorted(glob.glob(os.path.join(tile_dir, "gt*"))):
+                    if not os.path.isdir(gt_dir):
+                        continue
+                    gt_name = os.path.basename(gt_dir).lower()
+                    freq0_dir = os.path.join(gt_dir, "freq0")
+                    min_val = _safe_read(os.path.join(freq0_dir, "min_freq"))
+                    max_val = _safe_read(os.path.join(freq0_dir, "max_freq"))
+                    if min_val or max_val:
+                        gt_bounds[gt_name] = {
+                            "min_mhz": _parse_freq_val(min_val),
+                            "max_mhz": _parse_freq_val(max_val),
+                        }
+
+        elif driver == "i915":
+            # i915: card/gt/gt*/rps_{min,max}_freq_mhz
+            gt_root = os.path.join(card, "gt")
+            for gt_dir in sorted(glob.glob(os.path.join(gt_root, "gt*"))):
+                if not os.path.isdir(gt_dir):
+                    continue
+                gt_name = os.path.basename(gt_dir).lower()
+                min_val = _safe_read(os.path.join(gt_dir, "rps_min_freq_mhz"))
+                max_val = _safe_read(os.path.join(gt_dir, "rps_max_freq_mhz"))
+                if min_val or max_val:
+                    gt_bounds[gt_name] = {
+                        "min_mhz": _parse_freq_val(min_val),
+                        "max_mhz": _parse_freq_val(max_val),
+                    }
+
+        if gt_bounds:
+            result[card_name] = gt_bounds
+
     return result
 
 
@@ -970,11 +1035,22 @@ def _get_network_static_info() -> Dict[str, Any]:
             primary_score = score
             primary_interface = name
 
+    # Build list of valid physical NICs: candidate interfaces that are up with a real link speed.
+    valid_nics: List[Dict[str, Any]] = []
+    for name, nic in stats.items():
+        if not _is_candidate_interface(name):
+            continue
+        is_up = bool(getattr(nic, "isup", False))
+        speed = network_speeds_mbps.get(name, 0)
+        if is_up and speed > 0:
+            valid_nics.append({"name": name, "speed_mbps": speed})
+
     return {
         "nic_count": len(stats),
         "network_speeds_mbps": network_speeds_mbps,
         "network_peak_mbps": peak_speed,
         "primary_interface": primary_interface,
+        "valid_nics": valid_nics,
     }
 
 
@@ -1280,6 +1356,20 @@ def _kill_qmassa_processes(qmassa_bin: str) -> None:
             logger.debug("Failed to terminate qmassa pid %d: %s", pid, exc)
 
 
+def _kill_own_qmassa() -> None:
+    """Kill only the qmassa process that we launched (tracked by PID)."""
+    pid = _QMASSA_STATE.get("pid")
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        pass
+    _QMASSA_STATE["pid"] = None
+
+
 def _ensure_qmassa_running() -> Optional[str]:
     global _QMASSA_SHUTDOWN
     with _QMASSA_LOCK:
@@ -1292,46 +1382,74 @@ def _ensure_qmassa_running() -> Optional[str]:
 
         json_path = os.path.join("/tmp", "qmassa-metrics.json")
 
-        # Fast path: process is already visible in the OS process table.
-        # This correctly handles daemonization: the original launcher exits,
-        # but the real daemon lives under a different PID.
-        if _find_qmassa_process(qmassa_bin) is not None:
-            if _QMASSA_STATE.get("json_path") != json_path:
-                _QMASSA_STATE["json_path"] = json_path
-            return json_path
-
         now = time.time()
-        last_start = _QMASSA_STATE.get("last_start") or 0.0
-        last_failure = _QMASSA_STATE.get("last_failure_ts") or 0.0
 
-        # Within startup grace window: qmassa was just launched and may still
-        # be daemonizing / writing its PID.  Return json_path optimistically;
-        # _get_qmassa_output() handles the case where the file doesn't exist
-        # yet, so no data is lost — we just get empty results for a few seconds.
-        if last_start and now - last_start < _QMASSA_STARTUP_GRACE_SEC:
-            return json_path
+        # ── File-size guard (runs regardless of process state) ────────
+        # If the output file exceeds the limit, kill ALL qmassa processes
+        # and remove the file before doing anything else.
+        try:
+            file_size = os.path.getsize(json_path) if os.path.exists(json_path) else 0
+        except OSError:
+            file_size = 0
+        if file_size > _QMASSA_MAX_FILE_BYTES:
+            # Routine file-size rotation — no need to log.
+            _kill_own_qmassa()
+            try:
+                os.remove(json_path)
+            except Exception as exc:
+                logger.debug("Failed to remove oversized qmassa file: %s", exc)
+            # Fall through to re-launch below.
 
-        # Grace period elapsed and the process is still not visible — genuine failure.
-        if last_start and not last_failure:
-            last_failure = now
-            _QMASSA_STATE["last_failure_ts"] = now
-            _QMASSA_STATE["last_start"] = 0.0
-            logger.warning(
-                "qmassa failed to start, binary: %s; will retry in %ds",
-                qmassa_bin, _QMASSA_RETRY_BACKOFF_SEC,
-            )
+        # ── Fast path: process already running and file size OK ───────
+        else:
+            own_pid = _QMASSA_STATE.get("pid")
+            is_running = False
+            if own_pid is not None:
+                try:
+                    os.kill(own_pid, 0)  # signal 0: check if process exists
+                    is_running = True
+                except (ProcessLookupError, PermissionError):
+                    _QMASSA_STATE["pid"] = None
+            if is_running:
+                if _QMASSA_STATE.get("json_path") != json_path:
+                    _QMASSA_STATE["json_path"] = json_path
+                return json_path
 
-        # Respect retry backoff after a confirmed failure.
-        if last_failure and now - last_failure < _QMASSA_RETRY_BACKOFF_SEC:
-            return None
+            last_start = _QMASSA_STATE.get("last_start") or 0.0
+            last_failure = _QMASSA_STATE.get("last_failure_ts") or 0.0
 
-        # Launch qmassa.  We do NOT block to verify — if the binary daemonizes
-        # the launcher exits immediately and the daemon may take a few seconds
-        # to appear in the process table.  The startup grace window above
-        # handles this without triggering a false failure.
+            # Within startup grace window.
+            if last_start and now - last_start < _QMASSA_STARTUP_GRACE_SEC:
+                return json_path
+
+            # Process is gone — distinguish normal exit from startup failure.
+            had_successful_run = _QMASSA_STATE.get("last_parsed") is not None
+            if had_successful_run:
+                if os.path.exists(json_path):
+                    try:
+                        os.remove(json_path)
+                    except Exception as exc:
+                        logger.debug("Failed to remove old qmassa file: %s", exc)
+                logger.info("qmassa exited, restarting with fresh file")
+            else:
+                if last_start and not last_failure:
+                    last_failure = now
+                    _QMASSA_STATE["last_failure_ts"] = now
+                    _QMASSA_STATE["last_start"] = 0.0
+                    logger.warning(
+                        "qmassa failed to start, binary: %s; will retry in %ds",
+                        qmassa_bin, _QMASSA_RETRY_BACKOFF_SEC,
+                    )
+                if last_failure and now - last_failure < _QMASSA_RETRY_BACKOFF_SEC:
+                    return None
+
+        # Launch qmassa.  We do NOT block to verify — if the binary
+        # daemonizes the launcher exits immediately and the daemon may take
+        # a few seconds to appear in the process table.  The startup grace
+        # window above handles this without triggering a false failure.
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 [qmassa_bin, "-x", "-t", json_path],
                 cwd=repo_root,
                 stdin=subprocess.DEVNULL,
@@ -1342,7 +1460,8 @@ def _ensure_qmassa_running() -> Optional[str]:
             _QMASSA_STATE["json_path"] = json_path
             _QMASSA_STATE["last_start"] = now
             _QMASSA_STATE["last_failure_ts"] = 0.0
-            logger.info("qmassa launched: %s", qmassa_bin)
+            _QMASSA_STATE["pid"] = proc.pid
+            logger.info("qmassa launched: %s (pid %d)", qmassa_bin, proc.pid)
             return json_path
         except Exception as exc:
             _QMASSA_STATE["last_failure_ts"] = now
@@ -1359,15 +1478,11 @@ def shutdown_qmassa() -> None:
 
     with _QMASSA_LOCK:
         json_path = _QMASSA_STATE.get("json_path")
+        _kill_own_qmassa()
         _QMASSA_STATE["json_path"] = None
         _QMASSA_STATE["last_start"] = 0.0
         _QMASSA_STATE["last_parsed"] = None
         _QMASSA_STATE["last_failure_ts"] = 0.0
-
-    # Kill the daemon by scanning the process table (the original Popen handle
-    # is not reliable because qmassa daemonizes and the launcher exits first).
-    if qmassa_bin:
-        _kill_qmassa_processes(qmassa_bin)
 
     if json_path and os.path.exists(json_path):
         try:
@@ -1376,117 +1491,45 @@ def shutdown_qmassa() -> None:
             logger.debug("Failed to remove qmassa output file %s: %s", json_path, exc)
 
 
-_QMASSA_COMPACT_THRESHOLD = 10   # compact when states array exceeds this count
-_QMASSA_COMPACT_KEEP = 5         # keep this many most-recent states after compaction
-
-
-def _compact_qmassa_json_if_needed(json_path: str, raw_data: str) -> str:
-    """Compact the qmassa JSON file if its states array has grown too large.
-
-    qmassa appends monitoring snapshots to a ``"states"`` array in the output
-    file, which causes the file to grow unboundedly over time.  This function
-    rewrites the file to keep only the most recent
-    ``_QMASSA_COMPACT_KEEP`` states whenever the array exceeds
-    ``_QMASSA_COMPACT_THRESHOLD`` entries.
-
-    The rewrite is best-effort: any exception (e.g. a concurrent write from
-    qmassa) is silently swallowed and the original data is returned unchanged.
-
-    Returns the (possibly compacted) raw JSON string.
-    """
-    try:
-        payload = json.loads(raw_data)
-    except Exception:
-        return raw_data
-
-    states = payload.get("states") or []
-    if len(states) <= _QMASSA_COMPACT_THRESHOLD:
-        return raw_data
-
-    payload["states"] = states[-_QMASSA_COMPACT_KEEP:]
-    compacted = json.dumps(payload, ensure_ascii=False)
-    try:
-        # Write atomically via a sibling temp file then rename so the file is
-        # never seen in a half-written state by concurrent readers.
-        tmp_path = json_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write(compacted)
-        os.replace(tmp_path, json_path)
-        logger.debug(
-            "Compacted qmassa JSON: %d → %d states (%d bytes)",
-            len(states),
-            len(payload["states"]),
-            len(compacted),
-        )
-    except Exception as exc:
-        logger.debug("Failed to compact qmassa JSON file: %s", exc)
-
-    return compacted
-
-
-_QMASSA_JSON_READ_RETRIES = 3        # attempts before treating file as invalid
-_QMASSA_JSON_READ_RETRY_DELAY = 0.05  # seconds (50 ms) between read attempts
 
 
 def _read_qmassa_json(json_path: str) -> Optional[Dict[str, Any]]:
-    """Read and parse the qmassa JSON output file, retrying on transient I/O races.
+    """Read and parse the qmassa JSON output file.
 
     qmassa rewrites its output file in-place (non-atomic), so the monitor may
-    catch a partial write.  Rather than immediately surfacing that as an error,
-    we retry a handful of times with a short delay, which is almost always
-    enough to wait for the write to complete.
+    occasionally catch a partial write.  When that happens the caller falls
+    back to the last successfully parsed result cached in ``_QMASSA_STATE``.
 
-    After a successful parse the file is compacted when necessary to prevent
-    the ``states`` array from growing unboundedly on disk.
+    File growth is bounded by launching qmassa with ``-n`` so the ``states``
+    array never exceeds a fixed number of entries.
 
-    Returns the parsed dict on success, or ``None`` if all attempts fail.
+    Returns the parsed dict on success, or ``None`` on failure.
     """
-    for attempt in range(_QMASSA_JSON_READ_RETRIES):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = f.read()
-        except OSError:
-            return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = f.read()
+    except OSError:
+        return None
 
-        if not data or not data.strip():
-            # File is empty — qmassa may still be starting up; retry.
-            if attempt < _QMASSA_JSON_READ_RETRIES - 1:
-                time.sleep(_QMASSA_JSON_READ_RETRY_DELAY)
-            continue
+    if not data or not data.strip():
+        return None
 
-        parsed = _parse_qmassa_json(data)
-        if parsed is not None:
-            # Compact the file in the background to prevent unbounded growth.
-            _compact_qmassa_json_if_needed(json_path, data)
-            return parsed
-
-        # JSON is invalid — likely a partial write; wait and retry.
-        if attempt < _QMASSA_JSON_READ_RETRIES - 1:
-            time.sleep(_QMASSA_JSON_READ_RETRY_DELAY)
-
-    return None
+    return _parse_qmassa_json(data)
 
 
 def _get_qmassa_output() -> Dict[str, Any]:
     json_path = _ensure_qmassa_running()
     if not json_path:
         return {"available": False, "raw": None, "parsed": None, "error": "qmassa not available"}
-    if not os.path.exists(json_path):
-        return {"available": False, "raw": None, "parsed": None, "error": f"{json_path} not found"}
 
     try:
-        parsed = _read_qmassa_json(json_path)
+        parsed = _read_qmassa_json(json_path) if os.path.exists(json_path) else None
 
         with _QMASSA_LOCK:
             cached = _QMASSA_STATE.get("last_parsed")
             if parsed is None:
-                # All retry attempts failed — file is genuinely invalid right now.
-                # Log at most once every 30 s to avoid flooding the log.
-                now = time.time()
-                last_log_ts = float(_QMASSA_STATE.get("last_invalid_json_log_ts") or 0.0)
-                if now - last_log_ts >= 30.0:
-                    logger.debug("qmassa output could not be parsed after retries; using cached data")
-                    _QMASSA_STATE["last_invalid_json_log_ts"] = now
+                # File is missing or invalid right now (e.g. during restart).
+                # Silent — using cached data is the normal fallback path.
                 if cached:
                     return {
                         "available": True,
@@ -1530,6 +1573,11 @@ def _parse_qmassa_json(raw: str) -> Optional[Dict[str, Any]]:
             except (ValueError, TypeError):
                 return None
 
+        # PL4 is a transient instantaneous power limit that fires briefly
+        # during normal operation and does not indicate sustained throttling.
+        # Exclude it from the set of reasons that mark a GT as "throttled".
+        _BENIGN_THROTTLE_REASONS: Set[str] = {"pl4"}
+
         freqs: List[Dict[str, Any]] = []
         freq_samples = dev_stats.get("freqs") or []
         latest_freqs = freq_samples[-1] if freq_samples else []
@@ -1538,7 +1586,8 @@ def _parse_qmassa_json(raw: str) -> Optional[Dict[str, Any]]:
             name = (limit.get("name") or f"gt{idx}").lower()
             throttle = freq_info.get("throttle_reasons") or {}
             throttle_reasons = [k for k, v in throttle.items() if k != "status" and v]
-            throttled = bool(throttle.get("status")) or bool(throttle_reasons)
+            significant_reasons = [r for r in throttle_reasons if r.lower() not in _BENIGN_THROTTLE_REASONS]
+            throttled = bool(significant_reasons)
             freqs.append({
                 "name": name,
                 "min_mhz": _safe_float(freq_info.get("min_freq")),
@@ -1782,11 +1831,16 @@ def _build_npu_history(npu_smi: Dict[str, Any]) -> Dict[str, Any]:
         if utilization_percent is None:
             utilization_percent = _parse_util_from_raw(raw)
 
+    frequency_mhz: Optional[float] = None
+    if isinstance(parsed, dict):
+        frequency_mhz = _to_float(parsed.get("frequency_mhz"))
+
     return {
         "available": bool(npu_smi.get("available")),
         "error": npu_smi.get("error"),
         "raw_present": bool(raw),
         "utilization_percent": round(utilization_percent, 3) if utilization_percent is not None else None,
+        "frequency_mhz": round(frequency_mhz, 1) if frequency_mhz is not None else None,
         "parsed": parsed,
     }
 
@@ -1828,6 +1882,24 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
         total_read_iops += read_iops if read_iops is not None else 0.0
         total_write_iops += write_iops if write_iops is not None else 0.0
 
+    # Per-disk detail for history charts
+    per_disk: Dict[str, Dict[str, Optional[float]]] = {}
+    for disk_name, item in disk_io.items():
+        if not isinstance(item, dict):
+            continue
+        util = _to_float(item.get("utilization"))
+        if util is not None:
+            if util <= 1:
+                util *= 100
+            util = max(0.0, min(util, 100.0))
+        r_kb = _to_float(item.get("read_kb_per_sec"))
+        w_kb = _to_float(item.get("write_kb_per_sec"))
+        per_disk[disk_name] = {
+            "util": round(util, 2) if util is not None else None,
+            "read_mb": round(r_kb / 1024.0, 3) if r_kb is not None else None,
+            "write_mb": round(w_kb / 1024.0, 3) if w_kb is not None else None,
+        }
+
     return {
         "utilization": round(max_util, 2) if max_util is not None else None,
         "read_kb_per_sec": round(total_read_kb, 2),
@@ -1835,6 +1907,7 @@ def _build_disk_history(disk: Dict[str, Any]) -> Dict[str, Optional[float]]:
         "read_iops": round(total_read_iops, 2),
         "write_iops": round(total_write_iops, 2),
         "total_iops": round(total_read_iops + total_write_iops, 2),
+        "per_disk": per_disk,
     }
 
 
@@ -1850,7 +1923,8 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
     if rx_bytes is not None or tx_bytes is not None:
         total_mbps = ((rx_bytes or 0.0) + (tx_bytes or 0.0)) * 8.0 / 1_000_000.0
 
-    peak_mbps = _to_float((_get_network_static_info() or {}).get("network_peak_mbps"))
+    static_info = _get_network_static_info() or {}
+    peak_mbps = _to_float(static_info.get("network_peak_mbps"))
     if peak_mbps is not None and peak_mbps <= 0:
         peak_mbps = None
 
@@ -1863,6 +1937,31 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
     if total_mbps is not None and max_mbps and max_mbps > 0:
         utilization_percent = max(0.0, min((total_mbps / max_mbps) * 100.0, 100.0))
 
+    # Per-NIC detail for history charts (utilization + bandwidth)
+    per_nic: Dict[str, Dict[str, Optional[float]]] = {}
+    interfaces = network.get("interfaces") if isinstance(network, dict) else None
+    if isinstance(interfaces, dict):
+        valid_nics = static_info.get("valid_nics") or []
+        nic_speeds = {nic["name"]: nic["speed_mbps"] for nic in valid_nics if isinstance(nic, dict)}
+        for nic_name, nic_data in interfaces.items():
+            if nic_name not in nic_speeds:
+                continue
+            speed = nic_speeds[nic_name]
+            if not speed or speed <= 0:
+                continue
+            nic_rx = _to_float(nic_data.get("rx_bytes_per_sec")) if isinstance(nic_data, dict) else None
+            nic_tx = _to_float(nic_data.get("tx_bytes_per_sec")) if isinstance(nic_data, dict) else None
+            rx_mbps = (nic_rx or 0.0) * 8.0 / 1_000_000.0 if nic_rx is not None else 0.0
+            tx_mbps = (nic_tx or 0.0) * 8.0 / 1_000_000.0 if nic_tx is not None else 0.0
+            rx_util = max(0.0, min(rx_mbps / speed * 100.0, 100.0))
+            tx_util = max(0.0, min(tx_mbps / speed * 100.0, 100.0))
+            nic_util = max(rx_util, tx_util)
+            per_nic[nic_name] = {
+                "util": round(nic_util, 3),
+                "rx_mbps": round(rx_mbps, 3),
+                "tx_mbps": round(tx_mbps, 3),
+            }
+
     return {
         "total": {
             "rx_bytes_per_sec": rx_bytes,
@@ -1870,6 +1969,7 @@ def _build_network_history(network: Dict[str, Any]) -> Dict[str, Any]:
         },
         "total_mbps": round(total_mbps, 3) if total_mbps is not None else None,
         "utilization_percent": round(utilization_percent, 3) if utilization_percent is not None else None,
+        "per_nic": per_nic,
     }
 
 
@@ -1886,6 +1986,8 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         "collected_at": data.get("collected_at"),
         "cpu": {
             "usage_total": _to_float(cpu.get("usage_total")),
+            "p_core_usage": _to_float(cpu.get("p_core_usage")),
+            "e_core_usage": _to_float(cpu.get("e_core_usage")),
         },
         "memory": {
             "usage_percent": _to_float(memory.get("usage_percent")),
@@ -1894,6 +1996,8 @@ def _build_dynamic_history_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             "cpu": _to_float(pressure.get("cpu")),
             "memory": _to_float(pressure.get("memory")),
             "io": _to_float(pressure.get("io")),
+            "network_rx": _to_float(pressure.get("network_rx")),
+            "network_tx": _to_float(pressure.get("network_tx")),
         },
         "disk": _build_disk_history(disk),
         "network": _build_network_history(network),
@@ -1937,7 +2041,18 @@ def collect_static_info(force_refresh: bool = False) -> Dict[str, Any]:
         network_static = _get_network_static_info()
         disk_static = _get_disk_static_info()
         gpu_pci_addresses = _get_gpu_pci_addresses(cards)
-        gpu_gt_freq_bounds, gpu_engines_from_qmassa = _get_gpu_qmassa_static_info(cards, gpu_pci_addresses)
+        # sysfs is the primary source for per-GT freq bounds (no external dependency).
+        # qmassa fills in any entries that sysfs could not read.
+        gpu_gt_freq_bounds_sysfs = _get_gpu_gt_freq_bounds_sysfs(cards)
+        gpu_gt_freq_bounds_qmassa, gpu_engines_from_qmassa = _get_gpu_qmassa_static_info(cards, gpu_pci_addresses)
+        gpu_gt_freq_bounds: Dict[str, Any] = dict(gpu_gt_freq_bounds_sysfs)
+        for _ck, _qgt in gpu_gt_freq_bounds_qmassa.items():
+            if _ck not in gpu_gt_freq_bounds:
+                gpu_gt_freq_bounds[_ck] = _qgt
+            else:
+                for _gn, _bounds in _qgt.items():
+                    if _gn not in gpu_gt_freq_bounds[_ck]:
+                        gpu_gt_freq_bounds[_ck][_gn] = _bounds
         gpu_engines = _get_gpu_engines(cards)
         normalized_gpu_engines: Dict[str, List[str]] = {}
         all_engine_card_keys = set(gpu_engines.keys()) | set(gpu_engines_from_qmassa.keys())
@@ -2011,8 +2126,8 @@ def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None, ne
     # Build pressure metadata from SystemPressureMonitor when available.
     # get_current_pressure_level() is a cheap cache read; the actual measurement
     # is done by the SPM's own background refresh thread.
-    # Only the computed outputs (level, score, is_disk_io_stressed) are included —
-    # the raw PSI inputs used internally are not exposed here.
+    # Computed outputs (level, score, is_disk_io_stressed) and raw PSI inputs
+    # (cpu / memory / io stall fractions) are included for history snapshots.
     pressure_extra: Dict[str, Any] = {}
     if system_pressure_monitor is not None:
         try:
@@ -2022,6 +2137,17 @@ def collect_dynamic_info(resource_monitor=None, system_pressure_monitor=None, ne
             pressure_extra['is_disk_io_stressed'] = is_disk_io_stressed
         except Exception as e:
             logger.warning(f"SystemPressureMonitor unavailable: {e}")
+
+    # Raw PSI stall fractions (cpu / memory / io) for history-dashboard pressure charts.
+    # PSIMonitor is a singleton; reading its cached averages is cheap.
+    try:
+        from monitor.psi import PSIMonitor
+        psi = PSIMonitor().get_current_pressure()
+        pressure_extra['cpu'] = psi.get('cpu', 0.0)
+        pressure_extra['memory'] = psi.get('memory', 0.0)
+        pressure_extra['io'] = psi.get('io', 0.0)
+    except Exception as e:
+        logger.debug(f"PSIMonitor unavailable for raw pressure: {e}")
 
     # Add network pressure fractions (0-1) from NetworkMonitor when available
     if network_monitor is not None:
