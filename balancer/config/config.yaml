@@ -36,7 +36,8 @@ all_apps:
 weights_top:
   cpu: 2
   memory: 7
-  io: 1
+  io: 1  # reserved; IO is ranked separately via mode='io' and does not contribute to the default score
+  gpu: 1  # added to the default score as a secondary factor after GPU data is collected
 monitor_apps:  # Some specific apps to monitor by BPF
   - name: "Calculator"
     bpf_name: ["gnome-calculator"]

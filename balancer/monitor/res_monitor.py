@@ -18,6 +18,158 @@ from utils.logger import logger
 
 from monitor import PSIMonitor
 
+_GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
+_GPU_SAMPLE_INTERVAL = 0.3  # seconds between the two fdinfo snapshots for GPU utilisation
+
+
+def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
+    """Read Intel GPU DRM engine times and memory from /proc/<pid>/fdinfo.
+
+    Scans all file descriptors of the given process for DRM handles backed by an
+    Intel GPU driver (i915 or xe).  For each matching fd, it accumulates:
+
+    * ``engine_ns`` - a ``{engine_name: cumulative_nanoseconds}`` dict with the
+      per-engine busy time reported by the kernel via ``drm-engine-*`` fields.
+    * ``mem_bytes`` - total GPU memory in bytes from physical memory regions.
+
+    Memory and engine time are read from ``drm-total-*`` / ``drm-engine-*`` fields
+    (kernel >= 5.19) or the legacy ``drm-memory-*`` fields (kernel < 5.19).  GTT
+    regions are excluded because they represent virtual address-space reservations
+    rather than physical memory allocations.  Unitless ``drm-total-cycles-*``
+    entries emitted by the Xe driver are ignored (they are cycle counters, not
+    memory values).
+
+    Args:
+        pid: Process ID to inspect.
+        seen_client_ids: Optional mutable set shared across multiple calls.
+            When provided, any DRM client that was already counted (e.g. because
+            another PID in the same cgroup inherited the same GPU fd) is skipped
+            for both engine times and memory, preventing cross-PID
+            double-counting.  Pass the same set for all PIDs belonging to one
+            application group.
+
+    Returns a dict ``{"engine_ns": {...}, "mem_bytes": int}`` when the process
+    holds at least one Intel GPU fd, or ``None`` otherwise.
+    """
+    fd_dir = f'/proc/{pid}/fd'
+    fdinfo_dir = f'/proc/{pid}/fdinfo'
+
+    if not os.path.isdir(fd_dir):
+        return None
+
+    try:
+        fd_entries = os.listdir(fd_dir)
+    except (OSError, PermissionError):
+        return None
+
+    total_engine_ns = {}
+    total_mem_bytes = 0
+    found = False
+    # Use caller-supplied set for cross-PID dedup; fall back to a local set for
+    # intra-PID dedup (multiple fds pointing to the same DRM context).
+    _seen = seen_client_ids if seen_client_ids is not None else set()
+
+    for fd_name in fd_entries:
+        # Only consider DRM render/card nodes
+        try:
+            link = os.readlink(os.path.join(fd_dir, fd_name))
+            if '/dev/dri/' not in link:
+                continue
+        except (OSError, PermissionError):
+            continue
+
+        fdinfo_path = os.path.join(fdinfo_dir, fd_name)
+        try:
+            with open(fdinfo_path, 'r') as fh:
+                fdinfo_content = fh.read()
+        except (OSError, PermissionError):
+            continue
+
+        # Parse driver and client-id before deciding what to do
+        driver = None
+        client_id = None
+        for line in fdinfo_content.splitlines():
+            if line.startswith('drm-driver:'):
+                driver = line.split(':', 1)[1].strip()
+            elif line.startswith('drm-client-id:'):
+                try:
+                    client_id = int(line.split(':', 1)[1].strip())
+                except ValueError:
+                    pass
+
+        if driver not in _GPU_DRM_DRIVERS:
+            continue
+
+        found = True
+
+        # De-duplicate by client-id BEFORE accumulating anything.
+        # A process can open both card and render nodes for the same GPU context;
+        # each fd reports identical engine times and memory for that context, so
+        # counting more than once inflates both utilisation and memory.
+        # With a shared seen_client_ids set, child processes that inherited the
+        # same DRM fd from the parent are also skipped.
+        if client_id is not None:
+            if client_id in _seen:
+                continue
+            _seen.add(client_id)
+
+        for line in fdinfo_content.splitlines():
+            if line.startswith('drm-engine-'):
+                # e.g. 'drm-engine-render:\t123456789 ns'
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    engine = parts[0][len('drm-engine-'):].strip()
+                    val_parts = parts[1].strip().split()
+                    if val_parts:
+                        try:
+                            ns = int(val_parts[0])
+                            total_engine_ns[engine] = total_engine_ns.get(engine, 0) + ns
+                        except ValueError:
+                            pass
+
+        # Sum physical memory regions.
+        # - kernel >= 5.19: 'drm-total-*'  (e.g. 'drm-total-system:\t531 MiB')
+        # - kernel <  5.19: 'drm-memory-*' (e.g. 'drm-memory-system:\t512 KiB')
+        # Exclusions:
+        # - GTT entries ('-gtt' in field name) are virtual address-space
+        #   reservations, not physical allocations.
+        # - Unitless entries (e.g. 'drm-total-cycles-render: 987654321' emitted
+        #   by the Xe driver) are cycle counters, not memory.  Only fields that
+        #   carry an explicit memory unit (B / KiB / MiB / GiB) are summed.
+        for line in fdinfo_content.splitlines():
+            if not (line.startswith('drm-total-') or line.startswith('drm-memory-')):
+                continue
+            # Skip GTT virtual address space regions ('-gtt' as a field component)
+            if '-gtt' in line:
+                continue
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                val_parts = parts[1].strip().split()
+                # Must have at least two tokens: value + unit.  Unitless values
+                # (cycle counts) are intentionally ignored here.
+                if len(val_parts) < 2:
+                    continue
+                try:
+                    value = int(val_parts[0])
+                    unit = val_parts[1].upper()
+                    if unit in ('KIB', 'KI', 'K', 'KB'):
+                        value *= 1024
+                    elif unit in ('MIB', 'MI', 'M', 'MB'):
+                        value *= 1024 * 1024
+                    elif unit in ('GIB', 'GI', 'G', 'GB'):
+                        value *= 1024 * 1024 * 1024
+                    elif unit != 'B':
+                        continue  # unrecognised unit, skip
+                    total_mem_bytes += value
+                except (ValueError, IndexError):
+                    pass
+
+    if not found:
+        return None
+
+    return {'engine_ns': total_engine_ns, 'mem_bytes': total_mem_bytes}
+
+
 
 class ResourceMonitor:
     def __init__(self):
@@ -497,6 +649,74 @@ class ResourceMonitor:
 
         return results
 
+    def _get_gpu_stats_for_pids(self, pids, sample_interval=0.3):
+        """Sample Intel GPU engine utilization and memory for a collection of PIDs.
+
+        Reads ``/proc/<pid>/fdinfo`` for every PID at t0, waits
+        ``sample_interval`` seconds, then reads again at t1.  Engine busy-time
+        deltas are divided by the elapsed interval to produce a utilization
+        percentage; memory values are taken from the t1 snapshot.
+
+        Args:
+            pids: Iterable of process IDs belonging to one application group.
+            sample_interval: Measurement window in seconds (default 0.3 s).
+
+        Returns:
+            A dict with:
+                ``gpu_util``   - peak engine utilisation % across all engines (0-100).
+                ``gpu_mem_mb`` - total GPU memory used in MB.
+        """
+        _NO_GPU = {'gpu_util': 0.0, 'gpu_mem_mb': 0.0}
+        if not pids:
+            return _NO_GPU
+
+        # First snapshot - shared seen_client_ids deduplicates across all PIDs
+        # in this group so that child processes which inherited a parent's DRM fd
+        # don't contribute duplicate engine/memory readings.
+        seen_t0 = set()
+        t0_data = {}
+        for pid in pids:
+            data = _read_pid_fdinfo_gpu(pid, seen_t0)
+            if data is not None:
+                t0_data[pid] = data
+
+        if not t0_data:
+            return _NO_GPU
+
+        time.sleep(sample_interval)
+        elapsed_ns = sample_interval * 1e9
+
+        # Second snapshot - fresh dedup set so the same pids are processed
+        # consistently; only the first PID that exposes a given client_id
+        # contributes to the delta and memory totals.
+        seen_t1 = set()
+        total_engine_delta = {}
+        total_mem_bytes = 0
+
+        for pid in pids:
+            t1 = _read_pid_fdinfo_gpu(pid, seen_t1)
+            if t1 is None:
+                continue
+            t0 = t0_data.get(pid)
+            if t0:
+                for engine, ns1 in t1['engine_ns'].items():
+                    ns0 = t0['engine_ns'].get(engine, 0)
+                    delta = max(0, ns1 - ns0)
+                    total_engine_delta[engine] = total_engine_delta.get(engine, 0) + delta
+            total_mem_bytes += t1['mem_bytes']
+
+        # Peak engine utilisation
+        gpu_util = 0.0
+        for delta_ns in total_engine_delta.values():
+            util = (delta_ns / elapsed_ns) * 100
+            if util > gpu_util:
+                gpu_util = util
+
+        return {
+            'gpu_util': round(min(gpu_util, 100.0), 1),
+            'gpu_mem_mb': round(total_mem_bytes / (1024 * 1024), 1),
+        }
+
     def get_app_resource_stats(self, n=10):
         """获取App Resources页面所需的各应用CPU/内存使用数据（不含阈值过滤）
 
@@ -504,10 +724,64 @@ class ResourceMonitor:
           - 返回前 n 个应用（默认10个）而非仅返回top-1
           - 不检查系统压力阈值，始终返回当前资源使用情况
           - 适用于Dashboard "App Resources" 页面的数据展示
+          - 为每个应用附加GPU引擎使用率和GPU显存信息（通过 fdinfo 采样）
         """
         results = []
         processes = self._get_top_processes(n=n)
         logger.debug(f"App resource stats processes: {processes}")
+
+        # Collect all PIDs grouped by cgroup for a single GPU sampling pass.
+        # This avoids N separate sleep intervals for N apps.
+        cgroup_pids = {}
+        for process in processes:
+            cgroup = process['cgroup']
+            if cgroup not in cgroup_pids:
+                cgroup_pids[cgroup] = []
+            cgroup_pids[cgroup].extend(process.get('pids', []))
+
+        # First GPU fdinfo snapshot (t0) - iterate per-cgroup so that PIDs
+        # belonging to *different* apps never share a seen_client_ids set.
+        # Within each cgroup, the shared set ensures child processes that
+        # inherited a parent's DRM fd are not double-counted.
+        gpu_t0 = {}
+        for cgroup, pids in cgroup_pids.items():
+            seen_t0 = set()
+            for pid in pids:
+                data = _read_pid_fdinfo_gpu(pid, seen_t0)
+                if data is not None:
+                    gpu_t0[pid] = data
+
+        # Wait the GPU sampling interval
+        if gpu_t0:
+            time.sleep(_GPU_SAMPLE_INTERVAL)
+        elapsed_ns = _GPU_SAMPLE_INTERVAL * 1e9
+
+        # Second GPU fdinfo snapshot (t1) - build per-cgroup stats
+        gpu_stats_by_cgroup = {}
+        for cgroup, pids in cgroup_pids.items():
+            seen_t1 = set()
+            engine_delta = {}
+            mem_bytes = 0
+            for pid in pids:
+                t1 = _read_pid_fdinfo_gpu(pid, seen_t1)
+                if t1 is None:
+                    continue
+                t0 = gpu_t0.get(pid)
+                if t0:
+                    for engine, ns1 in t1['engine_ns'].items():
+                        ns0 = t0['engine_ns'].get(engine, 0)
+                        delta = max(0, ns1 - ns0)
+                        engine_delta[engine] = engine_delta.get(engine, 0) + delta
+                mem_bytes += t1['mem_bytes']
+            gpu_util = 0.0
+            for delta_ns in engine_delta.values():
+                util = (delta_ns / elapsed_ns) * 100
+                if util > gpu_util:
+                    gpu_util = util
+            gpu_stats_by_cgroup[cgroup] = {
+                'gpu_util': round(min(gpu_util, 100.0), 1),
+                'gpu_mem_mb': round(mem_bytes / (1024 * 1024), 1),
+            }
 
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), 'unknown')
@@ -516,6 +790,8 @@ class ResourceMonitor:
             app_match = self.try_match_app(process)
             app_id = app_match['id'] if app_match else process_name
             app_name = app_match['name'] if app_match else process_name
+
+            gpu_stats = gpu_stats_by_cgroup.get(process['cgroup'], {'gpu_util': 0.0, 'gpu_mem_mb': 0.0})
 
             results.append({
                 'app_id': app_id,
@@ -528,7 +804,19 @@ class ResourceMonitor:
                 'io_read_rate': process['io_read_rate'],                # MB/s
                 'io_write_rate': process['io_write_rate'],              # MB/s
                 'score': round(process['score'], 3),
+                'gpu_util': gpu_stats['gpu_util'],                      # % (0-100)
+                'gpu_mem_mb': gpu_stats['gpu_mem_mb'],                  # MB
             })
+
+        # Re-sort results to surface GPU-heavy apps that might have low CPU/mem scores.
+        # gpu_util (0-100) is weighted by the configured gpu weight so that an app with
+        # significant GPU usage is ranked above idle apps even when its CPU+mem score is
+        # lower.  The original 'score' field keeps its CPU+mem meaning for display purposes.
+        gpu_weight = self.config.weights_top.get('gpu', 1)
+        results.sort(
+            key=lambda r: r['score'] + gpu_weight * r['gpu_util'],
+            reverse=True
+        )
 
         return results
 

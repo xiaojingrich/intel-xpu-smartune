@@ -266,10 +266,49 @@ class IOController:
                 limit_str = " ".join(limit_parts)
 
             if limit_str:  # 确保命令非空
-                cmd = ["sudo", "sh", "-c", f"echo '{disk_id} {limit_str}' > {io_max_path}"]
+                # io.max may have vanished if the IO controller was disabled in a parent cgroup
+                # (e.g. after systemd reload/session rebuild).  During restore this is benign:
+                # disabling the controller already clears all limits, so there is nothing to do.
+                if not os.path.exists(io_max_path):
+                    if is_restore:
+                        logger.warning(
+                            f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), "
+                            f"IO controller appears disabled — limits already cleared, skipping restore"
+                        )
+                        continue
+                    else:
+                        logger.error(
+                            f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), cannot apply limits"
+                        )
+                        success = False
+                        continue
+
+                cmd = f"sudo sh -c 'echo \"{disk_id} {limit_str}\" > {io_max_path}'"
                 logger.info(f"Setting IO limits for cgroup: {cgroup_id} in disk {disk_name}({disk_id}): {limit_str}")
-                if not self._run_cmd(cmd):
-                    success = False
+
+                if is_restore:
+                    # For restore, run the command directly so we can distinguish a benign
+                    # "io.max disappeared between the existence check and the write" (TOCTOU)
+                    # from a genuine permission failure, without emitting a misleading ERROR.
+                    try:
+                        result = subprocess.run(cmd, shell=True, check=False, capture_output=True)
+                        if result.returncode != 0:
+                            if not os.path.exists(io_max_path):
+                                logger.warning(
+                                    f"io.max disappeared for cgroup {cgroup_id} (disk {disk_name}) "
+                                    f"mid-restore — IO controller was disabled, limits already cleared (benign)"
+                                )
+                            else:
+                                logger.error(
+                                    f"Command failed: {cmd}\nError: {result.stderr.decode().strip()}"
+                                )
+                                success = False
+                    except Exception as e:
+                        logger.error(f"Restore command raised an exception: {str(e)}")
+                        success = False
+                else:
+                    if not self._run_cmd(cmd):
+                        success = False
 
         return success
 

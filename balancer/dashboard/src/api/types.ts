@@ -56,6 +56,8 @@ export interface AppResourceEntry {
   io_read_rate: number    // MB/s
   io_write_rate: number   // MB/s
   score: number
+  gpu_util: number        // peak GPU engine utilisation % (0-100); 0 when GPU not in use
+  gpu_mem_mb: number      // GPU memory used in MB (drm-memory-* from /proc fdinfo)
 }
 
 export interface AppResourceStatsData {

@@ -249,7 +249,10 @@ def get_app_resource_stats():
                     "cpu_usage": <float>,      # fraction of total CPU capacity (0-1)
                     "memory_mb": <float>,      # resident memory in MB
                     "io_read_rate": <float>,   # disk read rate in MB/s
-                    "score": <float>
+                    "io_write_rate": <float>,  # disk write rate in MB/s
+                    "score": <float>,
+                    "gpu_util": <float>,       # peak GPU engine utilisation % (0-100); 0 when GPU not in use
+                    "gpu_mem_mb": <float>      # GPU memory used in MB (drm-memory-* from /proc fdinfo)
                 },
                 ...
             ]

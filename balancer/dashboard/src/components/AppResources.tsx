@@ -29,6 +29,8 @@ interface AppRow {
   io_read_rate: number
   io_write_rate: number
   score: number
+  gpu_util: number
+  gpu_mem_mb: number
 }
 
 interface DiskIoRow {
@@ -76,6 +78,8 @@ export default function AppResources({ active }: Props) {
         io_read_rate: entry.io_read_rate,
         io_write_rate: entry.io_write_rate,
         score: entry.score,
+        gpu_util: entry.gpu_util ?? 0,
+        gpu_mem_mb: entry.gpu_mem_mb ?? 0,
       }))
       setRows(appRows)
 
@@ -145,6 +149,36 @@ export default function AppResources({ active }: Props) {
       sorter: (a, b) => a.memory_mb - b.memory_mb,
       render: (v: number) => (
         <Text style={{ color: COLORS.text }}>{v.toFixed(1)}</Text>
+      ),
+    },
+    {
+      title: 'GPU Util %',
+      dataIndex: 'gpu_util',
+      key: 'gpu_util',
+      sorter: (a, b) => a.gpu_util - b.gpu_util,
+      render: (v: number) => {
+        const color = v > 80 ? COLORS.red : v > 50 ? COLORS.orange : v > 0 ? COLORS.green : COLORS.textMuted
+        return (
+          <Space direction="vertical" size={2} style={{ width: '100%' }}>
+            <Text style={{ color, fontSize: 12 }}>{v.toFixed(1)}%</Text>
+            <Progress
+              percent={Math.min(v, 100)}
+              showInfo={false}
+              strokeColor={color}
+              trailColor={COLORS.border}
+              size="small"
+            />
+          </Space>
+        )
+      },
+    },
+    {
+      title: 'GPU Mem (MB)',
+      dataIndex: 'gpu_mem_mb',
+      key: 'gpu_mem_mb',
+      sorter: (a, b) => a.gpu_mem_mb - b.gpu_mem_mb,
+      render: (v: number) => (
+        <Text style={{ color: v > 0 ? COLORS.text : COLORS.textMuted }}>{v.toFixed(1)}</Text>
       ),
     },
     {
