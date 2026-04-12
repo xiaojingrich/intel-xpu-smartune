@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Card, DatePicker, Divider, Empty, Popover, Segmented, Select, Space, Typography, message } from 'antd'
-import { ReloadOutlined, SettingOutlined } from '@ant-design/icons'
+import { Alert, Button, Card, Checkbox, DatePicker, Divider, Empty, Popover, Segmented, Select, Space, Typography, message } from 'antd'
+import { FilterOutlined, ReloadOutlined, SettingOutlined, DownOutlined } from '@ant-design/icons'
 import {
   Brush,
   CartesianGrid,
@@ -13,7 +13,7 @@ import {
 } from 'recharts'
 import dayjs, { type Dayjs } from 'dayjs'
 import { api } from '../api/client'
-import type { DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, QmassaDevice } from '../api/types'
+import type { DynamicInfoData, HistoryData, HistoryRetentionData, HistorySnapshotItem, GpuUsageDevice, StaticInfoData } from '../api/types'
 import { COLORS } from '../styles/theme'
 
 const { Text, Title } = Typography
@@ -39,6 +39,9 @@ interface CpuMemTrendPoint {
   pCoreUtilization: number | null
   eCoreUtilization: number | null
   memoryUtilization: number | null
+  pCoreFreqMhz: number | null
+  eCoreFreqMhz: number | null
+  cpuTemperatureC: number | null
 }
 
 interface DiskTrendPoint {
@@ -58,6 +61,11 @@ interface NpuTrendPoint {
   ts: number
   npuUtilization: number | null
   npuFreqMhz: number | null
+  npuPowerW: number | null
+  npuDdrBwMib: number | null
+  npuTemperatureC: number | null
+  npuTileCount: number | null
+  npuMemoryMb: number | null
 }
 
 interface GpuTrendPoint {
@@ -70,9 +78,16 @@ interface GpuTrendPoint {
   bcs: number | null
   gt0Freq: number | null
   gt1Freq: number | null
+  gt0Act: number | null
+  gt0Req: number | null
+  gt1Act: number | null
+  gt1Req: number | null
+  utilization: number | null
   gpuPower: number | null
   pkgPower: number | null
   memUsage: number | null
+  gt0Rc6: number | null
+  gt1Rc6: number | null
 }
 
 interface GpuTrendSeries {
@@ -80,6 +95,26 @@ interface GpuTrendSeries {
   label: string
   isIntegrated: boolean
   points: GpuTrendPoint[]
+}
+
+interface CpuPerCoreTrendPoint {
+  timestamp: string
+  ts: number
+  totalUtil: number | null
+  pAvgUtil: number | null
+  eAvgUtil: number | null
+  pAvgFreq: number | null
+  eAvgFreq: number | null
+  pkgTemp: number | null
+  [key: string]: string | number | null
+}
+
+interface CpuPerCoreInfo {
+  points: CpuPerCoreTrendPoint[]
+  coreCount: number
+  tempCoreCount: number
+  pCoreIndices: number[]
+  eCoreIndices: number[]
 }
 
 type RangePreset = '5m' | '15m' | '1h' | '6h' | '24h' | 'custom'
@@ -115,7 +150,58 @@ const RANGE_SECONDS: Record<Exclude<RangePreset, 'custom'>, number> = {
 }
 
 const SNAPSHOT_INTERVAL_SECONDS = 5
-const HISTORY_LIMIT_CAP = 20000
+const HISTORY_LIMIT_CAP = 100000
+const MAX_CHART_POINTS = 800
+
+/**
+ * Largest-Triangle-Three-Buckets downsampling.
+ * Reduces a time-series array to at most `threshold` points while preserving visual shape.
+ */
+function downsampleLTTB<T>(data: T[], threshold: number, getY: (d: T) => number): T[] {
+  const n = data.length
+  if (n <= threshold || threshold < 3) return data
+
+  const out: T[] = [data[0]]
+  const bucketSize = (n - 2) / (threshold - 2)
+  let prevIdx = 0
+
+  for (let b = 1; b < threshold - 1; b++) {
+    const bStart = Math.floor((b - 1) * bucketSize) + 1
+    const bEnd = Math.min(Math.floor(b * bucketSize) + 1, n - 1)
+    const nStart = Math.floor(b * bucketSize) + 1
+    const nEnd = Math.min(Math.floor((b + 1) * bucketSize) + 1, n)
+    let avgX = 0
+    let avgY = 0
+    let cnt = 0
+    for (let j = nStart; j < nEnd; j++) { avgX += j; avgY += getY(data[j]); cnt++ }
+    if (cnt > 0) { avgX /= cnt; avgY /= cnt }
+
+    const px = prevIdx
+    const py = getY(data[prevIdx])
+    let maxArea = -1
+    let maxIdx = bStart
+    for (let j = bStart; j < bEnd; j++) {
+      const area = Math.abs((px - avgX) * (getY(data[j]) - py) - (px - j) * (avgY - py))
+      if (area > maxArea) { maxArea = area; maxIdx = j }
+    }
+
+    out.push(data[maxIdx])
+    prevIdx = maxIdx
+  }
+
+  out.push(data[n - 1])
+  return out
+}
+
+/** Sum absolute numeric values in an object, skipping timestamp keys */
+function sumMetrics(p: Record<string, unknown>): number {
+  let s = 0
+  for (const [k, v] of Object.entries(p)) {
+    if (k === 'timestamp' || k === 'ts') continue
+    if (typeof v === 'number' && Number.isFinite(v)) s += Math.abs(v)
+  }
+  return s
+}
 
 function estimateRequiredLimit(
   rangePreset: RangePreset,
@@ -150,12 +236,26 @@ const NETWORK_COLORS = ['#73bf69', COLORS.accent, '#e07b54', COLORS.yellow, '#b8
 const METRIC_COLORS = { util: '#56c8d8', read: '#73bf69', write: '#e07b54', rx: '#73bf69', tx: '#e07b54' }
 
 const ENGINE_CURVE_META: Array<{ key: EngineKey; name: string; color: string }> = [
-  { key: 'vcs', name: 'VCS %', color: COLORS.accent },
-  { key: 'vecs', name: 'VECS %', color: COLORS.green },
-  { key: 'ccs', name: 'CCS %', color: COLORS.yellow },
-  { key: 'rcs', name: 'RCS %', color: COLORS.orange },
-  { key: 'bcs', name: 'BCS %', color: COLORS.red },
+  { key: 'vcs', name: 'VCS %', color: '#f9c74f' },
+  { key: 'vecs', name: 'VECS %', color: '#ff9f1c' },
+  { key: 'ccs', name: 'CCS %', color: '#5aa9ff' },
+  { key: 'rcs', name: 'RCS %', color: '#4cc9f0' },
+  { key: 'bcs', name: 'BCS %', color: '#ff6b9d' },
 ]
+
+const P_CORE_COLORS = ['#ff6b6b', '#ff9f43', '#feca57', '#ff6348', '#ee5a24', '#f0932b', '#eb4d4b', '#f39c12']
+const E_CORE_COLORS = ['#54a0ff', '#48dbfb', '#0abde3', '#10ac84', '#2ed573', '#7bed9f', '#70a1ff', '#5352ed', '#6c5ce7', '#00cec9', '#55efc4', '#74b9ff', '#a29bfe', '#81ecec', '#00b894', '#5f27cd']
+
+const SECTION_OPTIONS = [
+  { label: 'System Pressure', value: 'pressure' },
+  { label: 'CPU & Memory', value: 'cpuMem' },
+  { label: 'CPU Per-Core', value: 'cpuPerCore' },
+  { label: 'Disk I/O', value: 'disk' },
+  { label: 'Network I/O', value: 'network' },
+  { label: 'NPU', value: 'npu' },
+  { label: 'GPU', value: 'gpu' },
+]
+const ALL_SECTIONS = SECTION_OPTIONS.map((o) => o.value)
 
 function normalizePercent(value: unknown): number | null {
   if (typeof value !== 'number' || Number.isNaN(value)) return null
@@ -226,17 +326,23 @@ function getNpuUsage(dynamic: DynamicInfoData | null): number | null {
   return normalizePercent(npuSmi.parsed?.utilization_percent ?? npuSmi.parsed?.utilization)
 }
 
-function normalizeEngineUtil(device: QmassaDevice, key: EngineKey): number | null {
+function normalizeEngineUtil(device: GpuUsageDevice, key: EngineKey): number | null {
   return normalizePercent(device.engine_util?.[key])
 }
 
-function getFreq(device: QmassaDevice, targetName: 'gt0' | 'gt1'): number | null {
+function getFreq(device: GpuUsageDevice, targetName: 'gt0' | 'gt1'): number | null {
   const freq = (device.freqs || []).find((item) => item.name === targetName)
   if (!freq) return null
-  return toNumber(freq.cur_mhz ?? freq.act_mhz)
+  return toNumber(freq.act_mhz)
 }
 
-function getGpuLabel(device: QmassaDevice, index: number): string {
+function getReqFreq(device: GpuUsageDevice, targetName: 'gt0' | 'gt1'): number | null {
+  const freq = (device.freqs || []).find((item) => item.name === targetName)
+  if (!freq) return null
+  return toNumber(freq.cur_mhz)
+}
+
+function getGpuLabel(device: GpuUsageDevice, index: number): string {
   const type = `${device.dev_type || ''}`.toLowerCase()
   const role = type.includes('integrated') || type.includes('igpu')
     ? 'iGPU'
@@ -266,23 +372,83 @@ function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[
     return {
       timestamp: label,
       ts,
-      cpuUtilization: normalizePercent(dynamic?.cpu?.usage_total),
-      pCoreUtilization: normalizePercent(dynamic?.cpu?.p_core_usage),
-      eCoreUtilization: normalizePercent(dynamic?.cpu?.e_core_usage),
-      memoryUtilization: normalizePercent(dynamic?.memory?.usage_percent),
+      cpuUtilization: toNumber(dynamic?.cpu?.usage_total),
+      pCoreUtilization: toNumber(dynamic?.cpu?.p_core_usage),
+      eCoreUtilization: toNumber(dynamic?.cpu?.e_core_usage),
+      memoryUtilization: toNumber(dynamic?.memory?.usage_percent),
+      pCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.p_core_freq_mhz as number | null),
+      eCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.e_core_freq_mhz as number | null),
+      cpuTemperatureC: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.temperature_c as number | null),
     }
   })
 }
 
-function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrendPoint[]; diskNames: string[] } {
+function buildCpuPerCoreTrendPoints(items: HistorySnapshotItem[]): CpuPerCoreInfo {
+  const pCoreSet = new Set<number>()
+  const eCoreSet = new Set<number>()
+  let maxLogicalCore = -1
+  let maxTempCore = -1
+
+  const points = [...items].reverse().map((item) => {
+    const dynamic = toDynamicData(item)
+    const { ts, label } = buildTimestamp(item)
+    const cpu = dynamic?.cpu as Record<string, unknown> | undefined
+
+    const point: CpuPerCoreTrendPoint = {
+      timestamp: label,
+      ts,
+      totalUtil: toNumber(cpu?.usage_total as number | null),
+      pAvgUtil: toNumber(cpu?.p_core_usage as number | null),
+      eAvgUtil: toNumber(cpu?.e_core_usage as number | null),
+      pAvgFreq: toNumber(cpu?.p_core_freq_mhz as number | null),
+      eAvgFreq: toNumber(cpu?.e_core_freq_mhz as number | null),
+      pkgTemp: toNumber(cpu?.temperature_c as number | null),
+    }
+
+    const perCoreUsage = (cpu?.per_core_usage as number[] | undefined) || []
+    const perCoreFreq = (cpu?.per_core_freq_mhz as Array<number | null> | undefined) || []
+    const perCoreTemp = (cpu?.per_core_temperature_c as Array<number | null> | undefined) || []
+    const pIndices = (cpu?.p_core_indices as number[] | undefined) || []
+    const eIndices = (cpu?.e_core_indices as number[] | undefined) || []
+
+    pIndices.forEach((i) => pCoreSet.add(i))
+    eIndices.forEach((i) => eCoreSet.add(i))
+
+    perCoreUsage.forEach((v, i) => {
+      point[`u_${i}`] = normalizePercent(v)
+      if (i > maxLogicalCore) maxLogicalCore = i
+    })
+    perCoreFreq.forEach((v, i) => {
+      point[`f_${i}`] = toNumber(v)
+      if (i > maxLogicalCore) maxLogicalCore = i
+    })
+    perCoreTemp.forEach((v, i) => {
+      point[`t_${i}`] = toNumber(v)
+      if (i > maxTempCore) maxTempCore = i
+    })
+
+    return point
+  })
+
+  return {
+    points,
+    coreCount: maxLogicalCore + 1,
+    tempCoreCount: maxTempCore + 1,
+    pCoreIndices: [...pCoreSet].sort((a, b) => a - b),
+    eCoreIndices: [...eCoreSet].sort((a, b) => a - b),
+  }
+}
+
+function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrendPoint[]; diskNames: string[]; diskMaxThroughput: Record<string, number> } {
   const diskNameSet = new Set<string>()
+  const maxTpMap: Record<string, number> = {}
   const points = [...items].reverse().map((item) => {
     const dynamic = toDynamicData(item)
     const { ts, label } = buildTimestamp(item)
     const point: DiskTrendPoint = { timestamp: label, ts }
 
     const disk = dynamic?.disk as (DynamicInfoData['disk'] & {
-      per_disk?: Record<string, { util?: number | null; read_mb?: number | null; write_mb?: number | null } | number | null>
+      per_disk?: Record<string, { util?: number | null; read_mb?: number | null; write_mb?: number | null; max_throughput_mb?: number | null } | number | null>
     }) | undefined
     const perDisk = disk?.per_disk
     if (perDisk && typeof perDisk === 'object') {
@@ -293,6 +459,8 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
           point[`${name}:util`] = normalizePercent(val.util)
           point[`${name}:read`] = toNumber(val.read_mb)
           point[`${name}:write`] = toNumber(val.write_mb)
+          const tp = toNumber(val.max_throughput_mb)
+          if (tp != null && tp > 0) maxTpMap[name] = tp
         } else {
           // Old format: single utilization number
           point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
@@ -310,18 +478,19 @@ function buildDiskTrendPoints(items: HistorySnapshotItem[]): { points: DiskTrend
     }
     return point
   })
-  return { points, diskNames: Array.from(diskNameSet).sort() }
+  return { points, diskNames: Array.from(diskNameSet).sort(), diskMaxThroughput: maxTpMap }
 }
 
-function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: NetworkTrendPoint[]; nicNames: string[] } {
+function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: NetworkTrendPoint[]; nicNames: string[]; nicSpeeds: Record<string, number> } {
   const nicNameSet = new Set<string>()
+  const speedMap: Record<string, number> = {}
   const points = [...items].reverse().map((item) => {
     const dynamic = toDynamicData(item)
     const { ts, label } = buildTimestamp(item)
     const point: NetworkTrendPoint = { timestamp: label, ts }
 
     const network = dynamic?.network as (DynamicInfoData['network'] & {
-      per_nic?: Record<string, { util?: number | null; rx_mbps?: number | null; tx_mbps?: number | null; rx?: number | null; tx?: number | null } | number | null>
+      per_nic?: Record<string, { util?: number | null; rx_mbps?: number | null; tx_mbps?: number | null; rx?: number | null; tx?: number | null; speed_mbps?: number | null } | number | null>
     }) | undefined
     const perNic = network?.per_nic
     if (perNic && typeof perNic === 'object') {
@@ -332,6 +501,8 @@ function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: Networ
           point[`${name}:util`] = toNumber(val.util) ?? normalizePercent(val.rx != null || val.tx != null ? Math.max(val.rx ?? 0, val.tx ?? 0) : null)
           point[`${name}:rx`] = toNumber(val.rx_mbps) ?? null
           point[`${name}:tx`] = toNumber(val.tx_mbps) ?? null
+          const sp = toNumber(val.speed_mbps)
+          if (sp != null && sp > 0) speedMap[name] = sp
         } else {
           // Old format: single utilization number
           point[`${name}:util`] = typeof val === 'number' ? normalizePercent(val) : null
@@ -351,7 +522,7 @@ function buildNetworkTrendPoints(items: HistorySnapshotItem[]): { points: Networ
     }
     return point
   })
-  return { points, nicNames: Array.from(nicNameSet).sort() }
+  return { points, nicNames: Array.from(nicNameSet).sort(), nicSpeeds: speedMap }
 }
 
 function getNpuFreqMhz(dynamic: DynamicInfoData | null): number | null {
@@ -363,6 +534,51 @@ function getNpuFreqMhz(dynamic: DynamicInfoData | null): number | null {
   return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.frequency_mhz as number | null)
 }
 
+function getNpuPowerW(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.npu?.npu_smi) return null
+  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { power_w?: number | null; parsed?: Record<string, unknown> | null }
+  const direct = toNumber(npuSmi.power_w)
+  if (direct != null) return direct
+  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.power_w as number | null)
+}
+
+function getNpuDdrBwMib(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.npu?.npu_smi) return null
+  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { noc_bandwidth_mib_per_s?: number | null; parsed?: Record<string, unknown> | null }
+  const direct = toNumber(npuSmi.noc_bandwidth_mib_per_s)
+  if (direct != null) return direct
+  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.noc_bandwidth_mib_per_s as number | null)
+}
+
+function getNpuTemperatureC(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.npu?.npu_smi) return null
+  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { temperature_c?: number | null; parsed?: Record<string, unknown> | null }
+  const direct = toNumber(npuSmi.temperature_c)
+  if (direct != null) return direct
+  return toNumber((npuSmi.parsed as Record<string, unknown> | null)?.temperature_c as number | null)
+}
+
+function getNpuTileCount(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.npu?.npu_smi) return null
+  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { tile_config?: number | null; parsed?: Record<string, unknown> | null }
+  const direct = toNumber(npuSmi.tile_config)
+  if (direct != null) return direct
+  const parsed = npuSmi.parsed as Record<string, unknown> | null
+  const tc = parsed?.tile_config
+  return typeof tc === 'number' ? tc : null
+}
+
+function getNpuMemoryMb(dynamic: DynamicInfoData | null): number | null {
+  if (!dynamic?.npu?.npu_smi) return null
+  const npuSmi = dynamic.npu.npu_smi as DynamicInfoData['npu']['npu_smi'] & { memory_mb?: number | null; parsed?: Record<string, unknown> | null }
+  const direct = toNumber(npuSmi.memory_mb)
+  if (direct != null) return direct
+  // Fallback: parse from memory_bytes in parsed data
+  const parsed = npuSmi.parsed as Record<string, unknown> | null
+  const mb = parsed?.memory_bytes
+  return typeof mb === 'number' && mb > 0 ? mb / (1024 * 1024) : null
+}
+
 function buildNpuTrendPoints(items: HistorySnapshotItem[]): NpuTrendPoint[] {
   return [...items].reverse().map((item) => {
     const dynamic = toDynamicData(item)
@@ -372,11 +588,16 @@ function buildNpuTrendPoints(items: HistorySnapshotItem[]): NpuTrendPoint[] {
       ts,
       npuUtilization: getNpuUsage(dynamic),
       npuFreqMhz: getNpuFreqMhz(dynamic),
+      npuPowerW: getNpuPowerW(dynamic),
+      npuDdrBwMib: getNpuDdrBwMib(dynamic),
+      npuTemperatureC: getNpuTemperatureC(dynamic),
+      npuTileCount: getNpuTileCount(dynamic),
+      npuMemoryMb: getNpuMemoryMb(dynamic),
     }
   })
 }
 
-function isIntegratedGpu(device: QmassaDevice): boolean {
+function isIntegratedGpu(device: GpuUsageDevice): boolean {
   const type = `${device.dev_type || ''}`.toLowerCase()
   return type.includes('integrated') || type.includes('igpu')
 }
@@ -387,7 +608,7 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
   for (const item of [...items].reverse()) {
     const dynamic = toDynamicData(item)
     if (!dynamic) continue
-    const devices = dynamic.gpu?.qmassa?.parsed?.devices || []
+    const devices = dynamic.gpu?.gpu_usage?.parsed?.devices || []
     const { ts, label } = buildTimestamp(item)
 
     devices.forEach((device, index) => {
@@ -415,9 +636,16 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
         bcs: normalizeEngineUtil(device, 'bcs'),
         gt0Freq: getFreq(device, 'gt0'),
         gt1Freq: getFreq(device, 'gt1'),
+        gt0Act: getFreq(device, 'gt0'),
+        gt0Req: getReqFreq(device, 'gt0'),
+        gt1Act: getFreq(device, 'gt1'),
+        gt1Req: getReqFreq(device, 'gt1'),
+        utilization: toNumber(device.utilization ?? null),
         gpuPower: toNumber(device.power_w?.gpu ?? null),
-        pkgPower: toNumber(device.power_w?.pkg ?? null),
+        pkgPower: toNumber(device.power_w?.pkg ?? device.power_w?.card ?? null),
         memUsage,
+        gt0Rc6: toNumber((device.freqs || []).find((f) => f.name === 'gt0')?.rc6_pct ?? null),
+        gt1Rc6: toNumber((device.freqs || []).find((f) => f.name === 'gt1')?.rc6_pct ?? null),
       }
 
       seriesMap.get(id)?.points.push(point)
@@ -440,7 +668,7 @@ function LegendToggleItem({
   onClick: () => void
   dasharray?: string
 }) {
-  const lineColor = hidden ? COLORS.border : color
+  const lineColor = hidden ? 'rgba(120,176,255,0.25)' : color
   return (
     <span
       onClick={onClick}
@@ -450,15 +678,204 @@ function LegendToggleItem({
         gap: 5,
         cursor: 'pointer',
         marginRight: 12,
-        opacity: hidden ? 0.35 : 1,
+        opacity: hidden ? 0.55 : 1,
         userSelect: 'none',
       }}
     >
       <svg width={24} height={6} style={{ verticalAlign: 'middle' }}>
         <line x1={0} y1={3} x2={24} y2={3} stroke={lineColor} strokeWidth={2.5} strokeDasharray={dasharray} />
       </svg>
-      <span style={{ color: hidden ? 'rgba(174,191,223,0.3)' : COLORS.textMuted, fontSize: 11, textDecoration: hidden ? 'line-through' : 'none' }}>{value}</span>
+      <span style={{ color: hidden ? 'rgba(174,191,223,0.5)' : COLORS.textMuted, fontSize: 11, textDecoration: hidden ? 'line-through' : 'none' }}>{value}</span>
     </span>
+  )
+}
+
+/* ─── Configurable Chart ─── */
+
+interface SeriesConfig {
+  key: string
+  name: string
+  color: string
+  unit: string          // e.g. '%', 'MHz', '°C', 'W', 'MiB/s'
+  dasharray?: string
+  defaultOn?: boolean   // true = shown by default
+}
+
+function usePersistedSet(storageKey: string, defaults: string[]): [Set<string>, (key: string) => void, Set<string>] {
+  const [active, setActive] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem(storageKey)
+      if (raw) {
+        const arr = JSON.parse(raw)
+        if (Array.isArray(arr)) return new Set(arr as string[])
+      }
+    } catch { /* ignore */ }
+    return new Set(defaults)
+  })
+
+  const toggle = useCallback((key: string) => {
+    setActive((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      localStorage.setItem(storageKey, JSON.stringify([...next]))
+      return next
+    })
+  }, [storageKey])
+
+  return [active, toggle, new Set(defaults)]
+}
+
+function ConfigurableChart<T extends { timestamp: string }>({
+  title,
+  storageKey,
+  allSeries,
+  data,
+  height = 280,
+  showBrush = false,
+}: {
+  title: string
+  storageKey: string
+  allSeries: SeriesConfig[]
+  data: T[]
+  height?: number
+  showBrush?: boolean
+}) {
+  const defaults = useMemo(() => allSeries.filter((s) => s.defaultOn !== false).map((s) => s.key), [allSeries])
+  const [active, toggle] = usePersistedSet(storageKey, defaults)
+
+  // Determine which unit groups are active, assign left/right Y-axis (max 2)
+  const { leftUnit, rightUnit, activeSeries } = useMemo(() => {
+    const selected = allSeries.filter((s) => active.has(s.key))
+    const unitOrder: string[] = []
+    for (const s of selected) {
+      if (!unitOrder.includes(s.unit)) unitOrder.push(s.unit)
+    }
+    const left = unitOrder[0] || '%'
+    const right = unitOrder[1] || null
+
+    const mapped = selected.map((s) => ({
+      ...s,
+      yAxisId: s.unit === left ? 'left' : s.unit === right ? 'right' : 'left',
+    }))
+    return { leftUnit: left, rightUnit: right, activeSeries: mapped }
+  }, [allSeries, active])
+
+  const unitFormat = (unit: string) => (val: string | number) => {
+    const n = typeof val === 'number' ? val : parseFloat(String(val))
+    if (Number.isNaN(n)) return String(val)
+    if (unit === '%') return `${n}%`
+    if (unit === '°C') return `${n}°C`
+    if (unit === 'W') return `${n}W`
+    return `${n}`
+  }
+
+  const leftDomain: [number, string | number] | undefined = leftUnit === '%' ? [0, 100] : undefined
+  const rightDomain: [number, string | number] | undefined = rightUnit === '%' ? [0, 100] : undefined
+
+  return (
+    <Card
+      style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
+      bodyStyle={{ padding: 16 }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <Text style={{ color: COLORS.textMuted }}>{title}</Text>
+      </div>
+
+      {/* Series selector tags */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 10 }}>
+        {allSeries.map((s) => {
+          const on = active.has(s.key)
+          return (
+            <span
+              key={s.key}
+              onClick={() => toggle(s.key)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                cursor: 'pointer',
+                marginRight: 10,
+                padding: '2px 8px',
+                borderRadius: 4,
+                background: on ? 'rgba(120,176,255,0.08)' : 'rgba(120,176,255,0.02)',
+                border: `1px solid ${on ? s.color + '66' : COLORS.border}`,
+                opacity: on ? 1 : 0.6,
+                userSelect: 'none',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              <svg width={16} height={6} style={{ verticalAlign: 'middle' }}>
+                <line x1={0} y1={3} x2={16} y2={3} stroke={on ? s.color : COLORS.textMuted} strokeWidth={2} strokeDasharray={s.dasharray} />
+              </svg>
+              <span style={{
+                color: on ? COLORS.text : COLORS.textMuted,
+                fontSize: 10,
+                letterSpacing: '0.02em',
+              }}>
+                {on ? '' : '+ '}{s.name}
+              </span>
+              <span style={{ color: COLORS.textMuted, fontSize: 9, opacity: 0.7 }}>({s.unit})</span>
+            </span>
+          )
+        })}
+      </div>
+
+      {activeSeries.length === 0 ? (
+        <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Text style={{ color: COLORS.textMuted }}>Select at least one metric to display</Text>
+        </div>
+      ) : (
+        <div style={{ width: '100%', height }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{ top: 4, right: rightUnit ? 20 : 8, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
+              <XAxis
+                dataKey="timestamp"
+                tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                minTickGap={36}
+                tickFormatter={formatHistoryAxisTick}
+              />
+              <YAxis
+                yAxisId="left"
+                domain={leftDomain}
+                tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                tickFormatter={unitFormat(leftUnit)}
+              />
+              {rightUnit && (
+                <YAxis
+                  yAxisId="right"
+                  orientation="right"
+                  domain={rightDomain}
+                  tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+                  tickFormatter={unitFormat(rightUnit)}
+                />
+              )}
+              <Tooltip
+                contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+                formatter={tooltipFmt2}
+              />
+              {activeSeries.map((s) => (
+                <Line
+                  key={s.key}
+                  type="monotone"
+                  yAxisId={s.yAxisId}
+                  dataKey={s.key}
+                  name={s.name}
+                  stroke={s.color}
+                  strokeDasharray={s.dasharray}
+                  dot={false}
+                  strokeWidth={2}
+                />
+              ))}
+              {showBrush && (
+                <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
+              )}
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </Card>
   )
 }
 
@@ -473,19 +890,32 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
     })
   }, [])
 
+  // Shared brush state so both charts stay aligned
+  const [brushRange, setBrushRange] = useState<{ startIndex: number; endIndex: number } | null>(null)
+  const handleBrushChange = useCallback((range: { startIndex?: number; endIndex?: number }) => {
+    if (range.startIndex !== undefined && range.endIndex !== undefined) {
+      setBrushRange({ startIndex: range.startIndex, endIndex: range.endIndex })
+    }
+  }, [])
+
   const memLabel = series.isIntegrated ? 'Sys Mem %' : 'VRAM %'
 
-  const engineLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
+  const engineLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string; strokeWidth?: number }> = [
+    { key: 'utilization', name: 'GPU Util %', color: '#ff6b6b', yAxisId: 'util', strokeWidth: 2 },
     ...ENGINE_CURVE_META.map((e) => ({ key: e.key, name: e.name, color: e.color, yAxisId: 'util' })),
-    { key: 'memUsage', name: memLabel, color: COLORS.yellow, dasharray: '6 3', yAxisId: 'util' },
-    { key: 'gt0Freq', name: 'GT0 MHz', color: COLORS.text, dasharray: '6 4', yAxisId: 'freq' },
-    { key: 'gt1Freq', name: 'GT1 MHz', color: COLORS.textMuted, dasharray: '4 4', yAxisId: 'freq' },
+    { key: 'memUsage', name: memLabel, color: COLORS.yellow, dasharray: '5 3', yAxisId: 'util' },
+    { key: 'gt0Act', name: 'GT0 Act MHz', color: '#cbd5e1', yAxisId: 'freq' },
+    { key: 'gt0Req', name: 'GT0 Req MHz', color: '#cbd5e1', dasharray: '6 4', yAxisId: 'freq' },
+    { key: 'gt1Act', name: 'GT1 Act MHz', color: '#34d399', yAxisId: 'freq' },
+    { key: 'gt1Req', name: 'GT1 Req MHz', color: '#34d399', dasharray: '4 4', yAxisId: 'freq' },
+    { key: 'gt0Rc6', name: 'GT0 RC6 %', color: '#2dd4bf', dasharray: '3 2', yAxisId: 'util' },
+    { key: 'gt1Rc6', name: 'GT1 RC6 %', color: '#a3e635', dasharray: '3 2', yAxisId: 'util' },
   ]
 
   const pkgPowerLabel = series.isIntegrated ? 'Pkg Power W' : 'Card Power W'
   const powerLines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
-    { key: 'gpuPower', name: 'GPU Power W', color: COLORS.accent },
-    { key: 'pkgPower', name: pkgPowerLabel, color: COLORS.orange, dasharray: '5 3' },
+    { key: 'gpuPower', name: 'GPU Power W', color: '#4cc9f0' },
+    { key: 'pkgPower', name: pkgPowerLabel, color: '#ff9f1c', dasharray: '5 3' },
   ]
 
   return (
@@ -509,7 +939,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
           />
         ))}
       </div>
-      <div style={{ width: '100%', height: 300 }}>
+      <div style={{ width: '100%', height: 280 }}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
@@ -548,7 +978,9 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
                 hide={hidden.has(l.key)}
               />
             ))}
-            <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+            <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8}
+              {...(brushRange ? { startIndex: brushRange.startIndex, endIndex: brushRange.endIndex } : {})}
+              onChange={handleBrushChange} />
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -569,7 +1001,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
           />
         ))}
       </div>
-      <div style={{ width: '100%', height: 180 }}>
+      <div style={{ width: '100%', height: 160 }}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={series.points} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
             <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
@@ -600,11 +1032,128 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
                 hide={hidden.has(l.key)}
               />
             ))}
-            <Brush dataKey="timestamp" height={20} stroke={COLORS.accent} travellerWidth={8} />
+            <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8}
+              {...(brushRange ? { startIndex: brushRange.startIndex, endIndex: brushRange.endIndex } : {})}
+              onChange={handleBrushChange} />
           </LineChart>
         </ResponsiveContainer>
       </div>
     </Card>
+  )
+}
+
+function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
+  const { points, coreCount, pCoreIndices, eCoreIndices } = info
+
+  // Check which cores actually have temperature data in at least one point
+  const coresWithTemp = useMemo(() => {
+    const has = new Set<number>()
+    for (const pt of points) {
+      for (let i = 0; i < coreCount; i++) {
+        if (!has.has(i) && typeof pt[`t_${i}`] === 'number') has.add(i)
+      }
+      if (has.size >= coreCount) break
+    }
+    return has
+  }, [points, coreCount])
+
+  // P-Core chart: Util % (left Y) + Freq MHz (right Y) for each P logical core
+  const pCoreSeries: SeriesConfig[] = useMemo(() => {
+    if (!pCoreIndices.length) return []
+    return [
+      { key: 'pAvgUtil', name: 'P Avg Util', color: '#ffffff', unit: '%', dasharray: '6 3' },
+      ...pCoreIndices.map((logIdx, i) => ({
+        key: `u_${logIdx}`,
+        name: `P${i}`,
+        color: P_CORE_COLORS[i % P_CORE_COLORS.length],
+        unit: '%',
+      })),
+      { key: 'pAvgFreq', name: 'P Avg Freq', color: '#ffffff', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+      ...pCoreIndices.map((logIdx, i) => ({
+        key: `f_${logIdx}`,
+        name: `P${i} Freq`,
+        color: P_CORE_COLORS[i % P_CORE_COLORS.length],
+        unit: 'MHz',
+        defaultOn: false,
+      })),
+    ]
+  }, [pCoreIndices])
+
+  // E-Core chart: same dual-axis approach
+  const eCoreSeries: SeriesConfig[] = useMemo(() => {
+    if (!eCoreIndices.length) return []
+    return [
+      { key: 'eAvgUtil', name: 'E Avg Util', color: '#ffffff', unit: '%', dasharray: '6 3' },
+      ...eCoreIndices.map((logIdx, i) => ({
+        key: `u_${logIdx}`,
+        name: `E${i}`,
+        color: E_CORE_COLORS[i % E_CORE_COLORS.length],
+        unit: '%',
+      })),
+      { key: 'eAvgFreq', name: 'E Avg Freq', color: '#ffffff', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+      ...eCoreIndices.map((logIdx, i) => ({
+        key: `f_${logIdx}`,
+        name: `E${i} Freq`,
+        color: E_CORE_COLORS[i % E_CORE_COLORS.length],
+        unit: 'MHz',
+        defaultOn: false,
+      })),
+    ]
+  }, [eCoreIndices])
+
+  // Temperature chart: Package + per-core temps (P/E labeled), skip cores with no data
+  const tempSeries: SeriesConfig[] = useMemo(() => {
+    const series: SeriesConfig[] = [
+      { key: 'pkgTemp', name: 'Package', color: '#f94144', unit: '°C' },
+    ]
+    pCoreIndices.forEach((logIdx, i) => {
+      if (coresWithTemp.has(logIdx)) {
+        series.push({ key: `t_${logIdx}`, name: `P${i}`, color: P_CORE_COLORS[i % P_CORE_COLORS.length], unit: '°C', defaultOn: false })
+      }
+    })
+    eCoreIndices.forEach((logIdx, i) => {
+      if (coresWithTemp.has(logIdx)) {
+        series.push({ key: `t_${logIdx}`, name: `E${i}`, color: E_CORE_COLORS[i % E_CORE_COLORS.length], unit: '°C', defaultOn: false })
+      }
+    })
+    return series
+  }, [pCoreIndices, eCoreIndices, coresWithTemp])
+
+  if (coreCount === 0) return null
+
+  return (
+    <>
+      {pCoreSeries.length > 0 && (
+        <ConfigurableChart
+          title={`P-Core (${pCoreIndices.length}) — Utilization & Frequency`}
+          storageKey="history-cpu-pcore"
+          data={points}
+          allSeries={pCoreSeries}
+          height={240}
+          showBrush
+        />
+      )}
+      {eCoreSeries.length > 0 && (
+        <ConfigurableChart
+          title={`E-Core (${eCoreIndices.length}) — Utilization & Frequency`}
+          storageKey="history-cpu-ecore"
+          data={points}
+          allSeries={eCoreSeries}
+          height={240}
+          showBrush
+        />
+      )}
+      {tempSeries.length > 1 && (
+        <ConfigurableChart
+          title="CPU Temperature (°C)"
+          storageKey="history-cpu-temp"
+          data={points}
+          allSeries={tempSeries}
+          height={200}
+          showBrush
+        />
+      )}
+    </>
   )
 }
 
@@ -616,6 +1165,14 @@ export default function HistoryDashboard({ active }: Props) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [lastFetchAt, setLastFetchAt] = useState<string | null>(null)
+  const [visibleSections, setVisibleSections] = useState<string[]>(ALL_SECTIONS)
+
+  // Static info for NIC link speeds & disk throughput caps
+  const [staticInfo, setStaticInfo] = useState<StaticInfoData | null>(null)
+  useEffect(() => {
+    if (!active) return
+    api.getStaticInfo().then(setStaticInfo).catch(() => {})
+  }, [active])
 
   // Retention settings state
   const [retention, setRetention] = useState<HistoryRetentionData | null>(null)
@@ -719,28 +1276,55 @@ export default function HistoryDashboard({ active }: Props) {
     [history],
   )
 
-  const pressureTrendPoints = useMemo(() => buildPressureTrendPoints(dynamicItems), [dynamicItems])
-  const cpuMemTrendPoints = useMemo(() => buildCpuMemTrendPoints(dynamicItems), [dynamicItems])
-  const { points: diskTrendPoints, diskNames } = useMemo(() => buildDiskTrendPoints(dynamicItems), [dynamicItems])
-  const { points: networkTrendPoints, nicNames } = useMemo(() => buildNetworkTrendPoints(dynamicItems), [dynamicItems])
-  const npuTrendPoints = useMemo(() => buildNpuTrendPoints(dynamicItems), [dynamicItems])
-  const gpuTrendSeries = useMemo(() => buildGpuTrendSeries(dynamicItems), [dynamicItems])
+  const pressureTrendPoints = useMemo(() => {
+    const raw = buildPressureTrendPoints(dynamicItems)
+    return downsampleLTTB(raw, MAX_CHART_POINTS, (p) => Math.abs(p.systemPressure ?? 0) + Math.abs(p.diskPressure ?? 0) + Math.abs(p.networkPressure ?? 0))
+  }, [dynamicItems])
+  const cpuMemTrendPoints = useMemo(() => {
+    const raw = buildCpuMemTrendPoints(dynamicItems)
+    return downsampleLTTB(raw, MAX_CHART_POINTS, (p) => Math.abs(p.cpuUtilization ?? 0) + Math.abs(p.memoryUtilization ?? 0) + Math.abs(p.pCoreFreqMhz ?? 0) + Math.abs(p.cpuTemperatureC ?? 0))
+  }, [dynamicItems])
+  const cpuPerCoreInfo = useMemo<CpuPerCoreInfo>(() => {
+    const raw = buildCpuPerCoreTrendPoints(dynamicItems)
+    return {
+      ...raw,
+      points: downsampleLTTB(raw.points, MAX_CHART_POINTS, (p) =>
+        Math.abs(p.totalUtil as number ?? 0) + Math.abs((p.pkgTemp as number) ?? 0) + Math.abs((p.pAvgFreq as number) ?? 0) / 100,
+      ),
+    }
+  }, [dynamicItems])
+  const { points: diskTrendPoints, diskNames, diskMaxThroughput } = useMemo(() => {
+    const { points, diskNames: dn, diskMaxThroughput: tp } = buildDiskTrendPoints(dynamicItems)
+    return { points: downsampleLTTB(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), diskNames: dn, diskMaxThroughput: tp }
+  }, [dynamicItems])
+  const { points: networkTrendPoints, nicNames, nicSpeeds } = useMemo(() => {
+    const { points, nicNames: nn, nicSpeeds: sp } = buildNetworkTrendPoints(dynamicItems)
+    // Merge with static info NIC speeds as fallback (history data may lack speed_mbps)
+    const merged = { ...sp }
+    if (staticInfo?.io.network_speeds_mbps) {
+      for (const [name, speed] of Object.entries(staticInfo.io.network_speeds_mbps)) {
+        if (speed > 0 && !merged[name]) merged[name] = speed
+      }
+    }
+    return { points: downsampleLTTB(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), nicNames: nn, nicSpeeds: merged }
+  }, [dynamicItems, staticInfo])
+  const npuTrendPoints = useMemo(() => {
+    const raw = buildNpuTrendPoints(dynamicItems)
+    return downsampleLTTB(raw, MAX_CHART_POINTS, (p) => Math.abs(p.npuUtilization ?? 0) + Math.abs(p.npuFreqMhz ?? 0) + Math.abs(p.npuPowerW ?? 0) + Math.abs(p.npuTemperatureC ?? 0) + Math.abs(p.npuMemoryMb ?? 0))
+  }, [dynamicItems])
+  const gpuTrendSeries = useMemo(() => {
+    const raw = buildGpuTrendSeries(dynamicItems)
+    return raw.map((s) => ({
+      ...s,
+      points: downsampleLTTB(s.points, MAX_CHART_POINTS, (p) => Math.abs(p.utilization ?? 0) + Math.abs(p.vcs ?? 0) + Math.abs(p.vecs ?? 0) + Math.abs(p.gt0Act ?? 0) + Math.abs(p.gpuPower ?? 0)),
+    }))
+  }, [dynamicItems])
 
-  const hasNpuData = useMemo(() => npuTrendPoints.some((p) => p.npuUtilization != null || p.npuFreqMhz != null), [npuTrendPoints])
+  const hasNpuData = useMemo(() => npuTrendPoints.some((p) => p.npuUtilization != null || p.npuFreqMhz != null || p.npuTemperatureC != null), [npuTrendPoints])
 
   const [pressureHidden, setPressureHidden] = useState<Set<string>>(new Set())
   const togglePressure = useCallback((key: string) => {
     setPressureHidden((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
-  }, [])
-
-  const [cpuMemHidden, setCpuMemHidden] = useState<Set<string>>(new Set())
-  const toggleCpuMem = useCallback((key: string) => {
-    setCpuMemHidden((prev) => {
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
       else next.add(key)
@@ -832,6 +1416,36 @@ export default function HistoryDashboard({ active }: Props) {
 
           <Popover
             trigger="click"
+            title="Chart Sections"
+            content={
+              <div>
+                <Checkbox
+                  indeterminate={visibleSections.length > 0 && visibleSections.length < ALL_SECTIONS.length}
+                  checked={visibleSections.length === ALL_SECTIONS.length}
+                  onChange={(e) => setVisibleSections(e.target.checked ? [...ALL_SECTIONS] : [])}
+                >
+                  Select All
+                </Checkbox>
+                <Divider style={{ margin: '6px 0' }} />
+                <Checkbox.Group
+                  options={SECTION_OPTIONS}
+                  value={visibleSections}
+                  onChange={(checked) => setVisibleSections(checked as string[])}
+                  style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+                />
+              </div>
+            }
+          >
+            <Button
+              icon={<FilterOutlined />}
+              style={visibleSections.length < ALL_SECTIONS.length ? { borderColor: COLORS.accent, color: COLORS.accent } : undefined}
+            >
+              Filter{visibleSections.length < ALL_SECTIONS.length ? ` (${visibleSections.length}/${ALL_SECTIONS.length})` : ''} <DownOutlined style={{ fontSize: 10 }} />
+            </Button>
+          </Popover>
+
+          <Popover
+            trigger="click"
             title="History Data Retention"
             content={
               <div style={{ minWidth: 260 }}>
@@ -881,7 +1495,7 @@ export default function HistoryDashboard({ active }: Props) {
       </Text>
 
       {/* System Pressure */}
-      <Card
+      {visibleSections.includes('pressure') && <Card
         style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6 }}
         bodyStyle={{ padding: 16 }}
       >
@@ -908,7 +1522,7 @@ export default function HistoryDashboard({ active }: Props) {
                   />
                 ))}
               </div>
-              <div style={{ width: '100%', height: 280 }}>
+              <div style={{ width: '100%', height: 240 }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={pressureTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                     <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
@@ -940,7 +1554,7 @@ export default function HistoryDashboard({ active }: Props) {
                         hide={pressureHidden.has(l.key)}
                       />
                     ))}
-                    <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                    <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -953,82 +1567,35 @@ export default function HistoryDashboard({ active }: Props) {
         {!loading && pressureTrendPoints.length === 0 && (
           <Empty description="No history data" image={Empty.PRESENTED_IMAGE_SIMPLE} />
         )}
-      </Card>
+      </Card>}
 
-      {/* CPU & Memory Utilization */}
-      {!loading && cpuMemTrendPoints.length > 0 && (
-        <Card
-          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
-          bodyStyle={{ padding: 16 }}
-        >
-          <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
-            CPU &amp; Memory Utilization
-          </Text>
-          {(() => {
-            const lines: Array<{ key: string; name: string; color: string; dasharray?: string }> = [
-              { key: 'cpuUtilization', name: 'CPU Total %', color: COLORS.accent },
-              { key: 'pCoreUtilization', name: 'P-Core %', color: COLORS.orange, dasharray: '6 3' },
-              { key: 'eCoreUtilization', name: 'E-Core %', color: COLORS.green, dasharray: '6 3' },
-              { key: 'memoryUtilization', name: 'Memory %', color: COLORS.yellow },
-            ]
-            return (
-              <>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
-                  {lines.map((l) => (
-                    <LegendToggleItem
-                      key={l.key}
-                      value={l.name}
-                      color={l.color}
-                      hidden={cpuMemHidden.has(l.key)}
-                      onClick={() => toggleCpuMem(l.key)}
-                      dasharray={l.dasharray}
-                    />
-                  ))}
-                </div>
-                <div style={{ width: '100%', height: 280 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={cpuMemTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
-                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="timestamp"
-                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                        minTickGap={36}
-                        tickFormatter={formatHistoryAxisTick}
-                      />
-                      <YAxis
-                        domain={[0, 100]}
-                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                        tickFormatter={(val: string | number) => `${val}%`}
-                      />
-                      <Tooltip
-                        contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
-                        formatter={tooltipFmt2}
-                      />
-                      {lines.map((l) => (
-                        <Line
-                          key={l.key}
-                          type="monotone"
-                          dataKey={l.key}
-                          name={l.name}
-                          stroke={l.color}
-                          strokeDasharray={l.dasharray}
-                          dot={false}
-                          strokeWidth={2}
-                          hide={cpuMemHidden.has(l.key)}
-                        />
-                      ))}
-                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              </>
-            )
-          })()}
-        </Card>
+      {/* CPU & Memory — all metrics in one configurable chart */}
+      {visibleSections.includes('cpuMem') && !loading && cpuMemTrendPoints.length > 0 && (
+        <ConfigurableChart
+          title="CPU & Memory"
+          storageKey="history-cpu-series"
+          data={cpuMemTrendPoints}
+          height={280}
+          showBrush
+          allSeries={[
+            { key: 'cpuUtilization', name: 'CPU Total', color: COLORS.accent, unit: '%' },
+            { key: 'pCoreUtilization', name: 'P-Core Util', color: '#e07b54', unit: '%' },
+            { key: 'eCoreUtilization', name: 'E-Core Util', color: COLORS.green, unit: '%' },
+            { key: 'memoryUtilization', name: 'Memory', color: COLORS.yellow, unit: '%' },
+            { key: 'pCoreFreqMhz', name: 'P-Core Freq', color: '#ff9f1c', unit: 'MHz', defaultOn: false },
+            { key: 'eCoreFreqMhz', name: 'E-Core Freq', color: '#7ae582', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+            { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#f94144', unit: '°C', dasharray: '4 2', defaultOn: false },
+          ]}
+        />
+      )}
+
+      {/* CPU Per-Core — utilization, frequency, temperature */}
+      {visibleSections.includes('cpuPerCore') && !loading && cpuPerCoreInfo.coreCount > 0 && (
+        <CpuPerCoreHistoryCard info={cpuPerCoreInfo} />
       )}
 
       {/* Disk — Utilization & Bandwidth per device */}
-      {!loading && diskNames.length > 0 && diskNames.map((diskName) => {
+      {visibleSections.includes('disk') && !loading && diskNames.length > 0 && diskNames.map((diskName) => {
         const diskLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
           { key: `${diskName}:util`, name: 'Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
           { key: `${diskName}:read`, name: 'Read MB/s', color: METRIC_COLORS.read, yAxisId: 'bw' },
@@ -1040,8 +1607,14 @@ export default function HistoryDashboard({ active }: Props) {
           style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
           bodyStyle={{ padding: 16 }}
         >
+          {(() => {
+            const maxTp = diskMaxThroughput[diskName]
+            const bwDomain: [number, number | ((max: number) => number)] = maxTp ? [0, maxTp] : [0, (max: number) => Math.max(max, 100)]
+            const diskTypeLabel = maxTp ? (diskName.startsWith('nvme') ? 'NVMe' : maxTp >= 500 ? 'SSD' : 'HDD') : null
+            return (
+          <>
           <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
-            Disk I/O ({diskName})
+            Disk I/O ({diskName}){diskTypeLabel ? ` — ${diskTypeLabel} ~${maxTp} MB/s` : ''}
           </Text>
               <>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
@@ -1056,7 +1629,7 @@ export default function HistoryDashboard({ active }: Props) {
                     />
                   ))}
                 </div>
-                <div style={{ width: '100%', height: 300 }}>
+                <div style={{ width: '100%', height: 260 }}>
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={diskTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
@@ -1075,6 +1648,7 @@ export default function HistoryDashboard({ active }: Props) {
                       <YAxis
                         yAxisId="bw"
                         orientation="right"
+                        domain={bwDomain}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
                         label={{ value: 'MB/s', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
@@ -1097,17 +1671,20 @@ export default function HistoryDashboard({ active }: Props) {
                           hide={diskHidden.has(l.key)}
                         />
                       ))}
-                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
               </>
+          </>
+            )
+          })()}
         </Card>
         )
       })}
 
       {/* Network — Utilization & Bandwidth per NIC */}
-      {!loading && nicNames.length > 0 && nicNames.map((nicName) => {
+      {visibleSections.includes('network') && !loading && nicNames.length > 0 && nicNames.map((nicName) => {
         const nicLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
           { key: `${nicName}:util`, name: 'Util %', color: METRIC_COLORS.util, yAxisId: 'util' },
           { key: `${nicName}:rx`, name: 'RX Mbps', color: METRIC_COLORS.rx, yAxisId: 'bw' },
@@ -1119,8 +1696,13 @@ export default function HistoryDashboard({ active }: Props) {
           style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
           bodyStyle={{ padding: 16 }}
         >
+          {(() => {
+            const linkSpeed = nicSpeeds[nicName]
+            const bwDomain: [number, number | ((max: number) => number)] = linkSpeed ? [0, linkSpeed] : [0, (max: number) => Math.max(max, 100)]
+            return (
+          <>
           <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
-            Network I/O ({nicName})
+            Network I/O ({nicName}){linkSpeed ? ` — Link ${linkSpeed} Mbps` : ''}
           </Text>
               <>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
@@ -1135,7 +1717,7 @@ export default function HistoryDashboard({ active }: Props) {
                     />
                   ))}
                 </div>
-                <div style={{ width: '100%', height: 300 }}>
+                <div style={{ width: '100%', height: 260 }}>
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={networkTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
                       <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
@@ -1154,6 +1736,7 @@ export default function HistoryDashboard({ active }: Props) {
                       <YAxis
                         yAxisId="bw"
                         orientation="right"
+                        domain={bwDomain}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
                         label={{ value: 'Mbps', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
@@ -1176,94 +1759,40 @@ export default function HistoryDashboard({ active }: Props) {
                           hide={networkHidden.has(l.key)}
                         />
                       ))}
-                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
+                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} fill={COLORS.bg} travellerWidth={8} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
               </>
+          </>
+            )
+          })()}
         </Card>
         )
       })}
 
-      {/* NPU Utilization & Frequency */}
-      {!loading && hasNpuData && (
-        <Card
-          style={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, borderRadius: 6, marginTop: 16 }}
-          bodyStyle={{ padding: 16 }}
-        >
-          <Text style={{ color: COLORS.textMuted, display: 'block', marginBottom: 6 }}>
-            NPU — Utilization &amp; Frequency
-          </Text>
-          {(() => {
-            const npuLines: Array<{ key: string; name: string; color: string; dasharray?: string; yAxisId: string }> = [
-              { key: 'npuUtilization', name: 'NPU Utilization %', color: COLORS.accent, yAxisId: 'util' },
-              { key: 'npuFreqMhz', name: 'NPU Freq MHz', color: COLORS.orange, dasharray: '6 3', yAxisId: 'freq' },
-            ]
-            return (
-              <>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', marginBottom: 8 }}>
-                  {npuLines.map((l) => (
-                    <LegendToggleItem
-                      key={l.key}
-                      value={l.name}
-                      color={l.color}
-                      hidden={false}
-                      onClick={() => {}}
-                      dasharray={l.dasharray}
-                    />
-                  ))}
-                </div>
-                <div style={{ width: '100%', height: 260 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={npuTrendPoints} margin={{ top: 4, right: 20, left: 0, bottom: 0 }}>
-                      <CartesianGrid stroke={`${COLORS.border}99`} strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="timestamp"
-                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                        minTickGap={36}
-                        tickFormatter={formatHistoryAxisTick}
-                      />
-                      <YAxis
-                        yAxisId="util"
-                        domain={[0, 100]}
-                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                        tickFormatter={(val: string | number) => `${val}%`}
-                      />
-                      <YAxis
-                        yAxisId="freq"
-                        orientation="right"
-                        tick={{ fill: COLORS.textMuted, fontSize: 11 }}
-                        label={{ value: 'MHz', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
-                      />
-                      <Tooltip
-                        contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
-                        formatter={tooltipFmt2}
-                      />
-                      {npuLines.map((l) => (
-                        <Line
-                          key={l.key}
-                          type="monotone"
-                          yAxisId={l.yAxisId}
-                          dataKey={l.key}
-                          name={l.name}
-                          stroke={l.color}
-                          strokeDasharray={l.dasharray}
-                          dot={false}
-                          strokeWidth={2}
-                        />
-                      ))}
-                      <Brush dataKey="timestamp" height={24} stroke={COLORS.accent} travellerWidth={8} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              </>
-            )
-          })()}
-        </Card>
+      {/* NPU — all metrics in one configurable chart */}
+      {visibleSections.includes('npu') && !loading && hasNpuData && (
+        <ConfigurableChart
+          title="NPU"
+          storageKey="history-npu-series"
+          data={npuTrendPoints}
+          height={280}
+          showBrush
+          allSeries={[
+            { key: 'npuUtilization', name: 'Utilization', color: COLORS.accent, unit: '%' },
+            { key: 'npuFreqMhz', name: 'Frequency', color: '#7ae582', unit: 'MHz', dasharray: '6 4' },
+            { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W', defaultOn: false },
+            { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3', defaultOn: false },
+            { key: 'npuTemperatureC', name: 'Temperature', color: '#f94144', unit: '°C', dasharray: '4 2', defaultOn: false },
+            { key: 'npuTileCount', name: 'Tiles', color: '#b877db', unit: 'tiles', defaultOn: false },
+            { key: 'npuMemoryMb', name: 'Memory', color: '#56c8d8', unit: 'MB', dasharray: '5 3', defaultOn: false },
+          ]}
+        />
       )}
 
       {/* GPU History */}
-      <div style={{ marginTop: 16 }}>
+      {visibleSections.includes('gpu') && <div style={{ marginTop: 16 }}>
         {loading ? (
           <Card
             style={{
@@ -1291,7 +1820,7 @@ export default function HistoryDashboard({ active }: Props) {
             <GpuHistoryCard key={series.id} series={series} />
           ))
         )}
-      </div>
+      </div>}
     </div>
   )
 }

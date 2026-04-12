@@ -27,7 +27,7 @@ and uses cgroups v2 to control CPU, memory, and I/O resources per app based on p
     6. Keep-alive for Critical apps via oom_score_adj tuning
     7. tc/HTB + iptables + cgroup network traffic shaping with four priority classes
     8. Disk I/O stress detection and top disk consumer throttling
-    9. GPU real-time monitoring via qmassa: per-card gt0/gt1 frequency, power, engine utilization
+    9. GPU real-time monitoring via gpu_monitor: per-card gt0/gt1 frequency, power, engine utilization
        (Render/Compute/Video Encode/Decode/Copy), VRAM usage, and throttle reason detection
     10. NPU real-time monitoring via Intel PMT telemetry: utilization, power, temperature,
         frequency, NOC bandwidth, memory utilization; per-process NPU tracking via fdinfo
@@ -59,8 +59,7 @@ and uses cgroups v2 to control CPU, memory, and I/O resources per app based on p
     │   │                        #   (CPU, GPU, NPU, memory, disk, network, driver versions)
     │   ├── intel_npu_smi.py     #   Intel NPU monitoring via PMT telemetry and fdinfo
     │   └── monitor_api.py       #   Flask Blueprint exposing /monitor/* REST endpoints
-    ├── tools/
-    │   └── qmassa               #   Intel GPU telemetry tool (real-time GPU metrics via sysfs)
+    ├── tools/                   # External tools and utilities
     ├── test/                    # Unit / integration tests and feature test scripts
     ├── utils/                   # Shared utilities: logger, app_utils, http_utils
     ├── web/                     # Streamlit web UI for app management
@@ -97,7 +96,7 @@ Key Words:
 # GPU & NPU Real-time Monitoring:
 The hardware telemetry module provides real-time per-device metrics for Intel GPU and NPU.
 ```
-GPU (via qmassa):
+GPU (via gpu_monitor):
 1. Collects real-time per-card metrics for each GPU (iGPU and dGPU distinguished automatically):
     gt0/gt1 frequency (current/actual/max), GPU and package power consumption,
     per-engine utilization (Render, Compute, Video Encode/Decode, Copy),

@@ -22,7 +22,7 @@ from flask import Blueprint, request
 import psutil
 
 from db.DatabaseModel import MonitorSnapshot
-from monitor import ResourceMonitor, PSIMonitor, NetworkMonitor, PressureAnalyzer
+from monitor import ResourceMonitor, PSIMonitor, PressureAnalyzer
 from monitor.system_info import collect_static_info, collect_dynamic_info
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
@@ -30,7 +30,6 @@ from utils.logger import logger
 monitor_bp = Blueprint('monitor', __name__, url_prefix='/monitor')
 
 _resource_monitor = None
-_network_monitor = None
 _system_pressure_monitor = None
 
 # ---------------------------------------------------------------------------
@@ -67,11 +66,9 @@ def _start_dynamic_info_auto_refresh() -> None:
             try:
                 monitor = _get_resource_monitor()
                 spm = _get_system_pressure_monitor()
-                net = _get_network_monitor()
                 data = collect_dynamic_info(
                     resource_monitor=monitor,
                     system_pressure_monitor=spm,
-                    network_monitor=net,
                 )
                 with _DYNAMIC_INFO_CACHE_LOCK:
                     _DYNAMIC_INFO_CACHE["data"] = data
@@ -93,14 +90,6 @@ def _get_resource_monitor() -> ResourceMonitor:
     if _resource_monitor is None:
         _resource_monitor = ResourceMonitor()
     return _resource_monitor
-
-
-def _get_network_monitor() -> NetworkMonitor:
-    """Return the shared NetworkMonitor instance, creating it if needed."""
-    global _network_monitor
-    if _network_monitor is None:
-        _network_monitor = NetworkMonitor()
-    return _network_monitor
 
 
 def _get_system_pressure_monitor():
@@ -447,8 +436,7 @@ def get_dynamic_info():
         try:
             monitor = _get_resource_monitor()
             spm = _get_system_pressure_monitor()
-            net = _get_network_monitor()
-            data = collect_dynamic_info(resource_monitor=monitor, system_pressure_monitor=spm, network_monitor=net)
+            data = collect_dynamic_info(resource_monitor=monitor, system_pressure_monitor=spm)
             with _DYNAMIC_INFO_CACHE_LOCK:
                 _DYNAMIC_INFO_CACHE["data"] = data
                 _DYNAMIC_INFO_CACHE["ts"] = time.time()

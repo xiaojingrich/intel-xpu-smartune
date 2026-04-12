@@ -18,14 +18,27 @@ export interface DiskData {
   is_stressed?: boolean
   stressed_disks?: string[]
   iowait?: number
+  busy_disks?: string[]
+  total_disks?: number
+  busy_ratio?: number | null
+  busy_pct?: number | null
+  busy_level?: string
 }
 
 export interface PressureData {
+  cpu?: number
+  memory?: number
+  io?: number
   level?: string
   score?: number
   is_disk_io_stressed?: boolean
   network_rx?: number
   network_tx?: number
+  network_busy_nics?: string[]
+  network_total_nics?: number
+  network_busy_ratio?: number | null
+  network_busy_pct?: number | null
+  network_busy_level?: string
 }
 
 export interface AppInfo {
@@ -166,13 +179,30 @@ export interface StaticInfoData {
   memory: {
     ddr_speeds: string[]
     total_gb: number | null
+    swap_total_gb?: number | null
+    devices?: {
+      total_slots: number | null
+      populated: number
+      channels?: number | null
+      devices: Array<{
+        locator: string | null
+        bank_locator?: string | null
+        size_gb: number | null
+        type: string | null
+        speed: string | null
+        configured_speed: string | null
+        form_factor: string | null
+        manufacturer: string | null
+        part_number: string | null
+      }>
+    }
   }
   io: {
     nic_count: number
     network_speeds_mbps: Record<string, number>
     network_peak_mbps: number | null
     primary_interface: string
-    valid_nics: Array<{ name: string; speed_mbps: number }>
+    valid_nics: Array<{ name: string; speed_mbps: number; ipv4?: string[]; ipv6?: string[] }>
   }
   disk: {
     device_count: number
@@ -197,6 +227,7 @@ export interface StaticInfoData {
     pcie: Record<string, { current_speed: string | null; current_width: string | null; max_speed: string | null; max_width: string | null }>
     eu_count?: Record<string, number | null>
     pci_addresses?: Record<string, string>
+    driver_names?: Record<string, string | null>
   }
   npu: {
     names: string[]
@@ -212,40 +243,43 @@ export interface ToolOutput {
   error: string | null
 }
 
-export interface QmassaFreq {
+export interface GpuUsageFreq {
   name: string
   min_mhz: number | null
   cur_mhz: number | null
   act_mhz: number | null
   max_mhz: number | null
+  rc6_pct: number | null
   throttled: boolean
   throttle_reasons: string[]
 }
 
-export interface QmassaDevice {
+export interface GpuUsageDevice {
   pci_dev: string | null
   dev_type: string | null
   drv_name: string | null
   engines: string[]
-  freqs: QmassaFreq[]
+  freqs: GpuUsageFreq[]
   power_w: {
     gpu: number | null
     pkg: number | null
+    card?: number | null
   }
   engine_util: Record<string, number | null>
+  utilization?: number | null
 }
 
-export interface QmassaParsed {
+export interface GpuUsageParsed {
   timestamp: number | null
   version: string | null
-  devices: QmassaDevice[]
+  devices: GpuUsageDevice[]
 }
 
-export interface QmassaOutput {
+export interface GpuUsageOutput {
   available: boolean
   raw: string | null
   error: string | null
-  parsed: QmassaParsed | null
+  parsed: GpuUsageParsed | null
 }
 
 export interface DynamicInfoData {
@@ -261,11 +295,16 @@ export interface DynamicInfoData {
     p_core_indices: number[]
     e_core_indices: number[]
     core_type_source: string
+    temperature_c: number | null
+    per_core_temperature_c?: Array<number | null>
   }
   memory: {
     usage_percent: number | null
     total_gb: number | null
     available_gb: number | null
+    swap_total_gb: number | null
+    swap_used_gb: number | null
+    swap_usage_percent: number | null
   }
   pressure: PressureData
   network: {
@@ -275,7 +314,7 @@ export interface DynamicInfoData {
   disk: DiskData
   gpu: {
     vram: Record<string, { total_bytes: number | null; used_bytes: number | null; usage_percent: number | null }>
-    qmassa: QmassaOutput
+    gpu_usage: GpuUsageOutput
   }
   npu: {
     npu_smi: ToolOutput

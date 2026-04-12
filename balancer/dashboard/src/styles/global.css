@@ -18,3 +18,20 @@ body {
   background: var(--perf-bg);
   color: #d9d9d9;
 }
+
+/* Recharts Brush dark theme */
+.recharts-brush-slide {
+  fill: rgba(87, 148, 242, 0.15);
+  fill-opacity: 1;
+}
+
+.recharts-brush-traveller rect {
+  fill: #2d3149;
+  stroke: #5794f2;
+  rx: 2;
+}
+
+.recharts-brush text {
+  fill: #8e9ab3;
+  font-size: 10px;
+}

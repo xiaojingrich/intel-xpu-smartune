@@ -88,7 +88,7 @@ function summarizeGpuPcie(
 
 function summarizeGpuPerDevice(
   staticInfo?: StaticInfoData | null,
-): Array<{ label: string; engines: string; gtFreqs: string }> {
+): Array<{ label: string; engines: string; gtFreqs: string; driverName: string | null; euCount: number | null }> {
   if (!staticInfo) return []
 
   const cardKeySet = new Set<string>()
@@ -97,12 +97,26 @@ function summarizeGpuPerDevice(
   Object.keys(staticInfo.gpu.pcie || {}).forEach((k) => cardKeySet.add(k))
   Object.keys(staticInfo.gpu.pci_addresses || {}).forEach((k) => cardKeySet.add(k))
   Object.keys(staticInfo.gpu.gt_freq_bounds_mhz || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticInfo.gpu.driver_names || {}).forEach((k) => cardKeySet.add(k))
 
   const cardKeys = Array.from(cardKeySet).sort()
   const labels = buildGpuCardLabels(cardKeys, new Set(Object.keys(staticInfo.gpu.pcie || {})))
 
   return cardKeys.map((cardKey) => {
-    const engines = staticInfo.gpu.engines?.[cardKey] || []
+    const engineInstances = staticInfo.gpu.engines?.[cardKey] || []
+    // Group instances by type: ccs0,ccs1,ccs2,ccs3 -> CCS ×4
+    const typeOrder = ['bcs', 'ccs', 'rcs', 'vcs', 'vecs']
+    const typeCounts: Record<string, number> = {}
+    for (const name of engineInstances) {
+      const lowered = name.toLowerCase()
+      const engineType = typeOrder.find((t) => lowered.startsWith(t))
+      if (engineType) typeCounts[engineType] = (typeCounts[engineType] || 0) + 1
+    }
+    const enginesSummary = typeOrder
+      .filter((t) => typeCounts[t])
+      .map((t) => typeCounts[t] > 1 ? `${t.toUpperCase()} \u00d7${typeCounts[t]}` : t.toUpperCase())
+      .join(' | ')
+
     const gt0 = staticInfo.gpu.gt_freq_bounds_mhz?.[cardKey]?.gt0
     const gt1 = staticInfo.gpu.gt_freq_bounds_mhz?.[cardKey]?.gt1
     const gtFreqs = [
@@ -110,10 +124,15 @@ function summarizeGpuPerDevice(
       gt1 ? `gt1 ${formatFreqRange(gt1.min_mhz, gt1.max_mhz)}` : null,
     ].filter(Boolean).join(' | ')
 
+    const driverName = staticInfo.gpu.driver_names?.[cardKey] ?? null
+    const euCount = staticInfo.gpu.eu_count?.[cardKey] ?? null
+
     return {
       label: labels[cardKey] || cardKey,
-      engines: engines.length ? engines.join(', ') : 'N/A',
+      engines: enginesSummary || 'N/A',
       gtFreqs: gtFreqs || 'N/A',
+      driverName,
+      euCount,
     }
   })
 }
@@ -242,57 +261,139 @@ export default function About({ active }: Props) {
   }, [staticInfo])
 
   const hardwareSections = useMemo(() => {
-    if (!staticInfo) return [] as Array<{ title: string; items: Array<{ label: string; value: string }> }>
+    if (!staticInfo) return [] as Array<{ title: string; items: Array<{ label: string; value: React.ReactNode }> }>
+
+    const gpuPerDevice = summarizeGpuPerDevice(staticInfo)
+    const pcieEntries = Object.entries(staticInfo.gpu.pcie || {})
+    const pcieKeys = new Set(Object.keys(staticInfo.gpu.pcie || {}))
+    const pciAddresses = staticInfo.gpu.pci_addresses || {}
+    const gpuNames = staticInfo.gpu.names || []
+    const nameByBdf: Record<string, string> = {}
+    gpuNames.forEach((line) => {
+      const match = `${line}`.match(/^([0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])/i)
+      if (match) nameByBdf[match[1].toLowerCase()] = line
+    })
+
+    const gpuCards: Array<{ title: string; items: Array<{ label: string; value: React.ReactNode }> }> = gpuPerDevice.map((gpu) => {
+      // Find the card key from the label, e.g. "dGPU(card0)" -> "card0"
+      const cardKeyMatch = gpu.label.match(/\(([^)]+)\)/)
+      const cardKey = cardKeyMatch ? cardKeyMatch[1] : ''
+      const pci = pciAddresses[cardKey]
+      const shortBdf = typeof pci === 'string' ? pci.replace(/^[0-9a-f]{4}:/i, '').toLowerCase() : ''
+      const nameLine = nameByBdf[shortBdf] || 'N/A'
+      const pcieInfo = pcieEntries.find(([k]) => k === cardKey)
+      let pcieText = 'N/A'
+      if (pcieInfo) {
+        const info = pcieInfo[1]
+        const cur = info.current_speed && info.current_width
+          ? `${info.current_speed} x${info.current_width}` : (info.current_speed || info.current_width || null)
+        const max = info.max_speed && info.max_width ? `max ${info.max_speed} x${info.max_width}` : null
+        pcieText = cur && max ? `${cur} (${max})` : (cur || max || 'N/A')
+      }
+
+      const driverLabel = gpu.driverName || 'N/A'
+
+      const items: Array<{ label: string; value: React.ReactNode }> = [
+        { label: 'Name', value: nameLine },
+        { label: 'Driver', value: driverLabel },
+        ...(pcieKeys.has(cardKey) ? [{ label: 'PCIe', value: pcieText }] : []),
+        ...(gpu.driverName === 'i915' && typeof gpu.euCount === 'number' ? [{ label: 'EU Count', value: `${gpu.euCount}` }] : []),
+        { label: 'Engines', value: gpu.engines },
+        { label: 'GT0/GT1 Freq', value: gpu.gtFreqs },
+      ]
+      return { title: gpu.label, items }
+    })
 
     return [
       {
-        title: 'CPU & Memory',
+        title: 'CPU',
         items: [
-          { label: 'CPU model', value: formatPlain(staticInfo.cpu.model_name) },
+          { label: 'Model', value: formatPlain(staticInfo.cpu.model_name) },
           { label: 'Logical cores', value: formatPlain(staticInfo.cpu.core_count.logical) },
           { label: 'Physical cores', value: formatPlain(staticInfo.cpu.core_count.physical) },
           ...(staticInfo.cpu.freq_mhz.p_core_freq_mhz
-            ? [{ label: 'P-Core freq range', value: formatFreqRange(staticInfo.cpu.freq_mhz.p_core_freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.p_core_freq_mhz.max_mhz) }]
-            : [{ label: 'CPU freq range', value: formatFreqRange(staticInfo.cpu.freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.max_mhz) }]),
+            ? [{ label: 'P-Core freq', value: formatFreqRange(staticInfo.cpu.freq_mhz.p_core_freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.p_core_freq_mhz.max_mhz) }]
+            : [{ label: 'Freq range', value: formatFreqRange(staticInfo.cpu.freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.max_mhz) }]),
           ...(staticInfo.cpu.freq_mhz.e_core_freq_mhz
-            ? [{ label: 'E-Core freq range', value: formatFreqRange(staticInfo.cpu.freq_mhz.e_core_freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.e_core_freq_mhz.max_mhz) }]
+            ? [{ label: 'E-Core freq', value: formatFreqRange(staticInfo.cpu.freq_mhz.e_core_freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.e_core_freq_mhz.max_mhz) }]
             : []),
-          { label: 'Memory total', value: typeof staticInfo.memory.total_gb === 'number' ? `${staticInfo.memory.total_gb.toFixed(1)} GB` : 'N/A' },
-          { label: 'DDR speeds', value: formatPlain(staticInfo.memory.ddr_speeds) },
         ],
       },
       {
-        title: 'IO & Disk',
-        items: [
-          { label: 'NIC count', value: formatPlain(staticInfo.io.nic_count) },
-          { label: 'Primary NIC', value: formatPlain(staticInfo.io.primary_interface) },
-          { label: 'Network peak', value: formatNetworkSpeed(staticInfo.io.network_peak_mbps) },
-          { label: 'NIC speeds', value: summarizeNetworkSpeeds(staticInfo.io.network_speeds_mbps) },
-          { label: 'Disk total size', value: typeof staticInfo.disk.total_size_gb === 'number' ? `${staticInfo.disk.total_size_gb.toFixed(2)} GB` : 'N/A' },
-          { label: 'Disk devices', value: summarizeDiskSizes(staticInfo.disk.devices) },
-        ],
+        title: 'Memory',
+        items: (() => {
+          const devs = staticInfo.memory.devices?.devices
+          const devInfo = staticInfo.memory.devices
+          // Type: deduplicate across all populated slots
+          const types = devs?.length ? [...new Set(devs.map((d) => d.type).filter(Boolean))] : []
+          // Speed: rated speed with actual configured speed in parentheses
+          let speedText = formatPlain(staticInfo.memory.ddr_speeds)
+          if (devs?.length) {
+            const rated = devs[0].speed
+            const configured = devs[0].configured_speed
+            if (rated && rated !== 'Unknown') {
+              const configuredLabel = configured && configured !== 'Unknown' ? configured : null
+              speedText = configuredLabel ? `${rated} (Actual: ${configuredLabel})` : rated
+            }
+          }
+          return [
+            { label: 'Total', value: typeof staticInfo.memory.total_gb === 'number' ? `${staticInfo.memory.total_gb.toFixed(1)} GB` : 'N/A' },
+            ...(types.length ? [{ label: 'Type', value: types.join(', ') }] : []),
+            { label: 'Speed', value: speedText },
+            ...(devInfo?.total_slots != null
+              ? [{ label: 'Slots', value: `${devInfo.populated} of ${devInfo.total_slots} populated` }]
+              : []),
+            ...(devInfo?.channels != null
+              ? [{ label: 'Channel', value: devInfo.channels === 1 ? 'Single' : devInfo.channels === 2 ? 'Dual' : `${devInfo.channels}ch` }]
+              : []),
+            { label: 'Swap', value: typeof staticInfo.memory.swap_total_gb === 'number' && staticInfo.memory.swap_total_gb > 0
+              ? `${staticInfo.memory.swap_total_gb.toFixed(1)} GB`
+              : 'Not configured' },
+          ]
+        })(),
       },
+      ...(staticInfo.io.valid_nics?.length
+        ? staticInfo.io.valid_nics.map((nic) => ({
+            title: `NIC: ${nic.name}`,
+            items: [
+              { label: 'Speed', value: formatNetworkSpeed(nic.speed_mbps) },
+              { label: 'Primary', value: nic.name === staticInfo.io.primary_interface ? 'Yes' : 'No' },
+              ...(nic.ipv4?.length ? [{ label: 'IPv4', value: nic.ipv4.join(', ') }] : []),
+              ...(nic.ipv6?.length ? [{ label: 'IPv6', value: nic.ipv6.join(', ') }] : []),
+            ],
+          }))
+        : [{
+            title: 'Network',
+            items: [
+              { label: 'NIC count', value: formatPlain(staticInfo.io.nic_count) },
+              { label: 'Primary NIC', value: formatPlain(staticInfo.io.primary_interface) },
+              { label: 'Peak speed', value: formatNetworkSpeed(staticInfo.io.network_peak_mbps) },
+            ],
+          }]
+      ),
+      ...(staticInfo.disk.devices?.length
+        ? staticInfo.disk.devices.map((dev) => ({
+            title: `Disk: ${dev.name}`,
+            items: [
+              { label: 'Size', value: typeof dev.size_gb === 'number' ? `${dev.size_gb.toFixed(2)} GB` : 'N/A' },
+              { label: 'Type', value: dev.name.startsWith('nvme') ? 'NVMe SSD' : 'Disk' },
+            ],
+          }))
+        : [{
+            title: 'Disk',
+            items: [
+              { label: 'Total size', value: typeof staticInfo.disk.total_size_gb === 'number' ? `${staticInfo.disk.total_size_gb.toFixed(2)} GB` : 'N/A' },
+            ],
+          }]
+      ),
+      ...gpuCards,
       {
-        title: 'GPU & NPU',
+        title: 'NPU',
         items: [
-          { label: 'GPU count', value: formatPlain(staticInfo.gpu.count) },
-          { label: 'GPU names', value: summarizeGpuNamesByCard(staticInfo) },
-          { label: 'GPU PCIe', value: summarizeGpuPcie(staticInfo.gpu.pcie, staticInfo.gpu.freq_bounds_mhz) },
-          ...summarizeGpuPerDevice(staticInfo).flatMap((gpu) => [
-            { label: `${gpu.label} engines`, value: gpu.engines },
-            { label: `${gpu.label} gt0/gt1 freq`, value: gpu.gtFreqs },
-          ]),
-          {
-            label: 'NPU detail',
-            value: (
-              <span style={{ whiteSpace: 'pre-line' }}>
-                {`NPU\n${formatPlain(staticInfo.npu.names)}`}
-              </span>
-            ),
-          },
-          { label: 'NPU Device', value: formatPlain(staticInfo.npu.pciid) },
-          { label: 'NPU Driver', value: formatPlain(staticInfo.npu.driver_version) },
-          { label: 'NPU freq bounds', value: summarizeFreqBounds(staticInfo.npu.freq_bounds_mhz) },
+          { label: 'Name', value: formatPlain(staticInfo.npu.names) },
+          { label: 'Device', value: formatPlain(staticInfo.npu.pciid) },
+          { label: 'Driver', value: formatPlain(staticInfo.npu.driver_version) },
+          { label: 'Freq bounds', value: summarizeFreqBounds(staticInfo.npu.freq_bounds_mhz) },
         ],
       },
     ]
@@ -489,7 +590,7 @@ export default function About({ active }: Props) {
           </Text>
           <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
             {hardwareSections.map((section) => (
-              <Col key={`hw-${section.title}`} xs={24} lg={8}>
+              <Col key={`hw-${section.title}`} xs={24} md={12} xl={6}>
                 <SectionCard title={section.title} items={section.items} />
               </Col>
             ))}
