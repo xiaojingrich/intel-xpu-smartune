@@ -484,22 +484,24 @@ def _fdinfo_display_name(eng_name):
     return eng_name
 
 
-def scan_drm_fdinfo_engines(pci_slot):
-    """Scan /proc fdinfo for all DRM clients of a device.
+def scan_drm_fdinfo_clients(pci_slot):
+    """Scan /proc fdinfo for DRM clients of a device, grouped per client.
 
-    Returns dict per engine:
-      {engine_name: {"cycles": N, "total_cycles": N, "time_ns": N, "capacity": N}}
-    Values are summed across all clients.  Xe exposes drm-cycles-*/drm-total-cycles-*;
-    i915 exposes drm-engine-* (time in ns).  This function collects both.
+    Returns {(drm_minor, client_id): {eng_name: {cycles, total_cycles,
+    time_ns, capacity}}}.  Each (minor, client_id) tuple is unique per DRM
+    client; the same client may be shared across pids via fd duplication and
+    must only be counted once, so repeats are deduplicated by that key.
 
-    This approach does NOT use perf_event and does NOT affect GT idle state.
+    Matches qmassa's aggregation: utilization is computed per-client and
+    summed across clients upstream, which is more accurate than summing raw
+    cycles from all clients and dividing by max(total_cycles).
     """
-    engines = {}  # engine_name -> {cycles, total_cycles, time_ns, capacity}
+    clients = {}
 
-    def _ensure(name):
-        if name not in engines:
-            engines[name] = {"cycles": 0, "total_cycles": 0,
-                             "time_ns": 0, "capacity": 1}
+    def _ensure_eng(client_engs, name):
+        if name not in client_engs:
+            client_engs[name] = {"cycles": 0, "total_cycles": 0,
+                                 "time_ns": 0, "capacity": 1}
 
     proc = Path("/proc")
     for pid_entry in proc.iterdir():
@@ -524,6 +526,7 @@ def scan_drm_fdinfo_engines(pci_slot):
                 continue
             if os.major(st.st_rdev) != DRM_MAJOR:
                 continue
+            drm_minor = os.minor(st.st_rdev)
 
             fdinfo_path = fdinfo_dir / fd_path.name
             try:
@@ -532,14 +535,28 @@ def scan_drm_fdinfo_engines(pci_slot):
                 continue
 
             pdev_match = False
+            client_id = None
             for line in content.splitlines():
+                line = line.strip()
                 if line.startswith("drm-pdev:"):
                     if line.split(":", 1)[1].strip() == pci_slot:
                         pdev_match = True
+                elif line.startswith("drm-client-id:"):
+                    try:
+                        client_id = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        client_id = None
+                if pdev_match and client_id is not None:
                     break
 
-            if not pdev_match:
+            if not pdev_match or client_id is None:
                 continue
+
+            ckey = (drm_minor, client_id)
+            if ckey in clients:
+                # Same DRM client shared across pids — skip duplicate fdinfo
+                continue
+            client_engs = {}
 
             for line in content.splitlines():
                 line = line.strip()
@@ -550,41 +567,40 @@ def scan_drm_fdinfo_engines(pci_slot):
 
                 if key.startswith("drm-engine-capacity-"):
                     eng = key[len("drm-engine-capacity-"):]
-                    _ensure(eng)
+                    _ensure_eng(client_engs, eng)
                     try:
-                        engines[eng]["capacity"] = max(
-                            engines[eng]["capacity"], int(val))
+                        client_engs[eng]["capacity"] = int(val)
                     except ValueError:
                         pass
 
                 elif key.startswith("drm-engine-"):
                     eng = key[len("drm-engine-"):]
-                    _ensure(eng)
+                    _ensure_eng(client_engs, eng)
                     try:
-                        engines[eng]["time_ns"] += int(val.split()[0])
+                        client_engs[eng]["time_ns"] = int(val.split()[0])
                     except ValueError:
                         pass
 
                 elif key.startswith("drm-total-cycles-"):
                     eng = key[len("drm-total-cycles-"):]
-                    _ensure(eng)
+                    _ensure_eng(client_engs, eng)
                     try:
-                        # total_cycles is a reference clock, same for all
-                        # clients — take max, not sum
-                        engines[eng]["total_cycles"] = max(
-                            engines[eng]["total_cycles"], int(val))
+                        client_engs[eng]["total_cycles"] = int(val)
                     except ValueError:
                         pass
 
                 elif key.startswith("drm-cycles-"):
                     eng = key[len("drm-cycles-"):]
-                    _ensure(eng)
+                    _ensure_eng(client_engs, eng)
                     try:
-                        engines[eng]["cycles"] += int(val)
+                        client_engs[eng]["cycles"] = int(val)
                     except ValueError:
                         pass
 
-    return engines
+            if client_engs:
+                clients[ckey] = client_engs
+
+    return clients
 
 
 # ---------------------------------------------------------------------------
@@ -1115,9 +1131,9 @@ class I915Monitor:
 class XeMonitor:
     """System-wide GPU monitor for Xe driver.
 
-    Default (use_pmu=False): DRM fdinfo for engine utilization (per-class
-    average), sysfs for frequency, hwmon for power.  Does NOT open Xe PMU
-    perf_event counters.
+    Default (use_pmu=False): DRM fdinfo for engine utilization (per-client
+    percentages summed across clients, qmassa-style), sysfs for frequency,
+    hwmon for power.  Does NOT open Xe PMU perf_event counters.
 
     PMU mode (use_pmu=True): per-instance engine utilization and PMU-based
     frequency.  NOTE: opening Xe PMU counters prevents the GT from entering
@@ -1350,7 +1366,7 @@ class XeMonitor:
 
         # fdinfo mode: fdinfo engines, sysfs frequency
         if not self.use_pmu:
-            result["fdinfo_engines"] = scan_drm_fdinfo_engines(self.pci_slot)
+            result["fdinfo_clients"] = scan_drm_fdinfo_clients(self.pci_slot)
 
             freq = {}
             for gt_name, paths in self._freq_paths.items():
@@ -1416,41 +1432,61 @@ class XeMonitor:
                     pct = 0.0
                 engines_result[eng["display_name"]] = {"busy_pct": round(pct, 2)}
         else:
-            # fdinfo mode: cycles or time based utilization (per-class average)
-            cur_eng = cur.get("fdinfo_engines", {})
-            prev_eng = prev.get("fdinfo_engines", {})
-            eng_names = list(self._known_engines)
-            for n in set(cur_eng.keys()) | set(prev_eng.keys()):
-                if n not in eng_names:
-                    eng_names.append(n)
-            for eng_name in eng_names:
-                pct = 0.0
-                cd = cur_eng.get(eng_name, {})
-                pd = prev_eng.get(eng_name, {})
-                cap = cd.get("capacity", 1) or 1
+            # fdinfo mode: per-client utilization summed across clients,
+            # matching qmassa's aggregation (drm_clients.rs:eng_utilization +
+            # drm_devices.rs fallback loop).  This is more accurate than
+            # summing raw cycles across clients because each client's
+            # total_cycles may span a different sub-window of [prev, cur],
+            # especially for clients that started or ended during the period.
+            cur_clis = cur.get("fdinfo_clients", {})
+            prev_clis = prev.get("fdinfo_clients", {})
 
-                # Prefer cycles (Xe fdinfo)
-                if cd.get("total_cycles", 0) > 0 and pd.get("total_cycles", 0) > 0:
-                    delta_cyc = cd["cycles"] - pd["cycles"]
-                    delta_tot = cd["total_cycles"] - pd["total_cycles"]
-                    if delta_cyc < 0:
-                        delta_cyc = 0
-                    if delta_tot > 0:
-                        pct = (delta_cyc / delta_tot) * 100.0 / cap
+            # Accumulate per-engine utilization across all clients that were
+            # present in BOTH samples (need two samples to have a delta).
+            eng_totals = {}   # eng_name -> summed % across clients
+            eng_caps = {}     # eng_name -> capacity seen (for num_instances)
 
-                # Fallback to time (i915 fdinfo)
-                elif cd.get("time_ns", 0) > 0 or pd.get("time_ns", 0) > 0:
-                    delta_ns = cd.get("time_ns", 0) - pd.get("time_ns", 0)
-                    if delta_ns < 0:
-                        delta_ns = 0
-                    if dt_ns > 0:
-                        pct = (delta_ns / dt_ns) * 100.0 / cap
+            for ckey, cur_engs in cur_clis.items():
+                prev_engs = prev_clis.get(ckey)
+                if prev_engs is None:
+                    continue
+                for eng_name, cd in cur_engs.items():
+                    pd = prev_engs.get(eng_name)
+                    if pd is None:
+                        continue
+                    cap = cd.get("capacity", 1) or 1
+                    eng_caps[eng_name] = max(eng_caps.get(eng_name, 1), cap)
 
+                    cli_pct = 0.0
+                    # Prefer cycles (Xe fdinfo)
+                    dcy = cd.get("cycles", 0) - pd.get("cycles", 0)
+                    dtot = cd.get("total_cycles", 0) - pd.get("total_cycles", 0)
+                    if dcy < 0:
+                        dcy = 0
+                    if dtot > 0 and cd.get("total_cycles", 0) > 0:
+                        cli_pct = (dcy * 100.0) / (dtot * cap)
+                    # Fallback to time (i915 fdinfo): delta_time / dt_ns
+                    elif dt_ns > 0:
+                        dns = cd.get("time_ns", 0) - pd.get("time_ns", 0)
+                        if dns < 0:
+                            dns = 0
+                        if dns > 0:
+                            cli_pct = (dns * 100.0) / (dt_ns * cap)
+
+                    if cli_pct > 100.0:
+                        cli_pct = 100.0
+                    eng_totals[eng_name] = eng_totals.get(eng_name, 0.0) + cli_pct
+
+            # Ensure all known engines appear, even if idle
+            for eng_name in self._known_engines:
+                eng_totals.setdefault(eng_name, 0.0)
+
+            for eng_name, pct in eng_totals.items():
                 pct = min(max(pct, 0.0), 100.0)
                 display = _fdinfo_display_name(eng_name)
                 n_inst = self._engine_instances.get(eng_name, 0)
                 if n_inst <= 0:
-                    n_inst = cap
+                    n_inst = eng_caps.get(eng_name, 1)
                 engines_result[display] = {
                     "busy_pct": round(pct, 2),
                     "num_instances": n_inst,
