@@ -39,9 +39,11 @@ interface CpuMemTrendPoint {
   cpuUtilization: number | null
   pCoreUtilization: number | null
   eCoreUtilization: number | null
+  lpeCoreUtilization: number | null
   memoryUtilization: number | null
   pCoreFreqMhz: number | null
   eCoreFreqMhz: number | null
+  lpeCoreFreqMhz: number | null
   cpuTemperatureC: number | null
 }
 
@@ -104,8 +106,10 @@ interface CpuPerCoreTrendPoint {
   totalUtil: number | null
   pAvgUtil: number | null
   eAvgUtil: number | null
+  lpeAvgUtil: number | null
   pAvgFreq: number | null
   eAvgFreq: number | null
+  lpeAvgFreq: number | null
   pkgTemp: number | null
   [key: string]: string | number | null
 }
@@ -116,6 +120,7 @@ interface CpuPerCoreInfo {
   tempCoreCount: number
   pCoreIndices: number[]
   eCoreIndices: number[]
+  lpeCoreIndices: number[]
 }
 
 type RangePreset = '5m' | '15m' | '1h' | '6h' | '24h' | 'custom'
@@ -245,6 +250,7 @@ const ENGINE_CURVE_META: Array<{ key: EngineKey; name: string; color: string }> 
 
 const P_CORE_COLORS = ['#ff6b6b', '#ff9f43', '#feca57', '#ff6348', '#ee5a24', '#f0932b', '#eb4d4b', '#f39c12']
 const E_CORE_COLORS = ['#54a0ff', '#48dbfb', '#0abde3', '#10ac84', '#2ed573', '#7bed9f', '#70a1ff', '#5352ed', '#6c5ce7', '#00cec9', '#55efc4', '#74b9ff', '#a29bfe', '#81ecec', '#00b894', '#5f27cd']
+const LPE_CORE_COLORS = ['#c7a8ff', '#b19cd9', '#9b7ede', '#8e7cc3', '#b4a5e8', '#d4b8ff', '#a78bff', '#c9a0dc']
 
 const SECTION_OPTIONS = [
   { label: 'System Pressure', value: 'pressure' },
@@ -401,9 +407,11 @@ function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[
       cpuUtilization: toNumber(dynamic?.cpu?.usage_total),
       pCoreUtilization: toNumber(dynamic?.cpu?.p_core_usage),
       eCoreUtilization: toNumber(dynamic?.cpu?.e_core_usage),
+      lpeCoreUtilization: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.lpe_core_usage as number | null),
       memoryUtilization: toNumber(dynamic?.memory?.usage_percent),
       pCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.p_core_freq_mhz as number | null),
       eCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.e_core_freq_mhz as number | null),
+      lpeCoreFreqMhz: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.lpe_core_freq_mhz as number | null),
       cpuTemperatureC: toNumber((dynamic?.cpu as Record<string, unknown> | undefined)?.temperature_c as number | null),
     }
   })
@@ -412,6 +420,7 @@ function buildCpuMemTrendPoints(items: HistorySnapshotItem[]): CpuMemTrendPoint[
 function buildCpuPerCoreTrendPoints(items: HistorySnapshotItem[]): CpuPerCoreInfo {
   const pCoreSet = new Set<number>()
   const eCoreSet = new Set<number>()
+  const lpeCoreSet = new Set<number>()
   let maxLogicalCore = -1
   let maxTempCore = -1
 
@@ -426,8 +435,10 @@ function buildCpuPerCoreTrendPoints(items: HistorySnapshotItem[]): CpuPerCoreInf
       totalUtil: toNumber(cpu?.usage_total as number | null),
       pAvgUtil: toNumber(cpu?.p_core_usage as number | null),
       eAvgUtil: toNumber(cpu?.e_core_usage as number | null),
+      lpeAvgUtil: toNumber(cpu?.lpe_core_usage as number | null),
       pAvgFreq: toNumber(cpu?.p_core_freq_mhz as number | null),
       eAvgFreq: toNumber(cpu?.e_core_freq_mhz as number | null),
+      lpeAvgFreq: toNumber(cpu?.lpe_core_freq_mhz as number | null),
       pkgTemp: toNumber(cpu?.temperature_c as number | null),
     }
 
@@ -436,9 +447,11 @@ function buildCpuPerCoreTrendPoints(items: HistorySnapshotItem[]): CpuPerCoreInf
     const perCoreTemp = (cpu?.per_core_temperature_c as Array<number | null> | undefined) || []
     const pIndices = (cpu?.p_core_indices as number[] | undefined) || []
     const eIndices = (cpu?.e_core_indices as number[] | undefined) || []
+    const lpeIndices = (cpu?.lpe_core_indices as number[] | undefined) || []
 
     pIndices.forEach((i) => pCoreSet.add(i))
     eIndices.forEach((i) => eCoreSet.add(i))
+    lpeIndices.forEach((i) => lpeCoreSet.add(i))
 
     perCoreUsage.forEach((v, i) => {
       point[`u_${i}`] = normalizePercent(v)
@@ -462,6 +475,7 @@ function buildCpuPerCoreTrendPoints(items: HistorySnapshotItem[]): CpuPerCoreInf
     tempCoreCount: maxTempCore + 1,
     pCoreIndices: [...pCoreSet].sort((a, b) => a - b),
     eCoreIndices: [...eCoreSet].sort((a, b) => a - b),
+    lpeCoreIndices: [...lpeCoreSet].sort((a, b) => a - b),
   }
 }
 
@@ -1151,7 +1165,7 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
 }
 
 function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
-  const { points, coreCount, pCoreIndices, eCoreIndices } = info
+  const { points, coreCount, pCoreIndices, eCoreIndices, lpeCoreIndices } = info
 
   // Check which cores actually have temperature data in at least one point
   const coresWithTemp = useMemo(() => {
@@ -1209,7 +1223,29 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
     ]
   }, [eCoreIndices])
 
-  // Temperature chart: Package + per-core temps (P/E labeled), skip cores with no data
+  // LPE-Core chart: same dual-axis approach
+  const lpeCoreSeries: SeriesConfig[] = useMemo(() => {
+    if (!lpeCoreIndices.length) return []
+    return [
+      { key: 'lpeAvgUtil', name: 'LPE Avg Util', color: '#ffffff', unit: '%', dasharray: '6 3' },
+      ...lpeCoreIndices.map((logIdx, i) => ({
+        key: `u_${logIdx}`,
+        name: `LPE${i}`,
+        color: LPE_CORE_COLORS[i % LPE_CORE_COLORS.length],
+        unit: '%',
+      })),
+      { key: 'lpeAvgFreq', name: 'LPE Avg Freq', color: '#ffffff', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+      ...lpeCoreIndices.map((logIdx, i) => ({
+        key: `f_${logIdx}`,
+        name: `LPE${i} Freq`,
+        color: LPE_CORE_COLORS[i % LPE_CORE_COLORS.length],
+        unit: 'MHz',
+        defaultOn: false,
+      })),
+    ]
+  }, [lpeCoreIndices])
+
+  // Temperature chart: Package + per-core temps (P/E/LPE labeled), skip cores with no data
   const tempSeries: SeriesConfig[] = useMemo(() => {
     const series: SeriesConfig[] = [
       { key: 'pkgTemp', name: 'Package', color: '#f94144', unit: '°C' },
@@ -1224,8 +1260,13 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
         series.push({ key: `t_${logIdx}`, name: `E${i}`, color: E_CORE_COLORS[i % E_CORE_COLORS.length], unit: '°C', defaultOn: false })
       }
     })
+    lpeCoreIndices.forEach((logIdx, i) => {
+      if (coresWithTemp.has(logIdx)) {
+        series.push({ key: `t_${logIdx}`, name: `LPE${i}`, color: LPE_CORE_COLORS[i % LPE_CORE_COLORS.length], unit: '°C', defaultOn: false })
+      }
+    })
     return series
-  }, [pCoreIndices, eCoreIndices, coresWithTemp])
+  }, [pCoreIndices, eCoreIndices, lpeCoreIndices, coresWithTemp])
 
   if (coreCount === 0) return null
 
@@ -1248,6 +1289,17 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
           storageKey="history-cpu-ecore"
           data={points}
           allSeries={eCoreSeries}
+          height={240}
+          showBrush
+          hoverPanel
+        />
+      )}
+      {lpeCoreSeries.length > 0 && (
+        <ConfigurableChart
+          title={`LPE-Core (${lpeCoreIndices.length}) — Utilization & Frequency`}
+          storageKey="history-cpu-lpecore"
+          data={points}
+          allSeries={lpeCoreSeries}
           height={240}
           showBrush
           hoverPanel
@@ -1577,16 +1629,20 @@ export default function HistoryDashboard({ active }: Props) {
         { header: 'util_pct', key: 'util', width: 10 },
         { header: 'p_core_util_pct', key: 'p_util', width: 16 },
         { header: 'e_core_util_pct', key: 'e_util', width: 16 },
+        { header: 'lpe_core_util_pct', key: 'lpe_util', width: 18 },
         { header: 'p_core_freq_mhz', key: 'p_freq', width: 16 },
         { header: 'e_core_freq_mhz', key: 'e_freq', width: 16 },
+        { header: 'lpe_core_freq_mhz', key: 'lpe_freq', width: 18 },
         { header: 'temperature_c', key: 'temp', width: 14 },
       ],
       (d) => ({
         util: d?.cpu?.usage_total ?? null,
         p_util: d?.cpu?.p_core_usage ?? null,
         e_util: d?.cpu?.e_core_usage ?? null,
+        lpe_util: (d?.cpu as Record<string, unknown> | undefined)?.lpe_core_usage ?? null,
         p_freq: d?.cpu?.p_core_freq_mhz ?? null,
         e_freq: d?.cpu?.e_core_freq_mhz ?? null,
+        lpe_freq: (d?.cpu as Record<string, unknown> | undefined)?.lpe_core_freq_mhz ?? null,
         temp: d?.cpu?.temperature_c ?? null,
       }),
     )
@@ -1600,12 +1656,15 @@ export default function HistoryDashboard({ active }: Props) {
       if (coreCount > 0) {
         let pIdx: Set<number> = new Set()
         let eIdx: Set<number> = new Set()
+        let lpeIdx: Set<number> = new Set()
         for (const { data } of dyn) {
           if (data?.cpu?.p_core_indices?.length) pIdx = new Set(data.cpu.p_core_indices)
           if (data?.cpu?.e_core_indices?.length) eIdx = new Set(data.cpu.e_core_indices)
-          if (pIdx.size || eIdx.size) break
+          const lpeArr = (data?.cpu as Record<string, unknown> | undefined)?.lpe_core_indices as number[] | undefined
+          if (lpeArr?.length) lpeIdx = new Set(lpeArr)
+          if (pIdx.size || eIdx.size || lpeIdx.size) break
         }
-        const coreType = (i: number) => pIdx.has(i) ? 'P' : eIdx.has(i) ? 'E' : 'Core'
+        const coreType = (i: number) => pIdx.has(i) ? 'P' : eIdx.has(i) ? 'E' : lpeIdx.has(i) ? 'LPE' : 'Core'
         const cols: Array<Partial<ExcelJS.Column>> = []
         for (let i = 0; i < coreCount; i++) {
           cols.push(
@@ -2030,10 +2089,20 @@ export default function HistoryDashboard({ active }: Props) {
           allSeries={[
             { key: 'cpuUtilization', name: 'CPU Total', color: COLORS.accent, unit: '%' },
             { key: 'pCoreUtilization', name: 'P-Core Util', color: '#e07b54', unit: '%' },
-            { key: 'eCoreUtilization', name: 'E-Core Util', color: COLORS.green, unit: '%' },
+            ...(cpuPerCoreInfo.eCoreIndices.length
+              ? [{ key: 'eCoreUtilization', name: 'E-Core Util', color: COLORS.green, unit: '%' }]
+              : []),
+            ...(cpuPerCoreInfo.lpeCoreIndices.length
+              ? [{ key: 'lpeCoreUtilization', name: 'LPE-Core Util', color: '#b19cd9', unit: '%' }]
+              : []),
             { key: 'memoryUtilization', name: 'Memory', color: '#4ade80', unit: '%' },
             { key: 'pCoreFreqMhz', name: 'P-Core Freq', color: '#ff9f1c', unit: 'MHz', defaultOn: false },
-            { key: 'eCoreFreqMhz', name: 'E-Core Freq', color: '#7ae582', unit: 'MHz', dasharray: '6 3', defaultOn: false },
+            ...(cpuPerCoreInfo.eCoreIndices.length
+              ? [{ key: 'eCoreFreqMhz', name: 'E-Core Freq', color: '#7ae582', unit: 'MHz', dasharray: '6 3', defaultOn: false }]
+              : []),
+            ...(cpuPerCoreInfo.lpeCoreIndices.length
+              ? [{ key: 'lpeCoreFreqMhz', name: 'LPE-Core Freq', color: '#c7a8ff', unit: 'MHz', dasharray: '6 3', defaultOn: false }]
+              : []),
             { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#f94144', unit: '°C', dasharray: '4 2', defaultOn: false },
           ]}
         />
@@ -2221,24 +2290,44 @@ export default function HistoryDashboard({ active }: Props) {
         )
       })}
 
-      {/* NPU — all metrics in one configurable chart */}
+      {/* NPU — split into unit-grouped charts so axes aren't mixed */}
       {visibleSections.includes('npu') && !loading && hasNpuData && (
-        <ConfigurableChart
-          title="NPU"
-          storageKey="history-npu-series"
-          data={npuTrendPoints}
-          height={280}
-          showBrush
-          allSeries={[
-            { key: 'npuUtilization', name: 'Utilization', color: COLORS.accent, unit: '%' },
-            { key: 'npuFreqMhz', name: 'Frequency', color: '#7ae582', unit: 'MHz', dasharray: '6 4' },
-            { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W', defaultOn: false },
-            { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3', defaultOn: false },
-            { key: 'npuTemperatureC', name: 'Temperature', color: '#f94144', unit: '°C', dasharray: '4 2', defaultOn: false },
-            { key: 'npuTileCount', name: 'Tiles', color: '#b877db', unit: 'tiles', defaultOn: false },
-            { key: 'npuMemoryMb', name: 'Memory', color: '#56c8d8', unit: 'MB', dasharray: '5 3', defaultOn: false },
-          ]}
-        />
+        <>
+          <ConfigurableChart
+            title="NPU — Utilization & Frequency"
+            storageKey="history-npu-util-freq"
+            data={npuTrendPoints}
+            height={240}
+            showBrush
+            allSeries={[
+              { key: 'npuUtilization', name: 'Utilization', color: COLORS.accent, unit: '%' },
+              { key: 'npuFreqMhz', name: 'Frequency', color: '#7ae582', unit: 'MHz', dasharray: '6 4' },
+            ]}
+          />
+          <ConfigurableChart
+            title="NPU — Power & DDR Bandwidth"
+            storageKey="history-npu-power-bw"
+            data={npuTrendPoints}
+            height={240}
+            showBrush
+            allSeries={[
+              { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W' },
+              { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
+            ]}
+          />
+          <ConfigurableChart
+            title="NPU — Temperature, Memory & Tiles"
+            storageKey="history-npu-misc"
+            data={npuTrendPoints}
+            height={240}
+            showBrush
+            allSeries={[
+              { key: 'npuTemperatureC', name: 'Temperature', color: '#f94144', unit: '°C' },
+              { key: 'npuMemoryMb', name: 'Memory', color: '#56c8d8', unit: 'MB', dasharray: '5 3', defaultOn: false },
+              { key: 'npuTileCount', name: 'Tiles', color: '#b877db', unit: 'tiles', defaultOn: false },
+            ]}
+          />
+        </>
       )}
 
       {/* GPU History */}

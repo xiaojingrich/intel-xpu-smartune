@@ -175,6 +175,7 @@ export interface StaticInfoData {
       per_core_mhz: Array<number | null>
       p_core_freq_mhz?: { min_mhz: number | null; max_mhz: number | null } | null
       e_core_freq_mhz?: { min_mhz: number | null; max_mhz: number | null } | null
+      lpe_core_freq_mhz?: { min_mhz: number | null; max_mhz: number | null } | null
     }
   }
   memory: {
@@ -291,10 +292,13 @@ export interface DynamicInfoData {
     per_core_freq_mhz: Array<number | null>
     p_core_usage: number | null
     e_core_usage: number | null
+    lpe_core_usage: number | null
     p_core_freq_mhz: number | null
     e_core_freq_mhz: number | null
+    lpe_core_freq_mhz: number | null
     p_core_indices: number[]
     e_core_indices: number[]
+    lpe_core_indices: number[]
     core_type_source: string
     temperature_c: number | null
     per_core_temperature_c?: Array<number | null>

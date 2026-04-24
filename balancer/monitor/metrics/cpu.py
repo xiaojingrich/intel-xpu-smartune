@@ -270,10 +270,11 @@ def classify_cores(freqs: List[Optional[float]]) -> Dict[str, Any]:
         return cached_result
 
     detected = detect_core_groups()
-    if detected["p_cores"] or detected["e_cores"]:
+    if detected["p_cores"] or detected["e_cores"] or detected.get("lpe_cores"):
         result = {
             "p_cores": detected["p_cores"],
             "e_cores": detected["e_cores"],
+            "lpe_cores": detected.get("lpe_cores", []),
             "source": detected["source"],
         }
         _CORE_CLASS_CACHE["cpu_count"] = cpu_count
@@ -282,14 +283,14 @@ def classify_cores(freqs: List[Optional[float]]) -> Dict[str, Any]:
 
     valid_values = [f for f in freqs if f is not None]
     if not valid_values:
-        result = {"p_cores": [], "e_cores": [], "source": "unknown"}
+        result = {"p_cores": [], "e_cores": [], "lpe_cores": [], "source": "unknown"}
         _CORE_CLASS_CACHE["cpu_count"] = cpu_count
         _CORE_CLASS_CACHE["result"] = result
         return result
 
     freq_span = max(valid_values) - min(valid_values)
     if freq_span < 150:
-        result = {"p_cores": [], "e_cores": [], "source": "single-cluster"}
+        result = {"p_cores": [], "e_cores": [], "lpe_cores": [], "source": "single-cluster"}
         _CORE_CLASS_CACHE["cpu_count"] = cpu_count
         _CORE_CLASS_CACHE["result"] = result
         return result
@@ -299,7 +300,7 @@ def classify_cores(freqs: List[Optional[float]]) -> Dict[str, Any]:
     split = max(1, cpu_count // 2)
     p_cores = sorted_idx[:split]
     e_cores = sorted_idx[split:]
-    result = {"p_cores": p_cores, "e_cores": e_cores, "source": "heuristic"}
+    result = {"p_cores": p_cores, "e_cores": e_cores, "lpe_cores": [], "source": "heuristic"}
     _CORE_CLASS_CACHE["cpu_count"] = cpu_count
     _CORE_CLASS_CACHE["result"] = result
     return result
@@ -347,6 +348,7 @@ def get_cpu_freq_summary() -> Dict[str, Any]:
     core_class = detect_core_groups()
     p_indices = core_class.get("p_cores", [])
     e_indices = core_class.get("e_cores", [])
+    lpe_indices = core_class.get("lpe_cores", [])
 
     def _core_range(indices: List[int]) -> Dict[str, Optional[float]]:
         mins = [min_vals[i] for i in indices if i < len(min_vals)] if min_vals else []
@@ -365,6 +367,7 @@ def get_cpu_freq_summary() -> Dict[str, Any]:
         "per_core_mhz": per_core,
         "p_core_freq_mhz": _core_range(p_indices) if p_indices else None,
         "e_core_freq_mhz": _core_range(e_indices) if e_indices else None,
+        "lpe_core_freq_mhz": _core_range(lpe_indices) if lpe_indices else None,
     }
 
 
@@ -380,6 +383,7 @@ def get_cpu_dynamic() -> Dict[str, Any]:
     core_class = classify_cores([f.max if f else None for f in freqs or []])
     p_cores = core_class["p_cores"]
     e_cores = core_class["e_cores"]
+    lpe_cores = core_class.get("lpe_cores", [])
 
     return {
         "usage_total": round(total_usage, 2),
@@ -387,10 +391,13 @@ def get_cpu_dynamic() -> Dict[str, Any]:
         "per_core_freq_mhz": per_core_freq,
         "p_core_usage": _avg(usage_per_core, p_cores),
         "e_core_usage": _avg(usage_per_core, e_cores),
+        "lpe_core_usage": _avg(usage_per_core, lpe_cores),
         "p_core_freq_mhz": _avg(per_core_freq, p_cores),
         "e_core_freq_mhz": _avg(per_core_freq, e_cores),
+        "lpe_core_freq_mhz": _avg(per_core_freq, lpe_cores),
         "p_core_indices": p_cores,
         "e_core_indices": e_cores,
+        "lpe_core_indices": lpe_cores,
         "core_type_source": core_class["source"],
     }
 

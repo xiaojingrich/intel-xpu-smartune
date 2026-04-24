@@ -1956,12 +1956,19 @@ function NpuDetailCard({
           <ChartLegend items={pbItems} hidden={hidden} onToggle={toggle} />
           <div style={{ width: '100%', height: 120 }}>
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={powerBwData} margin={{ top: 2, right: 44, left: 0, bottom: 16 }}>
+              <LineChart data={powerBwData} margin={{ top: 2, right: 70, left: 0, bottom: 16 }}>
                 <CartesianGrid stroke={`${COLORS.border}55`} strokeDasharray="3 3" />
                 <XAxis dataKey="i" ticks={[0, powerBwData.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
-                <YAxis yAxisId="power" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}W`} width={40} />
-                <YAxis yAxisId="bw" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}`} width={40}
-                  label={{ value: 'MiB/s', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }} />
+                <YAxis yAxisId="power" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${Number(v).toFixed(1)}W`} width={44} />
+                <YAxis yAxisId="bw" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }}
+                  tickFormatter={(v) => {
+                    const n = Number(v)
+                    if (!Number.isFinite(n)) return String(v)
+                    if (n >= 1000) return `${(n / 1024).toFixed(1)}G`
+                    return n.toFixed(0)
+                  }}
+                  width={58}
+                  label={{ value: 'MiB/s', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: -4 }} />
                 <Tooltip
                   contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
                   formatter={(val: unknown, name: string) => {
@@ -2390,6 +2397,7 @@ export default function SystemOverview({ active }: Props) {
         'npu:availability': data.npu.npu_smi.available ? 100 : 0,
         'cpu:p': normalizePercent(data.cpu.p_core_usage),
         'cpu:e': normalizePercent(data.cpu.e_core_usage),
+        'cpu:lpe': normalizePercent(data.cpu.lpe_core_usage),
         'util:cpu': normalizePercent(data.cpu.usage_total),
         'util:memory': normalizePercent(data.memory.usage_percent),
       }
@@ -2657,10 +2665,13 @@ export default function SystemOverview({ active }: Props) {
   const cpuFreqRangeMeta = useMemo(() => {
     const pf = staticInfo?.cpu.freq_mhz.p_core_freq_mhz
     const ef = staticInfo?.cpu.freq_mhz.e_core_freq_mhz
+    const lf = staticInfo?.cpu.freq_mhz.lpe_core_freq_mhz
     const overall = formatFreqRange(staticInfo?.cpu.freq_mhz.min_mhz, staticInfo?.cpu.freq_mhz.max_mhz)
-    if (pf && ef) return `P: ${formatFreqRange(pf.min_mhz, pf.max_mhz)} / E: ${formatFreqRange(ef.min_mhz, ef.max_mhz)}`
-    if (pf) return `P: ${formatFreqRange(pf.min_mhz, pf.max_mhz)}`
-    return overall
+    const parts: string[] = []
+    if (pf) parts.push(`P: ${formatFreqRange(pf.min_mhz, pf.max_mhz)}`)
+    if (ef) parts.push(`E: ${formatFreqRange(ef.min_mhz, ef.max_mhz)}`)
+    if (lf) parts.push(`LPE: ${formatFreqRange(lf.min_mhz, lf.max_mhz)}`)
+    return parts.length ? parts.join(' / ') : overall
   }, [staticInfo?.cpu.freq_mhz])
 
   const cpuSnapshotMeta = staticInfo?.cpu.model_name
@@ -2818,15 +2829,17 @@ export default function SystemOverview({ active }: Props) {
   const coreGroups = useMemo(() => {
     const usage = dynamicInfo?.cpu.per_core_usage || []
     const freqs = dynamicInfo?.cpu.per_core_freq_mhz || []
-    if (!usage.length) return [] as Array<{ label: string; type: 'P' | 'E' | 'Core'; indices: number[] }>
+    if (!usage.length) return [] as Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }>
 
     const p = dynamicInfo?.cpu.p_core_indices || []
     const e = dynamicInfo?.cpu.e_core_indices || []
+    const lpe = dynamicInfo?.cpu.lpe_core_indices || []
 
-    if (p.length || e.length) {
-      const groups: Array<{ label: string; type: 'P' | 'E' | 'Core'; indices: number[] }> = []
+    if (p.length || e.length || lpe.length) {
+      const groups: Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }> = []
       if (p.length) groups.push({ label: 'P-Cores', type: 'P', indices: p })
       if (e.length) groups.push({ label: 'E-Cores', type: 'E', indices: e })
+      if (lpe.length) groups.push({ label: 'LPE-Cores', type: 'LPE', indices: lpe })
       return groups
     }
 
@@ -3028,8 +3041,14 @@ export default function SystemOverview({ active }: Props) {
             details={[
               { label: 'P-Core Usage', value: formatPercent(dynamicInfo?.cpu.p_core_usage), source: 'dynamic' },
               { label: 'E-Core Usage', value: formatPercent(dynamicInfo?.cpu.e_core_usage), source: 'dynamic' },
+              ...(isNumber(dynamicInfo?.cpu.lpe_core_usage)
+                ? [{ label: 'LPE-Core Usage', value: formatPercent(dynamicInfo?.cpu.lpe_core_usage), source: 'dynamic' as DataSourceKind }]
+                : []),
               { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu.p_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
               { label: 'E-Core Freq', value: formatMetric(dynamicInfo?.cpu.e_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
+              ...(isNumber(dynamicInfo?.cpu.lpe_core_freq_mhz)
+                ? [{ label: 'LPE-Core Freq', value: formatMetric(dynamicInfo?.cpu.lpe_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
+                : []),
               { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu.temperature_c, '°C', 1), source: 'dynamic' },
             ]}
             sparkMode={sparkMode}
@@ -3351,7 +3370,9 @@ export default function SystemOverview({ active }: Props) {
                         ? staticInfo?.cpu.freq_mhz.p_core_freq_mhz
                         : group.type === 'E'
                           ? staticInfo?.cpu.freq_mhz.e_core_freq_mhz
-                          : null
+                          : group.type === 'LPE'
+                            ? staticInfo?.cpu.freq_mhz.lpe_core_freq_mhz
+                            : null
                       const txt = freqBounds
                         ? formatFreqRange(freqBounds.min_mhz, freqBounds.max_mhz)
                         : formatFreqRange(staticInfo?.cpu.freq_mhz.min_mhz, staticInfo?.cpu.freq_mhz.max_mhz)

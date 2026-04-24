@@ -336,6 +336,9 @@ export default function About({ active }: Props) {
           ...(staticInfo.cpu.freq_mhz.e_core_freq_mhz
             ? [{ label: 'E-Core freq', value: formatFreqRange(staticInfo.cpu.freq_mhz.e_core_freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.e_core_freq_mhz.max_mhz) }]
             : []),
+          ...(staticInfo.cpu.freq_mhz.lpe_core_freq_mhz
+            ? [{ label: 'LPE-Core freq', value: formatFreqRange(staticInfo.cpu.freq_mhz.lpe_core_freq_mhz.min_mhz, staticInfo.cpu.freq_mhz.lpe_core_freq_mhz.max_mhz) }]
+            : []),
         ],
       },
       {
