@@ -1179,14 +1179,14 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
     return has
   }, [points, coreCount])
 
-  // P-Core chart: Util % (left Y) + Freq MHz (right Y) for each P logical core
+  // P-Core chart: Util % solid, Freq MHz dashed; per-core use palette, Avg uses white
   const pCoreSeries: SeriesConfig[] = useMemo(() => {
     if (!pCoreIndices.length) return []
     return [
-      { key: 'pAvgUtil', name: 'P Avg Util', color: '#ffffff', unit: '%', dasharray: '6 3' },
+      { key: 'pAvgUtil', name: 'P Avg Util', color: '#ffffff', unit: '%' },
       ...pCoreIndices.map((logIdx, i) => ({
         key: `u_${logIdx}`,
-        name: `P${i}`,
+        name: `P${i} Util`,
         color: P_CORE_COLORS[i % P_CORE_COLORS.length],
         unit: '%',
       })),
@@ -1196,19 +1196,20 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
         name: `P${i} Freq`,
         color: P_CORE_COLORS[i % P_CORE_COLORS.length],
         unit: 'MHz',
+        dasharray: '6 3',
         defaultOn: false,
       })),
     ]
   }, [pCoreIndices])
 
-  // E-Core chart: same dual-axis approach
+  // E-Core chart: same dual-style approach (solid util, dashed freq)
   const eCoreSeries: SeriesConfig[] = useMemo(() => {
     if (!eCoreIndices.length) return []
     return [
-      { key: 'eAvgUtil', name: 'E Avg Util', color: '#ffffff', unit: '%', dasharray: '6 3' },
+      { key: 'eAvgUtil', name: 'E Avg Util', color: '#ffffff', unit: '%' },
       ...eCoreIndices.map((logIdx, i) => ({
         key: `u_${logIdx}`,
-        name: `E${i}`,
+        name: `E${i} Util`,
         color: E_CORE_COLORS[i % E_CORE_COLORS.length],
         unit: '%',
       })),
@@ -1218,19 +1219,20 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
         name: `E${i} Freq`,
         color: E_CORE_COLORS[i % E_CORE_COLORS.length],
         unit: 'MHz',
+        dasharray: '6 3',
         defaultOn: false,
       })),
     ]
   }, [eCoreIndices])
 
-  // LPE-Core chart: same dual-axis approach
+  // LPE-Core chart: same dual-style approach
   const lpeCoreSeries: SeriesConfig[] = useMemo(() => {
     if (!lpeCoreIndices.length) return []
     return [
-      { key: 'lpeAvgUtil', name: 'LPE Avg Util', color: '#ffffff', unit: '%', dasharray: '6 3' },
+      { key: 'lpeAvgUtil', name: 'LPE Avg Util', color: '#ffffff', unit: '%' },
       ...lpeCoreIndices.map((logIdx, i) => ({
         key: `u_${logIdx}`,
-        name: `LPE${i}`,
+        name: `LPE${i} Util`,
         color: LPE_CORE_COLORS[i % LPE_CORE_COLORS.length],
         unit: '%',
       })),
@@ -1240,6 +1242,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
         name: `LPE${i} Freq`,
         color: LPE_CORE_COLORS[i % LPE_CORE_COLORS.length],
         unit: 'MHz',
+        dasharray: '6 3',
         defaultOn: false,
       })),
     ]

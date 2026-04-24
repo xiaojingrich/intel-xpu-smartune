@@ -1803,11 +1803,15 @@ function ChartLegend({
 function NpuDetailCard({
   npuParsed,
   npuName,
+  npuFreqMinMhz,
+  npuFreqMaxMhz,
   getSeries,
   trendWindow,
 }: {
   npuParsed: Record<string, unknown> | null
   npuName: string
+  npuFreqMinMhz: number | null
+  npuFreqMaxMhz: number | null
   getSeries: (key: string) => Array<number | null>
   trendWindow: '1m' | '5m'
 }) {
@@ -1873,6 +1877,11 @@ function NpuDetailCard({
           <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 2 }}>
             {npuName.replace(/\s*\[[0-9a-f]{4}:[0-9a-f]{4}\]\s*$/i, '').trim() || 'Intel NPU'}
           </Text>
+          {(isNumber(npuFreqMinMhz) || isNumber(npuFreqMaxMhz)) && (
+            <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 2 }}>
+              Freq Range: {isNumber(npuFreqMinMhz) ? Math.round(npuFreqMinMhz) : '—'} – {isNumber(npuFreqMaxMhz) ? Math.round(npuFreqMaxMhz) : '—'} MHz
+            </Text>
+          )}
         </div>
         <div style={{ textAlign: 'right' }}>
           <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block' }}>Util</Text>
@@ -3040,12 +3049,16 @@ export default function SystemOverview({ active }: Props) {
             subtitle={cpuSnapshotMeta}
             details={[
               { label: 'P-Core Usage', value: formatPercent(dynamicInfo?.cpu.p_core_usage), source: 'dynamic' },
-              { label: 'E-Core Usage', value: formatPercent(dynamicInfo?.cpu.e_core_usage), source: 'dynamic' },
+              ...(isNumber(dynamicInfo?.cpu.e_core_usage)
+                ? [{ label: 'E-Core Usage', value: formatPercent(dynamicInfo?.cpu.e_core_usage), source: 'dynamic' as DataSourceKind }]
+                : []),
               ...(isNumber(dynamicInfo?.cpu.lpe_core_usage)
                 ? [{ label: 'LPE-Core Usage', value: formatPercent(dynamicInfo?.cpu.lpe_core_usage), source: 'dynamic' as DataSourceKind }]
                 : []),
               { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu.p_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
-              { label: 'E-Core Freq', value: formatMetric(dynamicInfo?.cpu.e_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
+              ...(isNumber(dynamicInfo?.cpu.e_core_freq_mhz)
+                ? [{ label: 'E-Core Freq', value: formatMetric(dynamicInfo?.cpu.e_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
+                : []),
               ...(isNumber(dynamicInfo?.cpu.lpe_core_freq_mhz)
                 ? [{ label: 'LPE-Core Freq', value: formatMetric(dynamicInfo?.cpu.lpe_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
                 : []),
@@ -3449,6 +3462,16 @@ export default function SystemOverview({ active }: Props) {
           <NpuDetailCard
             npuParsed={npuParsed}
             npuName={staticInfo?.npu.names?.[0] || 'Intel NPU'}
+            npuFreqMinMhz={(() => {
+              const bounds = Object.values(staticInfo?.npu.freq_bounds_mhz || {})
+              const val = bounds[0]?.min_mhz
+              return typeof val === 'number' ? val : null
+            })()}
+            npuFreqMaxMhz={(() => {
+              const bounds = Object.values(staticInfo?.npu.freq_bounds_mhz || {})
+              const val = bounds[0]?.max_mhz
+              return typeof val === 'number' ? val : null
+            })()}
             getSeries={getSeries}
             trendWindow={trendWindow}
           />
