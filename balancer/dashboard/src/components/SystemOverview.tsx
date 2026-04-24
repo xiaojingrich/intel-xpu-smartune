@@ -1822,11 +1822,13 @@ function NpuDetailCard({
   const bandwidthMib = typeof npuParsed?.noc_bandwidth_mib_per_s === 'number' ? npuParsed.noc_bandwidth_mib_per_s : null
   const memoryMb = typeof npuParsed?.memory_bytes === 'number' ? (npuParsed.memory_bytes as number) / (1024 * 1024) : null
   const tileConfig = npuParsed?.tile_config != null ? `${npuParsed.tile_config}` : 'N/A'
+  const pmtAvailable = npuParsed?.pmt_available !== false
 
   const utilSeries = getSeries('npu:util')
   const freqSeries = getSeries('npu:freq_mhz')
   const powerSeries = getSeries('npu:power_w')
   const ddrBwSeries = getSeries('npu:bandwidth_mib')
+  const tempSeries = getSeries('npu:temp_c')
   const [hidden, setHidden] = useState<Set<string>>(new Set())
   const toggle = useCallback((key: string) => setHidden((prev) => {
     const next = new Set(prev); next.has(key) ? next.delete(key) : next.add(key); return next
@@ -1852,12 +1854,13 @@ function NpuDetailCard({
     freqMhz: padUf(freqSeries)[i] ?? null,
   })) : []
 
-  // Chart 2: Power W + DDR BW MiB/s
+  // Chart 2: Power W + DDR BW MiB/s + Temperature °C
   const pbItems = [
     { key: 'npuPower', name: 'NPU Power W', color: '#4cc9f0' },
     { key: 'ddrBw', name: 'DDR BW MiB/s', color: '#cbd5e1', dasharray: '5 3' },
+    { key: 'npuTemp', name: 'Temperature °C', color: '#f94144' },
   ]
-  const pbMaxLen = Math.max(powerSeries.length, ddrBwSeries.length)
+  const pbMaxLen = Math.max(powerSeries.length, ddrBwSeries.length, tempSeries.length)
   const padPb = (arr: Array<number | null>) => {
     const diff = pbMaxLen - arr.length
     return diff > 0 ? [...Array(diff).fill(null), ...arr] : arr.slice(-pbMaxLen)
@@ -1866,6 +1869,7 @@ function NpuDetailCard({
     i,
     npuPower: padPb(powerSeries)[i] ?? null,
     ddrBw: padPb(ddrBwSeries)[i] ?? null,
+    npuTemp: padPb(tempSeries)[i] ?? null,
   })) : []
 
   return (
@@ -1877,9 +1881,9 @@ function NpuDetailCard({
           <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 2 }}>
             {npuName.replace(/\s*\[[0-9a-f]{4}:[0-9a-f]{4}\]\s*$/i, '').trim() || 'Intel NPU'}
           </Text>
-          {(isNumber(npuFreqMinMhz) || isNumber(npuFreqMaxMhz)) && (
+          {isNumber(npuFreqMaxMhz) && (
             <Text style={{ color: COLORS.textMuted, fontSize: 10, display: 'block', marginTop: 2 }}>
-              Freq Range: {isNumber(npuFreqMinMhz) ? Math.round(npuFreqMinMhz) : '—'} – {isNumber(npuFreqMaxMhz) ? Math.round(npuFreqMaxMhz) : '—'} MHz
+              Max Freq: {Math.round(npuFreqMaxMhz)} MHz
             </Text>
           )}
         </div>
@@ -1910,21 +1914,27 @@ function NpuDetailCard({
         />
       </div>
 
-      {/* Numbers row */}
-      <div className="perf-metrics-row">
-        {[
-          { label: 'Power', value: isNumber(powerW) ? `${powerW.toFixed(2)} W` : 'N/A', color: PERF_COLORS.cpu },
-          { label: 'NPU Freq', value: isNumber(freqMhz) ? `${freqMhz.toFixed(0)} MHz` : 'N/A', color: PERF_COLORS.npu },
-          { label: 'DDR BW', value: isNumber(bandwidthMib) ? `${(bandwidthMib / 1024).toFixed(2)} GB/s` : 'N/A', color: PERF_COLORS.memory },
-          { label: 'Tile Conf', value: tileConfig, color: COLORS.textMuted },
-          { label: 'Temp', value: isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: PERF_COLORS.pressure },
-          { label: 'Memory', value: isNumber(memoryMb) ? `${memoryMb.toFixed(2)} MB` : 'N/A', color: COLORS.text },
-        ].map((item) => (
-          <span key={item.label} className="perf-metrics-chip">
-            <Text style={labelStyle}>{item.label}</Text>
-            <Text style={{ ...numStyle, color: item.color }}>{item.value}</Text>
-          </span>
-        ))}
+      {/* Numbers row (GPU-style: label + color dot + value, flowing inline) */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px 16px', alignItems: 'center', marginBottom: 8 }}>
+        {(() => {
+          const items: Array<{ key: string; label: string; value: string; color: string }> = []
+          items.push({ key: 'util', label: 'Util', value: isNumber(util) ? `${util.toFixed(1)} %` : 'N/A', color: COLORS.accent })
+          items.push({ key: 'freq', label: 'Freq', value: isNumber(freqMhz) ? `${freqMhz.toFixed(0)} MHz` : 'N/A', color: PERF_COLORS.npu })
+          items.push({ key: 'mem', label: 'Memory Used', value: isNumber(memoryMb) ? `${memoryMb.toFixed(2)} MB` : 'N/A', color: COLORS.text })
+          if (pmtAvailable) {
+            items.push({ key: 'power', label: 'Power', value: isNumber(powerW) ? `${powerW.toFixed(2)} W` : 'N/A', color: '#4cc9f0' })
+            items.push({ key: 'bw', label: 'DDR BW', value: isNumber(bandwidthMib) ? `${(bandwidthMib / 1024).toFixed(2)} GB/s` : 'N/A', color: '#cbd5e1' })
+            items.push({ key: 'temp', label: 'Temp', value: isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: '#f94144' })
+            items.push({ key: 'tile', label: 'Tile Conf', value: tileConfig, color: COLORS.textMuted })
+          }
+          return items.map((it) => (
+            <span key={it.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: it.color, flexShrink: 0, display: 'inline-block' }} />
+              <Text style={labelStyle}>{it.label}</Text>
+              <Text style={{ ...numStyle, color: it.color }}>{it.value}</Text>
+            </span>
+          ))
+        })()}
       </div>
 
       {/* Chart 1: Utilization % (left Y) + Freq MHz (right Y) — matching History */}
@@ -1936,8 +1946,10 @@ function NpuDetailCard({
               <LineChart data={utilFreqData} margin={{ top: 2, right: 44, left: 0, bottom: 16 }}>
                 <CartesianGrid stroke={`${COLORS.border}55`} strokeDasharray="3 3" />
                 <XAxis dataKey="i" ticks={[0, utilFreqData.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
-                <YAxis yAxisId="util" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={36} />
-                <YAxis yAxisId="freq" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} width={40} />
+                <YAxis yAxisId="util" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={44}
+                  label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
+                <YAxis yAxisId="freq" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} width={50}
+                  label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: 10 }} />
                 <Tooltip
                   contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
                   formatter={(val: unknown, name: string) => {
@@ -1959,8 +1971,8 @@ function NpuDetailCard({
         </>
       )}
 
-      {/* Chart 2: Power W (left Y) + DDR BW MiB/s (right Y) — matching History */}
-      {powerBwData.length > 0 && (
+      {/* Chart 2: Power W + Temperature °C (left Y) + DDR BW MiB/s (right Y) — matching History */}
+      {pmtAvailable && powerBwData.length > 0 && (
         <>
           <ChartLegend items={pbItems} hidden={hidden} onToggle={toggle} />
           <div style={{ width: '100%', height: 120 }}>
@@ -1968,7 +1980,8 @@ function NpuDetailCard({
               <LineChart data={powerBwData} margin={{ top: 2, right: 70, left: 0, bottom: 16 }}>
                 <CartesianGrid stroke={`${COLORS.border}55`} strokeDasharray="3 3" />
                 <XAxis dataKey="i" ticks={[0, powerBwData.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
-                <YAxis yAxisId="power" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${Number(v).toFixed(1)}W`} width={44} />
+                <YAxis yAxisId="left" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${Number(v).toFixed(0)}`} width={50}
+                  label={{ value: 'W / °C', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
                 <YAxis yAxisId="bw" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }}
                   tickFormatter={(v) => {
                     const n = Number(v)
@@ -1977,22 +1990,27 @@ function NpuDetailCard({
                     return n.toFixed(0)
                   }}
                   width={58}
-                  label={{ value: 'MiB/s', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: -4 }} />
+                  label={{ value: 'MiB/s', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: 10 }} />
                 <Tooltip
                   contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
                   formatter={(val: unknown, name: string) => {
                     const n = typeof val === 'number' ? val : null
                     if (n === null) return ['—', name]
-                    return name.includes('BW') ? [`${n.toFixed(2)} MiB/s`, name] : [`${n.toFixed(2)} W`, name]
+                    if (name.includes('BW')) return [`${n.toFixed(2)} MiB/s`, name]
+                    if (name.includes('Temperature')) return [`${n.toFixed(1)} °C`, name]
+                    return [`${n.toFixed(2)} W`, name]
                   }}
                   labelFormatter={() => ''}
                 />
-                <Line yAxisId="power" type="monotone" dataKey="npuPower" name="NPU Power W"
+                <Line yAxisId="left" type="monotone" dataKey="npuPower" name="NPU Power W"
                   stroke={'#4cc9f0'} dot={false} strokeWidth={2} isAnimationActive={false}
                   hide={hidden.has('npuPower')} />
                 <Line yAxisId="bw" type="monotone" dataKey="ddrBw" name="DDR BW MiB/s"
                   stroke={'#cbd5e1'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false}
                   hide={hidden.has('ddrBw')} />
+                <Line yAxisId="left" type="monotone" dataKey="npuTemp" name="Temperature °C"
+                  stroke={'#f94144'} dot={false} strokeWidth={2} isAnimationActive={false}
+                  hide={hidden.has('npuTemp')} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -2256,8 +2274,10 @@ function GpuDeviceCard({
                   <LineChart data={data} margin={{ top: 2, right: 4, left: 0, bottom: 16 }}>
                     <CartesianGrid stroke={`${COLORS.border}55`} strokeDasharray="3 3" />
                     <XAxis dataKey="i" ticks={[0, data.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
-                    <YAxis yAxisId="pct" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={36} />
-                    <YAxis yAxisId="mhz" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}`} width={48} />
+                    <YAxis yAxisId="pct" domain={[0, 100]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}%`} width={44}
+                      label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
+                    <YAxis yAxisId="mhz" orientation="right" domain={[0, (max: number) => Math.max(max, 1)]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v) => `${v}`} width={56}
+                      label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10, offset: 10 }} />
                     <Tooltip
                       contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
                       formatter={(val: unknown, name: string) => {
@@ -2325,7 +2345,8 @@ function GpuDeviceCard({
                   <LineChart data={data} margin={{ top: 2, right: 8, left: 0, bottom: 16 }}>
                     <CartesianGrid stroke={`${COLORS.border}55`} strokeDasharray="3 3" />
                     <XAxis dataKey="i" ticks={[0, data.length - 1]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(val: number) => val === 0 ? `-${trendWindow}` : 'now'} />
-                    <YAxis domain={[0, (max: number) => Math.ceil(Math.max(max, 1))]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v: number) => `${Number(v.toFixed(1))}W`} width={44} />
+                    <YAxis domain={[0, (max: number) => Math.ceil(Math.max(max, 1))]} tick={{ fill: COLORS.textMuted, fontSize: 10 }} tickFormatter={(v: number) => `${Number(v.toFixed(1))}W`} width={52}
+                      label={{ value: 'W', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 10, offset: 14 }} />
                     <Tooltip
                       contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: 11 }}
                       formatter={(val: unknown, name: string) => {
@@ -3269,8 +3290,11 @@ export default function SystemOverview({ active }: Props) {
             subtitle={npuSnapshotMeta}
             details={[
               { label: 'Util', value: formatPercent(npuUtilValue), source: 'dynamic' },
-              { label: 'Power', value: npuParsed?.power_w != null ? `${(npuParsed.power_w as number).toFixed(2)} W` : 'N/A', source: 'dynamic' },
+              ...(npuParsed?.pmt_available !== false
+                ? [{ label: 'Power', value: npuParsed?.power_w != null ? `${(npuParsed.power_w as number).toFixed(2)} W` : 'N/A', source: 'dynamic' as DataSourceKind }]
+                : []),
               { label: 'Freq', value: npuParsed?.frequency_mhz != null ? `${Math.round(npuParsed.frequency_mhz as number)} MHz` : 'N/A', source: 'dynamic' },
+              { label: 'Memory Used', value: npuParsed?.memory_bytes != null ? `${((npuParsed.memory_bytes as number) / (1024 * 1024)).toFixed(2)} MB` : 'N/A', source: 'dynamic' },
             ]}
             compact
             centerBody

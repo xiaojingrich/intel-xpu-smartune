@@ -248,9 +248,9 @@ const ENGINE_CURVE_META: Array<{ key: EngineKey; name: string; color: string }> 
   { key: 'bcs', name: 'BCS %', color: '#ff6b9d' },
 ]
 
-const P_CORE_COLORS = ['#ff6b6b', '#ff9f43', '#feca57', '#ff6348', '#ee5a24', '#f0932b', '#eb4d4b', '#f39c12']
-const E_CORE_COLORS = ['#54a0ff', '#48dbfb', '#0abde3', '#10ac84', '#2ed573', '#7bed9f', '#70a1ff', '#5352ed', '#6c5ce7', '#00cec9', '#55efc4', '#74b9ff', '#a29bfe', '#81ecec', '#00b894', '#5f27cd']
-const LPE_CORE_COLORS = ['#c7a8ff', '#b19cd9', '#9b7ede', '#8e7cc3', '#b4a5e8', '#d4b8ff', '#a78bff', '#c9a0dc']
+const P_CORE_COLORS = ['#ff7f00', '#ffd700', '#a65628', '#d4a017', '#ffa500', '#b8860b', '#cd853f', '#daa520']
+const E_CORE_COLORS = ['#377eb8', '#4daf4a', '#17becf', '#1e90ff', '#00ced1', '#7cfc00', '#20b2aa', '#2e8b57', '#4682b4', '#32cd32', '#00ffff', '#008b8b', '#6495ed', '#7fffd4', '#00fa9a', '#87ceeb']
+const LPE_CORE_COLORS = ['#984ea3', '#f781bf', '#ba55d3', '#e879f9', '#9370db', '#ff69b4', '#c71585', '#dda0dd']
 
 const SECTION_OPTIONS = [
   { label: 'System Pressure', value: 'pressure' },
@@ -813,8 +813,13 @@ function ConfigurableChart<T extends { timestamp: string }>({
     return `${n}`
   }
 
-  const leftDomain: [number, string | number] | undefined = leftUnit === '%' ? [0, 100] : undefined
-  const rightDomain: [number, string | number] | undefined = rightUnit === '%' ? [0, 100] : undefined
+  const domainFor = (unit: string | null): [number, string | number] | undefined => {
+    if (!unit) return undefined
+    if (unit === '%') return [0, 100]
+    return [0, 'auto']
+  }
+  const leftDomain = domainFor(leftUnit)
+  const rightDomain = domainFor(rightUnit)
 
   // Build a colour map keyed by series key for the hover panel
   const colorByKey = useMemo(() => {
@@ -888,9 +893,8 @@ function ConfigurableChart<T extends { timestamp: string }>({
                 fontSize: 10,
                 letterSpacing: '0.02em',
               }}>
-                {on ? '' : '+ '}{s.name}
+                {on ? '' : '+ '}{s.name} {s.unit}
               </span>
-              <span style={{ color: COLORS.textMuted, fontSize: 9, opacity: 0.7 }}>({s.unit})</span>
             </span>
           )
         })}
@@ -905,7 +909,7 @@ function ConfigurableChart<T extends { timestamp: string }>({
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
               data={data}
-              margin={{ top: 4, right: rightUnit ? 20 : 8, left: 0, bottom: 0 }}
+              margin={{ top: 4, right: rightUnit ? 32 : 16, left: 16, bottom: 0 }}
               onMouseMove={hoverPanel ? handleMouseMove : undefined}
               onMouseLeave={hoverPanel ? handleMouseLeave : undefined}
             >
@@ -921,6 +925,8 @@ function ConfigurableChart<T extends { timestamp: string }>({
                 domain={leftDomain}
                 tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                 tickFormatter={unitFormat(leftUnit)}
+                width={64}
+                label={{ value: leftUnit, angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 12, fontWeight: 600, dy: -4 }}
               />
               {rightUnit && (
                 <YAxis
@@ -929,6 +935,8 @@ function ConfigurableChart<T extends { timestamp: string }>({
                   domain={rightDomain}
                   tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                   tickFormatter={unitFormat(rightUnit)}
+                  width={64}
+                  label={{ value: rightUnit, angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 12, fontWeight: 600, dy: -4 }}
                 />
               )}
               {!hoverPanel && (
@@ -950,7 +958,7 @@ function ConfigurableChart<T extends { timestamp: string }>({
                   type="monotone"
                   yAxisId={s.yAxisId}
                   dataKey={s.key}
-                  name={s.name}
+                  name={`${s.name} ${s.unit}`}
                   stroke={s.color}
                   strokeDasharray={s.dasharray}
                   dot={false}
@@ -1076,11 +1084,15 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
               domain={[0, 100]}
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
               tickFormatter={(val: string | number) => `${val}%`}
+              width={52}
+              label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
             />
             <YAxis
               yAxisId="freq"
               orientation="right"
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
+              width={56}
+              label={{ value: 'MHz', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 11, offset: 10 }}
             />
             <Tooltip
               contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
@@ -1136,6 +1148,8 @@ function GpuHistoryCard({ series }: { series: GpuTrendSeries }) {
             <YAxis
               tick={{ fill: COLORS.textMuted, fontSize: 11 }}
               tickFormatter={(val: string | number) => `${val}W`}
+              width={56}
+              label={{ value: 'W', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
             />
             <Tooltip
               contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
@@ -1487,6 +1501,10 @@ export default function HistoryDashboard({ active }: Props) {
   }, [dynamicItems])
 
   const hasNpuData = useMemo(() => npuTrendPoints.some((p) => p.npuUtilization != null || p.npuFreqMhz != null || p.npuTemperatureC != null), [npuTrendPoints])
+  const hasNpuPmtData = useMemo(
+    () => npuTrendPoints.some((p) => p.npuPowerW != null || p.npuDdrBwMib != null || p.npuTemperatureC != null),
+    [npuTrendPoints],
+  )
 
   const [pressureHidden, setPressureHidden] = useState<Set<string>>(new Set())
   const togglePressure = useCallback((key: string) => {
@@ -2048,6 +2066,8 @@ export default function HistoryDashboard({ active }: Props) {
                       domain={[0, 100]}
                       tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                       tickFormatter={(val: string | number) => `${val}%`}
+                      width={52}
+                      label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
                     />
                     <Tooltip
                       contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
@@ -2166,6 +2186,8 @@ export default function HistoryDashboard({ active }: Props) {
                         domain={[0, 100]}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => `${val}%`}
+                        width={52}
+                        label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
                       />
                       <YAxis
                         yAxisId="bw"
@@ -2173,7 +2195,8 @@ export default function HistoryDashboard({ active }: Props) {
                         domain={bwDomain}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
-                        label={{ value: 'MB/s', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
+                        width={56}
+                        label={{ value: 'MB/s', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 11, offset: 10 }}
                       />
                       <Tooltip
                         contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
@@ -2254,6 +2277,8 @@ export default function HistoryDashboard({ active }: Props) {
                         domain={[0, 100]}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => `${val}%`}
+                        width={52}
+                        label={{ value: '%', angle: -90, position: 'insideLeft', fill: COLORS.textMuted, fontSize: 11, offset: 14 }}
                       />
                       <YAxis
                         yAxisId="bw"
@@ -2261,7 +2286,8 @@ export default function HistoryDashboard({ active }: Props) {
                         domain={bwDomain}
                         tick={{ fill: COLORS.textMuted, fontSize: 11 }}
                         tickFormatter={(val: string | number) => typeof val === 'number' ? val.toFixed(1) : `${val}`}
-                        label={{ value: 'Mbps', angle: -90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 10 }}
+                        width={56}
+                        label={{ value: 'Mbps', angle: 90, position: 'insideRight', fill: COLORS.textMuted, fontSize: 11, offset: 10 }}
                       />
                       <Tooltip
                         contentStyle={{ background: COLORS.panelBg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
@@ -2307,28 +2333,34 @@ export default function HistoryDashboard({ active }: Props) {
               { key: 'npuFreqMhz', name: 'Frequency', color: '#7ae582', unit: 'MHz', dasharray: '6 4' },
             ]}
           />
+          {hasNpuPmtData && (
+            <ConfigurableChart
+              title="NPU — Power, DDR Bandwidth & Temperature"
+              storageKey="history-npu-power-bw-temp"
+              data={npuTrendPoints}
+              height={240}
+              showBrush
+              allSeries={[
+                { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W' },
+                { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
+                { key: 'npuTemperatureC', name: 'Temperature', color: '#f94144', unit: '°C' },
+              ]}
+            />
+          )}
           <ConfigurableChart
-            title="NPU — Power & DDR Bandwidth"
-            storageKey="history-npu-power-bw"
+            title={hasNpuPmtData ? 'NPU — Memory Used & Tiles' : 'NPU — Memory Used'}
+            storageKey="history-npu-mem-tiles"
             data={npuTrendPoints}
             height={240}
             showBrush
-            allSeries={[
-              { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W' },
-              { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
-            ]}
-          />
-          <ConfigurableChart
-            title="NPU — Temperature, Memory & Tiles"
-            storageKey="history-npu-misc"
-            data={npuTrendPoints}
-            height={240}
-            showBrush
-            allSeries={[
-              { key: 'npuTemperatureC', name: 'Temperature', color: '#f94144', unit: '°C' },
-              { key: 'npuMemoryMb', name: 'Memory', color: '#56c8d8', unit: 'MB', dasharray: '5 3', defaultOn: false },
-              { key: 'npuTileCount', name: 'Tiles', color: '#b877db', unit: 'tiles', defaultOn: false },
-            ]}
+            allSeries={hasNpuPmtData
+              ? [
+                  { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },
+                  { key: 'npuTileCount', name: 'Tiles', color: '#b877db', unit: 'tiles', dasharray: '5 3', defaultOn: false },
+                ]
+              : [
+                  { key: 'npuMemoryMb', name: 'Memory Used', color: '#56c8d8', unit: 'MB' },
+                ]}
           />
         </>
       )}

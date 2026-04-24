@@ -91,7 +91,17 @@ def get_npu_freq_bounds() -> Dict[str, Dict[str, Optional[float]]]:
     return result
 
 
-def _collect_npu_smi_once() -> Dict[str, Any]:
+def _read_int_file(path: str) -> Optional[int]:
+    raw_text = safe_read(path)
+    if not raw_text:
+        return None
+    try:
+        return int(raw_text.strip())
+    except ValueError:
+        return None
+
+
+def _collect_npu_smi_once(include_processes: bool = False) -> Dict[str, Any]:
     driver_path = "/sys/bus/pci/drivers/intel_vpu/"
     debugfs_root = "/sys/kernel/debug/accel/"
     if not os.path.exists(driver_path):
@@ -116,40 +126,53 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
     if dev_path is None:
         return {"available": False, "raw": None, "error": "No Intel NPU PCI device found"}
 
+    telemetry: Optional[PmtTelemetry] = None
+    pmt_error: Optional[str] = None
     try:
         telemetry = PmtTelemetry()
     except (SystemExit, RuntimeError) as exc:
-        return {"available": False, "raw": None, "error": f"PmtTelemetry init failed: {exc}"}
+        pmt_error = f"PmtTelemetry init failed: {exc}"
     except Exception as exc:
-        return {"available": False, "raw": None, "error": f"PmtTelemetry init failed: {exc}"}
+        pmt_error = f"PmtTelemetry init failed: {exc}"
+    if pmt_error:
+        logger.debug(pmt_error)
 
     npu_busy_path = os.path.join(dev_path, "npu_busy_time_us")
 
     def read_busy_time() -> Optional[int]:
         if not os.path.exists(npu_busy_path):
             return None
-        raw_text = safe_read(npu_busy_path)
-        if not raw_text:
-            return None
-        try:
-            return int(raw_text)
-        except ValueError:
-            return None
+        return _read_int_file(npu_busy_path)
 
     interval_ms = 200.0
-    telemetry.update_buffer()
     busy_start = read_busy_time()
     t_start = time.monotonic()
-    energy_start = telemetry.get_npu_energy()
-    bandwidth_start = telemetry.get_noc_bandwidth()
+
+    energy_start: Optional[float] = None
+    bandwidth_start: Optional[float] = None
+    if telemetry is not None:
+        telemetry.update_buffer()
+        energy_start = telemetry.get_npu_energy()
+        bandwidth_start = telemetry.get_noc_bandwidth()
 
     time.sleep(interval_ms * 1e-3)
 
-    telemetry.update_buffer()
     busy_end = read_busy_time()
     t_end = time.monotonic()
-    energy_end = telemetry.get_npu_energy()
-    bandwidth_end = telemetry.get_noc_bandwidth()
+
+    energy_end: Optional[float] = None
+    bandwidth_end: Optional[float] = None
+    freq_mhz: Optional[float] = None
+    tile_config: Optional[int] = None
+    temperature_c: Optional[float] = None
+    if telemetry is not None:
+        telemetry.update_buffer()
+        energy_end = telemetry.get_npu_energy()
+        bandwidth_end = telemetry.get_noc_bandwidth()
+        raw_freq = telemetry.get_freq()
+        freq_mhz = raw_freq * 1000 / 2 if raw_freq is not None else None
+        tile_config = telemetry.get_tile_config()
+        temperature_c = telemetry.get_npu_temperature()
 
     utilization_percent: Optional[float] = None
     if busy_start is not None and busy_end is not None:
@@ -162,47 +185,49 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
     if energy_start is not None and energy_end is not None:
         power_w = (energy_end - energy_start) / (interval_ms * 1e-3)
 
-    memory_bytes: Optional[int] = None
-    memory_path = os.path.join(dev_path, "npu_memory_utilization")
-    try:
-        with open(memory_path, "r", encoding="utf-8") as f:
-            memory_raw = f.read().strip()
-        if memory_raw:
-            try:
-                memory_bytes = int(memory_raw)
-            except ValueError:
-                memory_bytes = None
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        logger.debug("Read failed for %s: %s", memory_path, exc)
+    noc_bandwidth: Optional[float] = None
+    if bandwidth_start is not None and bandwidth_end is not None:
+        noc_bandwidth = round(bandwidth_end - bandwidth_start, 6)
+
+    memory_bytes = _read_int_file(os.path.join(dev_path, "npu_memory_utilization"))
+    current_freq_mhz = _read_int_file(os.path.join(dev_path, "npu_current_frequency_mhz"))
+    max_freq_mhz = _read_int_file(os.path.join(dev_path, "npu_max_frequency_mhz"))
+
+    if freq_mhz is None and current_freq_mhz is not None:
+        freq_mhz = float(current_freq_mhz)
 
     fw_version = safe_read(os.path.join(debugfs_path, "fw_version")) if debugfs_path else None
     pciid = safe_read(os.path.join(dev_path, "device"))
     module_version = safe_read(os.path.join(driver_path, "module", "version"))
     driver_version = module_version.split(" ")[0] if module_version else None
 
-    processes = []
-    if dev_file:
+    processes: List[Dict[str, Any]] = []
+    if include_processes and dev_file:
         try:
             processes = get_npu_processes(dev_file)
-        except Exception:
-            processes = []
+        except Exception as exc:
+            logger.debug("get_npu_processes failed: %s", exc)
 
-    payload = {
+    payload: Dict[str, Any] = {
         "timestamp": int(time.time()),
         "pciid": pciid,
         "driver_version": driver_version,
         "fw_version": fw_version,
         "utilization_percent": round(utilization_percent, 3) if utilization_percent is not None else None,
-        "power_w": round(power_w, 6) if power_w is not None else None,
-        "frequency_mhz": telemetry.get_freq(),
-        "tile_config": telemetry.get_tile_config(),
-        "temperature_c": telemetry.get_npu_temperature(),
-        "noc_bandwidth_mib_per_s": round(bandwidth_end - bandwidth_start, 6),
+        "frequency_mhz": freq_mhz,
+        "current_frequency_mhz": current_freq_mhz,
+        "max_frequency_mhz": max_freq_mhz,
         "memory_bytes": memory_bytes,
+        "pmt_available": telemetry is not None,
+        "pmt_error": pmt_error,
         "processes": processes,
     }
+
+    if telemetry is not None:
+        payload["power_w"] = round(power_w, 6) if power_w is not None else None
+        payload["tile_config"] = tile_config
+        payload["temperature_c"] = temperature_c
+        payload["noc_bandwidth_mib_per_s"] = noc_bandwidth
 
     return {
         "available": True,
@@ -211,8 +236,35 @@ def _collect_npu_smi_once() -> Dict[str, Any]:
     }
 
 
-def get_intel_npu_smi_output() -> Dict[str, Any]:
+def get_intel_npu_smi_output(include_processes: bool = False) -> Dict[str, Any]:
     try:
-        return _collect_npu_smi_once()
+        return _collect_npu_smi_once(include_processes=include_processes)
     except Exception as exc:
         return {"available": False, "raw": None, "error": f"Failed to collect NPU metrics: {exc}"}
+
+
+def get_intel_npu_processes() -> List[Dict[str, Any]]:
+    """Standalone helper to probe NPU processes on demand.
+
+    Not called by the default overview collection; invoke explicitly when
+    per-process NPU info is needed.
+    """
+    driver_path = "/sys/bus/pci/drivers/intel_vpu/"
+    if not os.path.exists(driver_path):
+        return []
+    for entry in os.listdir(driver_path):
+        if not entry.startswith("0000:"):
+            continue
+        accel_path = os.path.join(driver_path, entry, "accel")
+        if not os.path.exists(accel_path):
+            return []
+        accel_entries = os.listdir(accel_path)
+        if not accel_entries:
+            return []
+        dev_file = os.path.join("/dev/accel", accel_entries[0])
+        try:
+            return get_npu_processes(dev_file)
+        except Exception as exc:
+            logger.debug("get_npu_processes failed: %s", exc)
+            return []
+    return []
