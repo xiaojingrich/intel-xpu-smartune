@@ -10,7 +10,6 @@ from subprocess import check_output # nosec
 from typing import Optional
 
 from utils.logger import logger
-from utils import app_utils
 from config.config import b_config
 
 class Controller:
@@ -166,6 +165,47 @@ class Controller:
             result = subprocess.run(['systemctl', '--user', 'set-property', '--runtime', '%s' % service, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
+    def _find_cgroup_dir(self, unit_name: str) -> Optional[str]:
+        """通过 unit 名在 cgroup 挂载点里查找对应目录（与 IOController 一致的做法）"""
+        try:
+            result = subprocess.run(
+                ["find", self.cgroup_mount, "-name", unit_name, "-type", "d"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+            )
+            if result.stdout:
+                first = result.stdout.splitlines()[0].strip()
+                return first or None
+            return None
+        except subprocess.CalledProcessError as e:
+            logger.error(f"find cgroup dir for {unit_name} failed: {e.stderr.strip()}")
+            return None
+
+    def _write_cgroup_file(self, path: str, value: str, label: str, is_restore: bool) -> bool:
+        """通过 sudo 写 cgroup 文件。缺失时：restore 视为幂等良性跳过，非 restore 视为失败。"""
+        if not os.path.exists(path):
+            msg = (f"{os.path.basename(path)} not found at {path}, "
+                   f"controller likely not delegated — skip {label}")
+            if is_restore:
+                logger.warning(msg + " (benign on restore)")
+                return True
+            logger.error(msg)
+            return False
+
+        cmd = f"sudo sh -c 'echo \"{value}\" > {path}'"
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)
+            if r.returncode != 0:
+                logger.error(
+                    f"Write cgroup failed: {label} -> {path} (rc={r.returncode}) "
+                    f"stderr={r.stderr.strip()}"
+                )
+                return False
+            logger.debug(f"Applied {label} -> {path} = {value!r}")
+            return True
+        except Exception as e:
+            logger.error(f"Exception writing {label} to {path}: {e}")
+            return False
+
     def _set_resource_quota(
             self,
             app_id: str,
@@ -175,13 +215,12 @@ class Controller:
             is_restore: bool = False
     ) -> bool:
         """
-        安全设置资源限制（CPU/内存/IO）
-        :param cpu_quota: CPU百分比（None表示不修改，1-100之间）
-        :param mem_high: 内存软限制（如"500M"，必须大于0）
+        安全设置资源限制（CPU/内存/IO）- 直接写 cgroup v2 文件，不经 systemd/dbus。
+        :param cpu_quota: CPU百分比（None表示不修改，1-100之间，按单核计；实际限额 = cpu_quota * cpus）
+        :param mem_high: 内存软限制（单位 MiB，必须大于0）
         :param io_weight: IO权重（1-10000，默认100）
         :param is_restore: 是否恢复默认值
         """
-        unit_type = "scope"
         # 参数范围检查
         if cpu_quota is not None and not (1 <= cpu_quota <= 100):
             logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. no limit for cpu.")
@@ -195,106 +234,78 @@ class Controller:
             logger.warning(f"Invalid io_weight {io_weight}, no limit for io.")
             io_weight = None
 
-        # If there is nothing to apply (and this is not a restore), skip the systemctl call entirely.
         if not is_restore and cpu_quota is None and mem_high is None and io_weight is None:
             return True
 
+        # 解析 unit 名 → cgroup 目录
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        # logger.debug(f"scopes----------: {scopes}")
-        # logger.debug(f"services--------: {services}")
-
-        # 铁威马系统上service与scope一样的执行cmd，不需要unit_type
-        if app_id.endswith('.scope'):
+        if app_id.endswith('.scope') or app_id.endswith('.service'):
             matching_app = app_id
-            unit_type = 'scope' if matching_app in scopes else 'service'
-        elif app_id.endswith('.service'):
-            matching_app = app_id
-            unit_type = 'service'
         elif app_id.endswith('.desktop'):
             app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
             matching_app = next(
                 (unit for unit in scopes + services if app_base_name in unit.lower()),
                 None
             )
-            unit_type = 'scope' if matching_app in scopes else 'service'
         else:
             matching_app = app_id
-            unit_type = 'scope'
 
         logger.debug(f"matching_app: {matching_app} for app_id: {app_id}")
         if not matching_app:
             logger.warning(f"No matching unit for {app_id}")
             return False
 
-        # 构建限制参数
-        properties = []
-        if not is_restore:
-            if cpu_quota is not None:
-                properties.append(f"CPUQuota={cpu_quota * self.cpus}%")
-            else:
-                properties.append("CPUQuota=")
-            if mem_high is not None:
-                properties.append(f"MemoryHigh={mem_high}M")
-            else:
-                properties.append("MemoryHigh=")
-            if io_weight is not None:
-                properties.append(f"IOWeight={io_weight}")
-            else:
-                properties.append("IOWeight=")
-        else:
-            # 恢复时清除所有限制
-            properties.extend([
-                "CPUQuota=",
-                "MemoryHigh=",
-                "IOWeight="
-            ])
-
-        # 执行命令
-        try:
-            dbus_address = app_utils.get_dbus_address()
-            if not dbus_address:
-                raise Exception("无法获取DBus会话地址")
-
-            # TOS的系统上默认user由管理员权限，如果用sudo需要，sudo -u @user python BalancerService.py运行，不然把sudo去掉运行
-            # ['sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(), 'systemctl', 'set-property', '--runtime', matching_app]
-
-            if getattr(self.config, "vendor", "") == "generic":
-                cmd_base = (
-                    ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
-                    if unit_type == 'scope' else
-                    [
-                        'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
-                        f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
-                        'systemctl', '--user', 'set-property', '--runtime', matching_app
-                    ]
-                )
-            else:
-                cmd_base = (
-                    ['systemctl', 'set-property', '--runtime', matching_app]
-                )
-
-            cmd = cmd_base + properties
-            # logger.debug(f"Executing command: {' '.join(cmd)}")
-
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True,
-                env={"DBUS_SESSION_BUS_ADDRESS": dbus_address}
-            )
-            logger.debug(f"Executed result: {result}")
-            if result.returncode == 0:
-                return True
-            else:
-                logger.error(f"Failed to set resource for {matching_app}")
-                return False
-        except Exception as e:
-            logger.error(f"Set resource failed: {str(e)}")
+        cgroup_dir = self._find_cgroup_dir(matching_app)
+        if not cgroup_dir:
+            logger.warning(f"Cannot locate cgroup dir for {matching_app}")
             return False
+
+        # 组装需要写入的 (file, value, label)
+        # cpu.max 格式: "<quota_us> <period_us>"；period 固定 100000us；unlimited = "max 100000"
+        # memory.high 格式: 字节数；unlimited = "max"
+        # io.weight 格式: 数字(1-10000)；默认 = "default 100"
+        period_us = 100000
+        writes = []
+
+        if is_restore:
+            writes.append((os.path.join(cgroup_dir, "cpu.max"),    f"max {period_us}", "CPUQuota="))
+            writes.append((os.path.join(cgroup_dir, "memory.high"), "max",              "MemoryHigh="))
+            writes.append((os.path.join(cgroup_dir, "io.weight"),   "default 100",      "IOWeight="))
+        else:
+            if cpu_quota is not None:
+                total_pct = cpu_quota * self.cpus
+                quota_us = int(period_us * total_pct / 100)
+                writes.append((os.path.join(cgroup_dir, "cpu.max"),
+                               f"{quota_us} {period_us}",
+                               f"CPUQuota={total_pct}%"))
+            else:
+                writes.append((os.path.join(cgroup_dir, "cpu.max"),
+                               f"max {period_us}", "CPUQuota="))
+
+            if mem_high is not None:
+                mem_bytes = int(mem_high) * 1024 * 1024
+                writes.append((os.path.join(cgroup_dir, "memory.high"),
+                               str(mem_bytes),
+                               f"MemoryHigh={mem_high}M"))
+            else:
+                writes.append((os.path.join(cgroup_dir, "memory.high"),
+                               "max", "MemoryHigh="))
+
+            if io_weight is not None:
+                writes.append((os.path.join(cgroup_dir, "io.weight"),
+                               str(io_weight),
+                               f"IOWeight={io_weight}"))
+            else:
+                writes.append((os.path.join(cgroup_dir, "io.weight"),
+                               "default 100", "IOWeight="))
+
+        success = True
+        for path, value, label in writes:
+            if not self._write_cgroup_file(path, value, label, is_restore):
+                success = False
+        return success
 
     # cpu
     def set_cpu_quota(self, app_id: str, cpu_quota: int, is_restore: bool = False):
