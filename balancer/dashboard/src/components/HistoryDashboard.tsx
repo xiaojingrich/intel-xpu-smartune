@@ -1265,7 +1265,7 @@ function CpuPerCoreHistoryCard({ info }: { info: CpuPerCoreInfo }) {
   // Temperature chart: Package + per-core temps (P/E/LPE labeled), skip cores with no data
   const tempSeries: SeriesConfig[] = useMemo(() => {
     const series: SeriesConfig[] = [
-      { key: 'pkgTemp', name: 'Package', color: '#f94144', unit: '°C' },
+      { key: 'pkgTemp', name: 'Package', color: '#fbbf24', unit: '°C' },
     ]
     pCoreIndices.forEach((logIdx, i) => {
       if (coresWithTemp.has(logIdx)) {
@@ -2126,7 +2126,7 @@ export default function HistoryDashboard({ active }: Props) {
             ...(cpuPerCoreInfo.lpeCoreIndices.length
               ? [{ key: 'lpeCoreFreqMhz', name: 'LPE-Core Freq', color: '#c7a8ff', unit: 'MHz', dasharray: '6 3', defaultOn: false }]
               : []),
-            { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#f94144', unit: '°C', dasharray: '4 2', defaultOn: false },
+            { key: 'cpuTemperatureC', name: 'CPU Temp', color: '#fbbf24', unit: '°C', dasharray: '4 2', defaultOn: false },
           ]}
         />
       )}
@@ -2343,7 +2343,7 @@ export default function HistoryDashboard({ active }: Props) {
               allSeries={[
                 { key: 'npuPowerW', name: 'Power', color: '#4cc9f0', unit: 'W' },
                 { key: 'npuDdrBwMib', name: 'DDR BW', color: '#a78bfa', unit: 'MiB/s', dasharray: '5 3' },
-                { key: 'npuTemperatureC', name: 'Temperature', color: '#f94144', unit: '°C' },
+                { key: 'npuTemperatureC', name: 'Temperature', color: '#fbbf24', unit: '°C' },
               ]}
             />
           )}

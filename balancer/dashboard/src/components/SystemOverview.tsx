@@ -1858,7 +1858,7 @@ function NpuDetailCard({
   const pbItems = [
     { key: 'npuPower', name: 'NPU Power W', color: '#4cc9f0' },
     { key: 'ddrBw', name: 'DDR BW MiB/s', color: '#cbd5e1', dasharray: '5 3' },
-    { key: 'npuTemp', name: 'Temperature °C', color: '#f94144' },
+    { key: 'npuTemp', name: 'Temperature °C', color: '#fbbf24' },
   ]
   const pbMaxLen = Math.max(powerSeries.length, ddrBwSeries.length, tempSeries.length)
   const padPb = (arr: Array<number | null>) => {
@@ -1924,7 +1924,7 @@ function NpuDetailCard({
           if (pmtAvailable) {
             items.push({ key: 'power', label: 'Power', value: isNumber(powerW) ? `${powerW.toFixed(2)} W` : 'N/A', color: '#4cc9f0' })
             items.push({ key: 'bw', label: 'DDR BW', value: isNumber(bandwidthMib) ? `${(bandwidthMib / 1024).toFixed(2)} GB/s` : 'N/A', color: '#cbd5e1' })
-            items.push({ key: 'temp', label: 'Temp', value: isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: '#f94144' })
+            items.push({ key: 'temp', label: 'Temp', value: isNumber(tempC) ? `${tempC.toFixed(0)} °C` : 'N/A', color: '#fbbf24' })
             items.push({ key: 'tile', label: 'Tile Conf', value: tileConfig, color: COLORS.textMuted })
           }
           return items.map((it) => (
@@ -2009,7 +2009,7 @@ function NpuDetailCard({
                   stroke={'#cbd5e1'} strokeDasharray="5 3" dot={false} strokeWidth={2} isAnimationActive={false}
                   hide={hidden.has('ddrBw')} />
                 <Line yAxisId="left" type="monotone" dataKey="npuTemp" name="Temperature °C"
-                  stroke={'#f94144'} dot={false} strokeWidth={2} isAnimationActive={false}
+                  stroke={'#fbbf24'} dot={false} strokeWidth={2} isAnimationActive={false}
                   hide={hidden.has('npuTemp')} />
               </LineChart>
             </ResponsiveContainer>
