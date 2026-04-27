@@ -206,10 +206,12 @@ class ResourceMonitor:
 
         # logger.debug(f"Candidate processes for cgroup aggregation: {candidate_procs}")
         # Step 2: 收集所有不重复的cgroup_path
+        # Exclude '/' (root cgroup): its pids span the entire system process tree, which
+        # would create a spurious "super group" with an artificially high aggregate score.
         cgroup_paths = set()
         for proc in candidate_procs:
             cgroup_path = get_cgroup_path_by_pid(proc['pid'])
-            if cgroup_path:
+            if cgroup_path and cgroup_path != '/':
                 cgroup_paths.add(cgroup_path)
 
         # Step 3: 按 cgroup 聚合进程
@@ -515,6 +517,13 @@ class ResourceMonitor:
             elif isinstance(names, set):
                 names = list(names)
 
+            # When a dominant_name is available (aggregated process groups), restrict name
+            # matching to that single name.  Matching against the full names list risks false
+            # positives: a root-cgroup or terminal-scope group can contain hundreds of process
+            # names (e.g. gnome-calculator) that are unrelated to the actual heavy workload.
+            dominant_name = process_info.get('dominant_name', '')
+            match_names = [dominant_name] if dominant_name else names
+
             for app_id, app in self.desktop_apps.items():
                 try:
                     app_cmd = app.get("cmdline", "")
@@ -527,7 +536,7 @@ class ResourceMonitor:
                         }
 
                     app_name_lower = app.get("name", "").lower()
-                    for proc_name in names:
+                    for proc_name in match_names:
                         if app_name_lower and proc_name and app_name_lower in proc_name.lower():
                             logger.debug(f"try_match_app matched desktop app by name: {app_id}")
                             return {
@@ -628,7 +637,7 @@ class ResourceMonitor:
         """获取disk io占用最高的1个进程及其应用信息"""
         results = []
         processes = self._get_top_processes(n=1, mode="io")
-        logger.debug(f"Top processes: {processes}")
+        logger.debug(f"Top processes(disk io): {processes}")
 
         for process in processes:
             process_name = next(iter(process['names']), "unknown")
