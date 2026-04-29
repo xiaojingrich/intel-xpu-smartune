@@ -1063,11 +1063,13 @@ class DynamicBalancer:
             usage = {}
 
         effective_app_id = os.path.basename(usage.get("cgroup_path", ""))
-        cpu_usage_percent = usage.get("cpu_percent", 0) if usage.get("cpu_percent", 0) > 10 else 0
-        mem_current = usage.get("mem_current", 0)
+        cpu_usage_percent = usage.get("cpu_percent", 0) if usage.get("cpu_percent", 0) >= 10 else 0
+        mem_current = usage.get("mem_current", 0) + usage.get("mem_swap_current", 0)  # RSS + swap = true working set
         io_read_mb = usage.get("io_read_mb", 0)
         io_write_mb = usage.get("io_write_mb", 0)
-        is_io_limit = False if (io_read_mb + io_write_mb) < 100 else True  # 假设100MB/s作为IO压力的阈值
+        io_read_iops = usage.get("io_read_iops", 0)
+        io_write_iops = usage.get("io_write_iops", 0)
+        is_io_limit = (io_read_mb + io_write_mb) >= 100 or (io_read_iops + io_write_iops) >= 1000  # 100MB/s或1000 IOPS
 
         # Set limits based on usage and configured rates
         cpu_quota = int(cpu_usage_percent * limit_rates["cpu_rate"]) if (limit_rates.get("cpu_rate") and
@@ -1084,7 +1086,7 @@ class DynamicBalancer:
             reason = (
                 f"无法检测到 {app_name} 的资源使用情况，跳过限制。请选择其他应用进行限制。"
                 if not usage
-                else f"{app_name} 当前资源使用极低（CPU≤10%，内存≈0，IO<100 MB/s），无需限制。请选择其他应用。"
+                else f"{app_name} 当前资源使用极低（CPU<10%，内存≈0，IO<100 MB/s且<1000 IOPS），无需限制。请选择其他应用。"
             )
             logger.warning(reason)
             app_utils.safe_notify("资源限制跳过", reason, icon="dialog-warning")

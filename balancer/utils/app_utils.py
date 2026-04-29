@@ -489,27 +489,77 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
         # Try app_name first; if that yields nothing, fall back to app_id (e.g. "benchmark.py")
         # so that processes whose argv[0] was renamed (e.g. via perl $0=) are still found.
         pids = get_app_processes(app_name)
+        logger.debug(f"[resource_usage] app_name='{app_name}' -> pids from pgrep: {pids}")
         if not pids and app_id:
-            pids = get_app_processes(os.path.basename(app_id))
+            fallback_name = os.path.basename(app_id)
+            pids = get_app_processes(fallback_name)
+            logger.debug(f"[resource_usage] fallback app_id basename='{fallback_name}' -> pids: {pids}")
         if not pids:
             print(f"No processes found for app {app_name} (ID: {app_id})")
             return {}
 
+        representative_pid = pids[0]
         # Locate the cgroup from the first PID
-        cgroup_path = get_cgroup_path_by_pid(pids[0])
+        cgroup_path = get_cgroup_path_by_pid(representative_pid)
+        logger.debug(
+            f"[resource_usage] representative_pid={representative_pid}, "
+            f"cgroup_path='{cgroup_path}'"
+        )
         if not cgroup_path:
-            print(f"No cgroup found for PID {pids[0]} of app {app_name}")
+            print(f"No cgroup found for PID {representative_pid} of app {app_name}")
             return {}
 
+        # Log the process cmdline for the representative PID to confirm we found the right process
+        try:
+            proc_cmdline = psutil.Process(representative_pid).cmdline()
+            logger.debug(f"[resource_usage] pid={representative_pid} cmdline={proc_cmdline}")
+        except Exception:
+            pass
+
         cgroup_dir = os.path.join(base_cgroup, cgroup_path.lstrip('/'))
+        logger.debug(f"[resource_usage] cgroup_dir='{cgroup_dir}'")
         num_cpus = os.cpu_count() or 1
 
         # --- Instantaneous memory from cgroup memory.current ---
+        cgroup_mem_bytes = 0
+        mem_current_path = os.path.join(cgroup_dir, "memory.current")
         try:
-            with open(os.path.join(cgroup_dir, "memory.current"), 'r') as f:
-                cgroup_mem_bytes = int(f.read().strip())
-        except (FileNotFoundError, IOError, ValueError):
-            cgroup_mem_bytes = 0
+            with open(mem_current_path, 'r') as f:
+                raw = f.read().strip()
+            cgroup_mem_bytes = int(raw)
+            logger.debug(
+                f"[resource_usage] memory.current raw='{raw}' "
+                f"({cgroup_mem_bytes / (1024**2):.2f} MB) from '{mem_current_path}'"
+            )
+        except FileNotFoundError:
+            logger.debug(f"[resource_usage] memory.current NOT FOUND at '{mem_current_path}'")
+        except (IOError, ValueError) as e:
+            logger.debug(f"[resource_usage] memory.current read error: {e}")
+
+        # Also read memory.swap.current (cgroup v2) to see if memory was pushed to swap
+        swap_bytes = 0
+        swap_current_path = os.path.join(cgroup_dir, "memory.swap.current")
+        try:
+            with open(swap_current_path, 'r') as f:
+                swap_raw = f.read().strip()
+            swap_bytes = int(swap_raw)
+            logger.debug(
+                f"[resource_usage] memory.swap.current raw='{swap_raw}' "
+                f"({swap_bytes / (1024**2):.2f} MB) — memory reclaimed to swap"
+            )
+        except FileNotFoundError:
+            logger.debug(f"[resource_usage] memory.swap.current NOT FOUND at '{swap_current_path}'")
+        except (IOError, ValueError) as e:
+            logger.debug(f"[resource_usage] memory.swap.current read error: {e}")
+
+        # Also read memory.high to confirm what limit is currently in effect
+        mem_high_path = os.path.join(cgroup_dir, "memory.high")
+        try:
+            with open(mem_high_path, 'r') as f:
+                mem_high_raw = f.read().strip()
+            logger.debug(f"[resource_usage] memory.high='{mem_high_raw}' (current effective limit)")
+        except Exception:
+            pass
 
         # --- Helpers to sample cumulative cgroup counters ---
         def read_cpu_usage_usec():
@@ -522,29 +572,53 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
                 pass
             return 0
 
-        def read_io_bytes():
-            rbytes, wbytes = 0, 0
+        def read_io_stats(label=""):
+            rbytes, wbytes, rios, wios = 0, 0, 0, 0
+            io_stat_path = os.path.join(cgroup_dir, "io.stat")
             try:
-                with open(os.path.join(cgroup_dir, "io.stat"), 'r') as f:
-                    for line in f:
-                        parts = dict(p.split('=') for p in line.split() if '=' in p)
-                        rbytes += int(parts.get('rbytes', 0))
-                        wbytes += int(parts.get('wbytes', 0))
-            except (FileNotFoundError, IOError, ValueError):
-                pass
-            return rbytes, wbytes
+                with open(io_stat_path, 'r') as f:
+                    raw_lines = f.readlines()
+                if label:
+                    logger.debug(
+                        f"[resource_usage] io.stat ({label}) raw content "
+                        f"(path='{io_stat_path}'): {[l.rstrip() for l in raw_lines]}"
+                    )
+                for line in raw_lines:
+                    parts = dict(p.split('=') for p in line.split() if '=' in p)
+                    rbytes += int(parts.get('rbytes', 0))
+                    wbytes += int(parts.get('wbytes', 0))
+                    rios += int(parts.get('rios', 0))
+                    wios += int(parts.get('wios', 0))
+            except FileNotFoundError:
+                if label:
+                    logger.debug(f"[resource_usage] io.stat NOT FOUND at '{io_stat_path}'")
+            except (IOError, ValueError) as e:
+                if label:
+                    logger.debug(f"[resource_usage] io.stat read error: {e}")
+            return rbytes, wbytes, rios, wios
 
         # Sample CPU and IO over a short window so we get accurate rates
         t1 = time.monotonic()
         cpu_usec1 = read_cpu_usage_usec()
-        io_rbytes1, io_wbytes1 = read_io_bytes()
+        io_rbytes1, io_wbytes1, io_rios1, io_wios1 = read_io_stats(label="sample1")
         time.sleep(0.5)
         t2 = time.monotonic()
         cpu_usec2 = read_cpu_usage_usec()
-        io_rbytes2, io_wbytes2 = read_io_bytes()
+        io_rbytes2, io_wbytes2, io_rios2, io_wios2 = read_io_stats(label="sample2")
 
         elapsed = t2 - t1
         elapsed_usec = elapsed * 1_000_000
+
+        logger.debug(
+            f"[resource_usage] CPU sample: usec1={cpu_usec1}, usec2={cpu_usec2}, "
+            f"delta={cpu_usec2 - cpu_usec1}, elapsed={elapsed:.3f}s, num_cpus={num_cpus}"
+        )
+        logger.debug(
+            f"[resource_usage] IO sample: rbytes1={io_rbytes1}, rbytes2={io_rbytes2}, "
+            f"wbytes1={io_wbytes1}, wbytes2={io_wbytes2}, "
+            f"delta_r={io_rbytes2 - io_rbytes1}, delta_w={io_wbytes2 - io_wbytes1}, "
+            f"delta_rios={io_rios2 - io_rios1}, delta_wios={io_wios2 - io_wios1}"
+        )
 
         cpu_percent = (
             round(max(0.0, cpu_usec2 - cpu_usec1) / (elapsed_usec * num_cpus) * 100, 1)
@@ -552,12 +626,17 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
         )
         io_read_mb_s = round(max(0.0, (io_rbytes2 - io_rbytes1) / elapsed / (1024 ** 2)), 2) if elapsed > 0 else 0.0
         io_write_mb_s = round(max(0.0, (io_wbytes2 - io_wbytes1) / elapsed / (1024 ** 2)), 2) if elapsed > 0 else 0.0
+        io_read_iops = round(max(0.0, (io_rios2 - io_rios1) / elapsed), 1) if elapsed > 0 else 0.0
+        io_write_iops = round(max(0.0, (io_wios2 - io_wios1) / elapsed), 1) if elapsed > 0 else 0.0
         mem_current_mb = round(cgroup_mem_bytes / (1024 ** 2), 2)
+        mem_swap_mb = round(swap_bytes / (1024 ** 2), 2)
 
         all_pids = get_pids_in_cgroup(cgroup_path)
         logger.debug(
             f"Resource usage for {app_name} (ID: {app_id}): CPU={cpu_percent:.1f}%, "
-            f"Memory_current={mem_current_mb:.2f}MB, IO Read={io_read_mb_s:.2f}MB/s, IO Write={io_write_mb_s:.2f}MB/s"
+            f"Memory_current={mem_current_mb:.2f}MB (swap={mem_swap_mb:.2f}MB), "
+            f"IO Read={io_read_mb_s:.2f}MB/s ({io_read_iops:.1f} IOPS), "
+            f"IO Write={io_write_mb_s:.2f}MB/s ({io_write_iops:.1f} IOPS)"
         )
         return {
             'pids': list(all_pids),
@@ -565,8 +644,11 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
             'cgroup_path': cgroup_path,
             'cpu_percent': cpu_percent,
             'mem_current': mem_current_mb,
+            'mem_swap_current': mem_swap_mb,
             'io_read_mb': io_read_mb_s,
             'io_write_mb': io_write_mb_s,
+            'io_read_iops': io_read_iops,
+            'io_write_iops': io_write_iops,
         }
     except Exception as e:
         print(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")

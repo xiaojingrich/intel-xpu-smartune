@@ -63,6 +63,8 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
         return None
 
     total_engine_ns = {}
+    total_engine_cycles = {}        # Xe driver: drm-cycles-<engine>
+    total_engine_total_cycles = {}  # Xe driver: drm-total-cycles-<engine>
     total_mem_bytes = 0
     found = False
     # Use caller-supplied set for cross-PID dedup; fall back to a local set for
@@ -126,6 +128,32 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
                             total_engine_ns[engine] = total_engine_ns.get(engine, 0) + ns
                         except ValueError:
                             pass
+            elif line.startswith('drm-cycles-'):
+                # Xe driver: e.g. 'drm-cycles-render:\t987654321'
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    engine = parts[0][len('drm-cycles-'):].strip()
+                    val_parts = parts[1].strip().split()
+                    if val_parts:
+                        try:
+                            total_engine_cycles[engine] = (
+                                total_engine_cycles.get(engine, 0) + int(val_parts[0])
+                            )
+                        except ValueError:
+                            pass
+            elif line.startswith('drm-total-cycles-'):
+                # Xe driver: e.g. 'drm-total-cycles-render:\t9999999999'
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    engine = parts[0][len('drm-total-cycles-'):].strip()
+                    val_parts = parts[1].strip().split()
+                    if val_parts:
+                        try:
+                            total_engine_total_cycles[engine] = (
+                                total_engine_total_cycles.get(engine, 0) + int(val_parts[0])
+                            )
+                        except ValueError:
+                            pass
 
         # Sum physical memory regions.
         # - kernel >= 5.19: 'drm-total-*'  (e.g. 'drm-total-system:\t531 MiB')
@@ -167,7 +195,12 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
     if not found:
         return None
 
-    return {'engine_ns': total_engine_ns, 'mem_bytes': total_mem_bytes}
+    return {
+        'engine_ns': total_engine_ns,
+        'engine_cycles': total_engine_cycles,
+        'engine_total_cycles': total_engine_total_cycles,
+        'mem_bytes': total_mem_bytes,
+    }
 
 
 
@@ -700,6 +733,8 @@ class ResourceMonitor:
         # contributes to the delta and memory totals.
         seen_t1 = set()
         total_engine_delta = {}
+        total_engine_cycles_delta = {}
+        total_engine_total_cycles_delta = {}
         total_mem_bytes = 0
 
         for pid in pids:
@@ -712,15 +747,40 @@ class ResourceMonitor:
                     ns0 = t0['engine_ns'].get(engine, 0)
                     delta = max(0, ns1 - ns0)
                     total_engine_delta[engine] = total_engine_delta.get(engine, 0) + delta
+                for engine, cy1 in t1['engine_cycles'].items():
+                    cy0 = t0['engine_cycles'].get(engine, 0)
+                    total_engine_cycles_delta[engine] = (
+                        total_engine_cycles_delta.get(engine, 0) + max(0, cy1 - cy0)
+                    )
+                for engine, tc1 in t1['engine_total_cycles'].items():
+                    tc0 = t0['engine_total_cycles'].get(engine, 0)
+                    total_engine_total_cycles_delta[engine] = (
+                        total_engine_total_cycles_delta.get(engine, 0) + max(0, tc1 - tc0)
+                    )
             total_mem_bytes += t1['mem_bytes']
 
-        # Peak engine utilisation
+        # Peak engine utilisation: prefer Xe cycle-based, fall back to i915 time-based
         gpu_util = 0.0
-        for delta_ns in total_engine_delta.values():
+        winning_engine = None
+        for engine, delta_ns in total_engine_delta.items():
             util = (delta_ns / elapsed_ns) * 100
+            logger.debug(f"  [GPU] i915 engine={engine} delta_ns={delta_ns} util={util:.1f}%")
             if util > gpu_util:
                 gpu_util = util
+                winning_engine = engine
+        for engine, delta_cy in total_engine_cycles_delta.items():
+            dtot = total_engine_total_cycles_delta.get(engine, 0)
+            if dtot > 0:
+                util = (delta_cy / dtot) * 100
+                logger.debug(f"  [GPU] Xe engine={engine} delta_cy={delta_cy} total_cy={dtot} util={util:.1f}%")
+                if util > gpu_util:
+                    gpu_util = util
+                    winning_engine = engine
 
+        logger.debug(
+            f"  [GPU] pids={list(pids)} winning_engine={winning_engine} "
+            f"gpu_util={round(min(gpu_util, 100.0), 1)}% mem_mb={round(total_mem_bytes / (1024 * 1024), 1)}"
+        )
         return {
             'gpu_util': round(min(gpu_util, 100.0), 1),
             'gpu_mem_mb': round(total_mem_bytes / (1024 * 1024), 1),
@@ -770,6 +830,8 @@ class ResourceMonitor:
         for cgroup, pids in cgroup_pids.items():
             seen_t1 = set()
             engine_delta = {}
+            engine_cycles_delta = {}
+            engine_total_cycles_delta = {}
             mem_bytes = 0
             for pid in pids:
                 t1 = _read_pid_fdinfo_gpu(pid, seen_t1)
@@ -781,16 +843,42 @@ class ResourceMonitor:
                         ns0 = t0['engine_ns'].get(engine, 0)
                         delta = max(0, ns1 - ns0)
                         engine_delta[engine] = engine_delta.get(engine, 0) + delta
+                    for engine, cy1 in t1['engine_cycles'].items():
+                        cy0 = t0['engine_cycles'].get(engine, 0)
+                        engine_cycles_delta[engine] = (
+                            engine_cycles_delta.get(engine, 0) + max(0, cy1 - cy0)
+                        )
+                    for engine, tc1 in t1['engine_total_cycles'].items():
+                        tc0 = t0['engine_total_cycles'].get(engine, 0)
+                        engine_total_cycles_delta[engine] = (
+                            engine_total_cycles_delta.get(engine, 0) + max(0, tc1 - tc0)
+                        )
                 mem_bytes += t1['mem_bytes']
             gpu_util = 0.0
-            for delta_ns in engine_delta.values():
+            winning_engine = None
+            for engine, delta_ns in engine_delta.items():
                 util = (delta_ns / elapsed_ns) * 100
+                logger.debug(f"  [GPU][{cgroup}] i915 engine={engine} delta_ns={delta_ns} util={util:.1f}%")
                 if util > gpu_util:
                     gpu_util = util
+                    winning_engine = engine
+            for engine, delta_cy in engine_cycles_delta.items():
+                dtot = engine_total_cycles_delta.get(engine, 0)
+                if dtot > 0:
+                    util = (delta_cy / dtot) * 100
+                    logger.debug(f"  [GPU][{cgroup}] Xe engine={engine} delta_cy={delta_cy} total_cy={dtot} util={util:.1f}%")
+                    if util > gpu_util:
+                        gpu_util = util
+                        winning_engine = engine
             gpu_stats_by_cgroup[cgroup] = {
                 'gpu_util': round(min(gpu_util, 100.0), 1),
                 'gpu_mem_mb': round(mem_bytes / (1024 * 1024), 1),
             }
+            logger.debug(
+                f"  [GPU][{cgroup}] winning_engine={winning_engine} "
+                f"gpu_util={gpu_stats_by_cgroup[cgroup]['gpu_util']}% "
+                f"mem_mb={gpu_stats_by_cgroup[cgroup]['gpu_mem_mb']}"
+            )
 
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), 'unknown')
@@ -799,6 +887,11 @@ class ResourceMonitor:
             app_match = self.try_match_app(process)
             app_id = app_match['id'] if app_match else process_name
             app_name = app_match['name'] if app_match else process_name
+            match_type = app_match['type'] if app_match else 'none'
+            logger.debug(
+                f"  [AppName] process={process_name!r} cgroup={process['cgroup']!r} "
+                f"-> app_name={app_name!r} (match_type={match_type})"
+            )
 
             gpu_stats = gpu_stats_by_cgroup.get(process['cgroup'], {'gpu_util': 0.0, 'gpu_mem_mb': 0.0})
 
@@ -826,6 +919,16 @@ class ResourceMonitor:
             key=lambda r: r['score'] + gpu_weight * r['gpu_util'],
             reverse=True
         )
+
+        logger.info("[AppResources] Top %d apps:", len(results))
+        for rank, r in enumerate(results, 1):
+            logger.info(
+                "  #%d app_name=%r process=%r cpu=%.1f%% mem_mb=%.1f "
+                "gpu_util=%.1f%% gpu_mem_mb=%.1f score=%.3f",
+                rank, r['app_name'], r['process_name'],
+                r['cpu_usage'] * 100, r['memory_mb'],
+                r['gpu_util'], r['gpu_mem_mb'], r['score'],
+            )
 
         return results
 
