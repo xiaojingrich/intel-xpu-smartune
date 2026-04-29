@@ -22,34 +22,93 @@ _GPU_DRM_DRIVERS = frozenset({'i915', 'xe'})
 _GPU_SAMPLE_INTERVAL = 0.3  # seconds between the two fdinfo snapshots for GPU utilisation
 
 
+def _parse_fdinfo_mem_bytes(line, is_xe):
+    """Parse a single drm-total-*/drm-memory-* line into bytes, or return 0.
+
+    Handles unit conversion (KiB/MiB/GiB/B) and driver-specific GTT semantics:
+    - xe: GTT regions represent real GPU memory, included.
+    - i915: GTT regions are virtual address-space reservations, excluded.
+    Cycle-counter lines (drm-total-cycles-*) are always excluded.
+    """
+    if not (line.startswith('drm-total-') or line.startswith('drm-memory-')):
+        return 0
+    if not is_xe and '-gtt' in line:
+        return 0
+    if '-cycles-' in line:
+        return 0
+    parts = line.split(':', 1)
+    if len(parts) != 2:
+        return 0
+    val_parts = parts[1].strip().split()
+    if len(val_parts) < 2:
+        return 0
+    try:
+        value = int(val_parts[0])
+        unit = val_parts[1].upper()
+        if unit in ('KIB', 'KI', 'K', 'KB'):
+            value *= 1024
+        elif unit in ('MIB', 'MI', 'M', 'MB'):
+            value *= 1024 * 1024
+        elif unit in ('GIB', 'GI', 'G', 'GB'):
+            value *= 1024 * 1024 * 1024
+        elif unit != 'B':
+            return 0
+        return value
+    except (ValueError, IndexError):
+        return 0
+
+
+def _parse_fdinfo_engines(content):
+    """Parse engine utilization fields from fdinfo content.
+
+    Returns a dict ``{engine_name: {"cycles": int, "total_cycles": int, "time_ns": int}}``.
+    Uses the same data model as gpu_monitor.scan_drm_fdinfo_clients:
+    - xe driver reports ``drm-cycles-*`` / ``drm-total-cycles-*`` (cycle counts).
+    - i915 driver reports ``drm-engine-*`` (nanoseconds).
+    Both are stored per engine so callers can compute utilization uniformly.
+    """
+    engines = {}
+
+    def _ensure(name):
+        if name not in engines:
+            engines[name] = {"cycles": 0, "total_cycles": 0, "time_ns": 0}
+
+    for line in content.splitlines():
+        parts = line.split(':', 1)
+        if len(parts) < 2:
+            continue
+        key, val = parts[0].strip(), parts[1].strip()
+
+        if key.startswith('drm-engine-'):
+            eng = key[len('drm-engine-'):]
+            _ensure(eng)
+            try:
+                engines[eng]["time_ns"] = int(val.split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif key.startswith('drm-total-cycles-'):
+            eng = key[len('drm-total-cycles-'):]
+            _ensure(eng)
+            try:
+                engines[eng]["total_cycles"] = int(val)
+            except ValueError:
+                pass
+        elif key.startswith('drm-cycles-'):
+            eng = key[len('drm-cycles-'):]
+            _ensure(eng)
+            try:
+                engines[eng]["cycles"] = int(val)
+            except ValueError:
+                pass
+
+    return engines
+
+
 def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
     """Read Intel GPU DRM engine times and memory from /proc/<pid>/fdinfo.
 
-    Scans all file descriptors of the given process for DRM handles backed by an
-    Intel GPU driver (i915 or xe).  For each matching fd, it accumulates:
-
-    * ``engine_ns`` - a ``{engine_name: cumulative_nanoseconds}`` dict with the
-      per-engine busy time reported by the kernel via ``drm-engine-*`` fields.
-    * ``mem_bytes`` - total GPU memory in bytes from physical memory regions.
-
-    Memory and engine time are read from ``drm-total-*`` / ``drm-engine-*`` fields
-    (kernel >= 5.19) or the legacy ``drm-memory-*`` fields (kernel < 5.19).  GTT
-    regions are excluded because they represent virtual address-space reservations
-    rather than physical memory allocations.  Unitless ``drm-total-cycles-*``
-    entries emitted by the Xe driver are ignored (they are cycle counters, not
-    memory values).
-
-    Args:
-        pid: Process ID to inspect.
-        seen_client_ids: Optional mutable set shared across multiple calls.
-            When provided, any DRM client that was already counted (e.g. because
-            another PID in the same cgroup inherited the same GPU fd) is skipped
-            for both engine times and memory, preventing cross-PID
-            double-counting.  Pass the same set for all PIDs belonging to one
-            application group.
-
-    Returns a dict ``{"engine_ns": {...}, "mem_bytes": int}`` when the process
-    holds at least one Intel GPU fd, or ``None`` otherwise.
+    Returns ``{"engines": {name: {cycles, total_cycles, time_ns}}, "mem_bytes": int}``
+    when the process holds at least one Intel GPU fd, or ``None`` otherwise.
     """
     fd_dir = f'/proc/{pid}/fd'
     fdinfo_dir = f'/proc/{pid}/fdinfo'
@@ -62,17 +121,12 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
     except (OSError, PermissionError):
         return None
 
-    total_engine_ns = {}
-    total_engine_cycles = {}        # Xe driver: drm-cycles-<engine>
-    total_engine_total_cycles = {}  # Xe driver: drm-total-cycles-<engine>
+    all_engines = {}
     total_mem_bytes = 0
     found = False
-    # Use caller-supplied set for cross-PID dedup; fall back to a local set for
-    # intra-PID dedup (multiple fds pointing to the same DRM context).
     _seen = seen_client_ids if seen_client_ids is not None else set()
 
     for fd_name in fd_entries:
-        # Only consider DRM render/card nodes
         try:
             link = os.readlink(os.path.join(fd_dir, fd_name))
             if '/dev/dri/' not in link:
@@ -87,7 +141,6 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
         except (OSError, PermissionError):
             continue
 
-        # Parse driver and client-id before deciding what to do
         driver = None
         client_id = None
         for line in fdinfo_content.splitlines():
@@ -104,103 +157,43 @@ def _read_pid_fdinfo_gpu(pid, seen_client_ids=None):
 
         found = True
 
-        # De-duplicate by client-id BEFORE accumulating anything.
-        # A process can open both card and render nodes for the same GPU context;
-        # each fd reports identical engine times and memory for that context, so
-        # counting more than once inflates both utilisation and memory.
-        # With a shared seen_client_ids set, child processes that inherited the
-        # same DRM fd from the parent are also skipped.
         if client_id is not None:
             if client_id in _seen:
                 continue
             _seen.add(client_id)
 
-        for line in fdinfo_content.splitlines():
-            if line.startswith('drm-engine-'):
-                # e.g. 'drm-engine-render:\t123456789 ns'
-                parts = line.split(':', 1)
-                if len(parts) == 2:
-                    engine = parts[0][len('drm-engine-'):].strip()
-                    val_parts = parts[1].strip().split()
-                    if val_parts:
-                        try:
-                            ns = int(val_parts[0])
-                            total_engine_ns[engine] = total_engine_ns.get(engine, 0) + ns
-                        except ValueError:
-                            pass
-            elif line.startswith('drm-cycles-'):
-                # Xe driver: e.g. 'drm-cycles-render:\t987654321'
-                parts = line.split(':', 1)
-                if len(parts) == 2:
-                    engine = parts[0][len('drm-cycles-'):].strip()
-                    val_parts = parts[1].strip().split()
-                    if val_parts:
-                        try:
-                            total_engine_cycles[engine] = (
-                                total_engine_cycles.get(engine, 0) + int(val_parts[0])
-                            )
-                        except ValueError:
-                            pass
-            elif line.startswith('drm-total-cycles-'):
-                # Xe driver: e.g. 'drm-total-cycles-render:\t9999999999'
-                parts = line.split(':', 1)
-                if len(parts) == 2:
-                    engine = parts[0][len('drm-total-cycles-'):].strip()
-                    val_parts = parts[1].strip().split()
-                    if val_parts:
-                        try:
-                            total_engine_total_cycles[engine] = (
-                                total_engine_total_cycles.get(engine, 0) + int(val_parts[0])
-                            )
-                        except ValueError:
-                            pass
+        is_xe = (driver == 'xe')
 
-        # Sum physical memory regions.
-        # - kernel >= 5.19: 'drm-total-*'  (e.g. 'drm-total-system:\t531 MiB')
-        # - kernel <  5.19: 'drm-memory-*' (e.g. 'drm-memory-system:\t512 KiB')
-        # Exclusions:
-        # - GTT entries ('-gtt' in field name) are virtual address-space
-        #   reservations, not physical allocations.
-        # - Unitless entries (e.g. 'drm-total-cycles-render: 987654321' emitted
-        #   by the Xe driver) are cycle counters, not memory.  Only fields that
-        #   carry an explicit memory unit (B / KiB / MiB / GiB) are summed.
+        fd_engines = _parse_fdinfo_engines(fdinfo_content)
+        for eng, data in fd_engines.items():
+            if eng not in all_engines:
+                all_engines[eng] = {"cycles": 0, "total_cycles": 0, "time_ns": 0}
+            all_engines[eng]["cycles"] += data["cycles"]
+            all_engines[eng]["total_cycles"] += data["total_cycles"]
+            all_engines[eng]["time_ns"] += data["time_ns"]
+
         for line in fdinfo_content.splitlines():
-            if not (line.startswith('drm-total-') or line.startswith('drm-memory-')):
-                continue
-            # Skip GTT virtual address space regions ('-gtt' as a field component)
-            if '-gtt' in line:
-                continue
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                val_parts = parts[1].strip().split()
-                # Must have at least two tokens: value + unit.  Unitless values
-                # (cycle counts) are intentionally ignored here.
-                if len(val_parts) < 2:
-                    continue
-                try:
-                    value = int(val_parts[0])
-                    unit = val_parts[1].upper()
-                    if unit in ('KIB', 'KI', 'K', 'KB'):
-                        value *= 1024
-                    elif unit in ('MIB', 'MI', 'M', 'MB'):
-                        value *= 1024 * 1024
-                    elif unit in ('GIB', 'GI', 'G', 'GB'):
-                        value *= 1024 * 1024 * 1024
-                    elif unit != 'B':
-                        continue  # unrecognised unit, skip
-                    total_mem_bytes += value
-                except (ValueError, IndexError):
-                    pass
+            total_mem_bytes += _parse_fdinfo_mem_bytes(line, is_xe)
 
     if not found:
         return None
 
-    return {
-        'engine_ns': total_engine_ns,
-        'engine_cycles': total_engine_cycles,
-        'engine_total_cycles': total_engine_total_cycles,
-        'mem_bytes': total_mem_bytes,
-    }
+    return {'engines': all_engines, 'mem_bytes': total_mem_bytes}
+
+
+def _accumulate_engine_delta(out, t0_engines, t1_engines):
+    """Accumulate per-engine deltas between two snapshots into *out*.
+
+    Each engine entry has {cycles, total_cycles, time_ns}.  Deltas are computed
+    per field and added to the running totals in *out*.
+    """
+    for eng, d1 in t1_engines.items():
+        d0 = t0_engines.get(eng, {"cycles": 0, "total_cycles": 0, "time_ns": 0})
+        if eng not in out:
+            out[eng] = {"cycles": 0, "total_cycles": 0, "time_ns": 0}
+        out[eng]["cycles"] += max(0, d1["cycles"] - d0["cycles"])
+        out[eng]["total_cycles"] += max(0, d1["total_cycles"] - d0["total_cycles"])
+        out[eng]["time_ns"] += max(0, d1["time_ns"] - d0["time_ns"])
 
 
 
@@ -732,9 +725,7 @@ class ResourceMonitor:
         # consistently; only the first PID that exposes a given client_id
         # contributes to the delta and memory totals.
         seen_t1 = set()
-        total_engine_delta = {}
-        total_engine_cycles_delta = {}
-        total_engine_total_cycles_delta = {}
+        engine_delta = {}
         total_mem_bytes = 0
 
         for pid in pids:
@@ -743,39 +734,28 @@ class ResourceMonitor:
                 continue
             t0 = t0_data.get(pid)
             if t0:
-                for engine, ns1 in t1['engine_ns'].items():
-                    ns0 = t0['engine_ns'].get(engine, 0)
-                    delta = max(0, ns1 - ns0)
-                    total_engine_delta[engine] = total_engine_delta.get(engine, 0) + delta
-                for engine, cy1 in t1['engine_cycles'].items():
-                    cy0 = t0['engine_cycles'].get(engine, 0)
-                    total_engine_cycles_delta[engine] = (
-                        total_engine_cycles_delta.get(engine, 0) + max(0, cy1 - cy0)
-                    )
-                for engine, tc1 in t1['engine_total_cycles'].items():
-                    tc0 = t0['engine_total_cycles'].get(engine, 0)
-                    total_engine_total_cycles_delta[engine] = (
-                        total_engine_total_cycles_delta.get(engine, 0) + max(0, tc1 - tc0)
-                    )
+                _accumulate_engine_delta(engine_delta, t0['engines'], t1['engines'])
             total_mem_bytes += t1['mem_bytes']
 
         # Peak engine utilisation: prefer Xe cycle-based, fall back to i915 time-based
         gpu_util = 0.0
         winning_engine = None
-        for engine, delta_ns in total_engine_delta.items():
-            util = (delta_ns / elapsed_ns) * 100
-            logger.debug(f"  [GPU] i915 engine={engine} delta_ns={delta_ns} util={util:.1f}%")
+        for engine, data in engine_delta.items():
+            util = 0.0
+            if data["total_cycles"] > 0:
+                util = (data["cycles"] / data["total_cycles"]) * 100
+                logger.debug(
+                    f"  [GPU] Xe engine={engine} delta_cy={data['cycles']} "
+                    f"total_cy={data['total_cycles']} util={util:.1f}%"
+                )
+            elif elapsed_ns > 0 and data["time_ns"] > 0:
+                util = (data["time_ns"] / elapsed_ns) * 100
+                logger.debug(
+                    f"  [GPU] i915 engine={engine} delta_ns={data['time_ns']} util={util:.1f}%"
+                )
             if util > gpu_util:
                 gpu_util = util
                 winning_engine = engine
-        for engine, delta_cy in total_engine_cycles_delta.items():
-            dtot = total_engine_total_cycles_delta.get(engine, 0)
-            if dtot > 0:
-                util = (delta_cy / dtot) * 100
-                logger.debug(f"  [GPU] Xe engine={engine} delta_cy={delta_cy} total_cy={dtot} util={util:.1f}%")
-                if util > gpu_util:
-                    gpu_util = util
-                    winning_engine = engine
 
         logger.debug(
             f"  [GPU] pids={list(pids)} winning_engine={winning_engine} "
@@ -830,8 +810,6 @@ class ResourceMonitor:
         for cgroup, pids in cgroup_pids.items():
             seen_t1 = set()
             engine_delta = {}
-            engine_cycles_delta = {}
-            engine_total_cycles_delta = {}
             mem_bytes = 0
             for pid in pids:
                 t1 = _read_pid_fdinfo_gpu(pid, seen_t1)
@@ -839,37 +817,26 @@ class ResourceMonitor:
                     continue
                 t0 = gpu_t0.get(pid)
                 if t0:
-                    for engine, ns1 in t1['engine_ns'].items():
-                        ns0 = t0['engine_ns'].get(engine, 0)
-                        delta = max(0, ns1 - ns0)
-                        engine_delta[engine] = engine_delta.get(engine, 0) + delta
-                    for engine, cy1 in t1['engine_cycles'].items():
-                        cy0 = t0['engine_cycles'].get(engine, 0)
-                        engine_cycles_delta[engine] = (
-                            engine_cycles_delta.get(engine, 0) + max(0, cy1 - cy0)
-                        )
-                    for engine, tc1 in t1['engine_total_cycles'].items():
-                        tc0 = t0['engine_total_cycles'].get(engine, 0)
-                        engine_total_cycles_delta[engine] = (
-                            engine_total_cycles_delta.get(engine, 0) + max(0, tc1 - tc0)
-                        )
+                    _accumulate_engine_delta(engine_delta, t0['engines'], t1['engines'])
                 mem_bytes += t1['mem_bytes']
             gpu_util = 0.0
             winning_engine = None
-            for engine, delta_ns in engine_delta.items():
-                util = (delta_ns / elapsed_ns) * 100
-                logger.debug(f"  [GPU][{cgroup}] i915 engine={engine} delta_ns={delta_ns} util={util:.1f}%")
+            for engine, data in engine_delta.items():
+                util = 0.0
+                if data["total_cycles"] > 0:
+                    util = (data["cycles"] / data["total_cycles"]) * 100
+                    logger.debug(
+                        f"  [GPU][{cgroup}] Xe engine={engine} delta_cy={data['cycles']} "
+                        f"total_cy={data['total_cycles']} util={util:.1f}%"
+                    )
+                elif elapsed_ns > 0 and data["time_ns"] > 0:
+                    util = (data["time_ns"] / elapsed_ns) * 100
+                    logger.debug(
+                        f"  [GPU][{cgroup}] i915 engine={engine} delta_ns={data['time_ns']} util={util:.1f}%"
+                    )
                 if util > gpu_util:
                     gpu_util = util
                     winning_engine = engine
-            for engine, delta_cy in engine_cycles_delta.items():
-                dtot = engine_total_cycles_delta.get(engine, 0)
-                if dtot > 0:
-                    util = (delta_cy / dtot) * 100
-                    logger.debug(f"  [GPU][{cgroup}] Xe engine={engine} delta_cy={delta_cy} total_cy={dtot} util={util:.1f}%")
-                    if util > gpu_util:
-                        gpu_util = util
-                        winning_engine = engine
             gpu_stats_by_cgroup[cgroup] = {
                 'gpu_util': round(min(gpu_util, 100.0), 1),
                 'gpu_mem_mb': round(mem_bytes / (1024 * 1024), 1),
