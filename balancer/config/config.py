@@ -33,6 +33,7 @@ class Config:
     network_system_ports: list = None
     monitor_apps: dict = None
     all_apps: dict = None
+    controlled_apps: list = None
 
     @classmethod
     def from_file(cls, path: str):

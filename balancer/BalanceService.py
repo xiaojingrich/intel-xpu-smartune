@@ -15,7 +15,7 @@ from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
 from monitor.monitor_api import monitor_bp, register_system_pressure_monitor, _start_snapshot_cleanup_task
 from monitor.system_info import preload_static_info, shutdown_gpu_usage
-from utils.app_utils import adjust_oom_priority, callback_manager, fetch_all_apps, get_priority_value
+from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
@@ -80,6 +80,9 @@ class DynamicService:
 
     def rebuild_controlled_map(self):
         self.balancer.bpf_monitor.rebuild_controlled_map()
+
+    def check_running_apps(self):
+        return self.balancer.bpf_monitor.scan_already_running_apps()
 
     def shutdown(self):
         self.balancer.shutdown()
@@ -398,6 +401,19 @@ def set_to_control():
         _service.rebuild_controlled_map()
         adjust_oom_priority(app_id, app_name, priority, cmdline)
 
+        # After registering the app, probe whether it is already running so the
+        # UI reflects the correct status immediately (without waiting for the next
+        # BPF exec event).
+        if controlled and app_id:
+            status = check_app_running_status(app_id, app_name, cmdline)
+            logger.info(f"set_to_control: initial status check for '{app_name}' → {status}")
+            callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': status,
+                'purpose': "app"
+            }, store=True)
+
         return construct_response(
             data={
                 "app_name": app_name,
@@ -503,6 +519,30 @@ def get_controlled_app():
         logger.error(f"Get controlled apps failed: {str(e)}")
         return construct_response(
             data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/check_running_apps', methods=['POST'])
+def check_running_apps():
+    """Scan currently running processes to find managed apps that started before the balancer.
+
+    This endpoint is called once when the UI balancer tab is first opened.  It
+    uses psutil to inspect live processes and registers any monitored app that is
+    already running so its status is reflected correctly in the UI.  Ongoing
+    detection after this initial scan is handled by BPF as usual.
+    """
+    try:
+        detected = _service.check_running_apps()
+        return construct_response(
+            data=detected,
+            retmsg=f"Startup scan complete, detected {len(detected)} pre-existing monitored app(s)"
+        )
+    except Exception as e:
+        logger.error(f"check_running_apps failed: {str(e)}")
+        return construct_response(
+            data=[],
             retcode=RetCode.EXCEPTION_ERROR,
             retmsg=str(e)
         )

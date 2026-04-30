@@ -63,6 +63,7 @@ export const api = {
   setHistoryRetention: (days: number) =>
     post<{ retention_days: number; deleted: number }>('/monitor/history/retention', { retention_days: days }),
 
+  checkRunningApps: () => post<AppListData>('/app/check_running_apps'),
   getApps: () => post<AppListData>('/app/get_apps'),
   getControlledApps: () => post<AppListData>('/app/get_controlled_app'),
   // The server returns retcode=404 (NOT_EXISTING, "No pending apps found") when the

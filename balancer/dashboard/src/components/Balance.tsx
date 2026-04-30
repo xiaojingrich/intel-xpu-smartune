@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react'
+import React, { useState, useCallback, useEffect, useRef } from 'react'
 import {
   Row,
   Col,
@@ -131,9 +131,25 @@ export default function Balance({ active }: Props) {
     }
   }, [])
 
+  // Track whether the startup scan has been triggered for this session.
+  // The scan only runs once — the first time this tab becomes active — to detect
+  // managed apps that were already running before the balancer service started.
+  // After that initial check, BPF handles all start/stop events as usual.
+  const startupScanDone = useRef(false)
+
   // Initial data fetch on mount / when tab becomes active
   useEffect(() => {
-    if (active) fetchData()
+    if (active) {
+      if (!startupScanDone.current) {
+        startupScanDone.current = true
+        // Fire-and-forget: errors here are non-critical; the backend logs them.
+        // Log to console in development so frontend engineers can diagnose failures.
+        api.checkRunningApps().catch((e: unknown) => {
+          console.error('[Balance] startup scan failed:', e)
+        })
+      }
+      fetchData()
+    }
   }, [active, fetchData])
 
   // SSE: push updates from server instead of polling every 5 s

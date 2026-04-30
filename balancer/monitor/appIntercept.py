@@ -92,9 +92,12 @@ class AppIntercept(metaclass=SingletonMeta):
         hot-path (print_event → get_main_process) never rebuilds these dicts
         itself.
         """
-        cnf_appname = self.controlManager.config.monitor_apps
+        # Prefer the unified controlled_apps list; fall back to the legacy monitor_apps key.
+        cnf_apps = (getattr(self.controlManager.config, 'controlled_apps', None)
+                    or getattr(self.controlManager.config, 'monitor_apps', None)
+                    or [])
         app_executables = {
-            item['name']: item.get('bpf_name', []) for item in cnf_appname
+            item['name']: item.get('bpf_name', []) for item in cnf_apps
         }
 
         comm_to_app: dict[str, str] = {}
@@ -368,6 +371,113 @@ class AppIntercept(metaclass=SingletonMeta):
     def get_monitored_apps(self) -> List[str]:
         """获取当前监控的应用列表"""
         return list(self.monitored_apps)
+
+    def scan_already_running_apps(self) -> list:
+        """Scan currently running processes for monitored apps that pre-date the balancer.
+
+        Called once when the UI balancer tab is first opened to detect apps that
+        started before the balancer service (and were therefore missed by BPF).
+        Any matching process is registered in monitored_app_launched and a
+        "running" callback is sent so the UI and database reflect the correct state.
+        After this one-time scan, ongoing detection is left entirely to BPF.
+
+        Two scanning strategies are used:
+
+        1. **BPF comm/exe matching** (existing logic) – iterates live processes and
+           checks whether comm or exe matches a known monitored app via
+           :meth:`get_main_process`.  This covers normal single-process desktop apps.
+
+        2. **Multi-process apps** – for apps whose ``controlled_apps`` config entry
+           contains a non-empty ``process_names`` list, the BPF comm-matching path
+           may miss them (they are recognised by process name, not by bpf_name).
+           A second pass calls :func:`app_utils.check_app_running_status` for each
+           such app that was NOT already detected in pass 1, and emits the
+           appropriate "running" or "stopped" callback.
+
+        :return: list of dicts with keys app_id, app_name, pid for each detected app.
+        """
+        detected = []
+        detected_app_ids: set[str] = set()
+
+        # --- Pass 1: BPF comm/exe matching (original logic) ---
+        if self.monitored_apps:
+            try:
+                for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                    try:
+                        pid = proc.info['pid']
+                        # Fast-path: skip PIDs already tracked by BPF or a prior scan
+                        if pid in self.monitored_app_launched or pid in self.handled_processes:
+                            continue
+                        # Full parent-chain check (handles child processes of known apps)
+                        if self.is_process_handled(pid):
+                            continue
+
+                        comm = proc.info.get('name') or ''
+                        exe = proc.info.get('exe') or ''
+
+                        is_match, app_name = self.get_main_process(comm, exe)
+                        if not is_match:
+                            continue
+
+                        registered_app = self._app_map_index.get(app_name.lower())
+                        if not registered_app:
+                            continue
+
+                        app_id = registered_app['app_id']
+                        logger.info(
+                            f"[startup scan] Detected pre-existing process: PID={pid}, "
+                            f"app={app_name}, comm={comm}, exe={exe}"
+                        )
+                        self.monitored_app_launched[pid] = (app_id, app_name, comm, exe)
+                        self.mark_process_handled(pid)
+
+                        app_utils.callback_manager.send_callback_notification({
+                            'app_id': app_id,
+                            'app_name': app_name,
+                            'status': "running",
+                            'purpose': "app"
+                        }, True)
+                        detected.append({"app_id": app_id, "app_name": app_name, "pid": pid})
+                        detected_app_ids.add(app_id)
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception as e:
+                logger.error(f"scan_already_running_apps (pass 1) failed: {e}")
+
+        # --- Pass 2: multi-process apps (process_names) ---
+        # Check apps that have process_names configured and were not found in pass 1.
+        try:
+            all_controlled = app_utils.get_controlled_apps() or []
+            for app in all_controlled:
+                app_id = app.get('app_id', '')
+                app_name = app.get('app_name', '')
+                cmdline = app.get('cmdline', '')
+                if not app_id or app_id in detected_app_ids:
+                    continue
+                process_names = app_utils._get_app_process_names(app_id=app_id, app_name=app_name)
+                if not process_names:
+                    continue  # handled by pass 1 (or not monitored at all)
+
+                status = app_utils.check_app_running_status(app_id, app_name, cmdline)
+                logger.info(
+                    f"[startup scan] Multi-process app '{app_name}' "
+                    f"(process_names={process_names}): status={status}"
+                )
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': status,
+                    'purpose': "app"
+                }, True)
+                if status == "running":
+                    detected.append({"app_id": app_id, "app_name": app_name, "pid": None})
+        except Exception as e:
+            logger.error(f"scan_already_running_apps (pass 2) failed: {e}")
+
+        logger.info(f"[startup scan] Detected {len(detected)} pre-existing monitored app(s): "
+                    f"{[d['app_name'] for d in detected]}")
+        return detected
 
     def check_system_resources(self, cpu_threshold: int = 70, mem_threshold: int = 80) -> bool:
         """检查系统资源使用情况"""

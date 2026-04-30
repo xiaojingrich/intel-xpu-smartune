@@ -212,6 +212,31 @@ class ResourceMonitor:
             logger.warning(f"Could not load desktop apps: {str(e)}")
             self.desktop_apps = {}
 
+        # Multi-process app lookup structures, built from controlled_apps entries
+        # that have a non-empty process_names list.
+        # _proc_name_to_app  : process_name_lower -> app_id
+        # _multiprocess_apps : app_id -> {'name': str, 'process_names_lower': list}
+        self._proc_name_to_app: dict[str, str] = {}
+        self._multiprocess_apps: dict[str, dict] = {}
+        self._load_multiprocess_config()
+
+    def _load_multiprocess_config(self) -> None:
+        """Populate multi-process app lookup maps from controlled_apps config."""
+        apps = getattr(self.config, 'controlled_apps', None) or []
+        for app in apps:
+            pnames = app.get('process_names') or []
+            if not pnames:
+                continue
+            app_id = app.get('id', '')
+            app_name = app.get('name', '')
+            pnames_lower = [p.lower() for p in pnames]
+            self._multiprocess_apps[app_id] = {
+                'name': app_name,
+                'process_names_lower': pnames_lower,
+            }
+            for p in pnames_lower:
+                self._proc_name_to_app[p] = app_id
+
     def _get_top_processes(self, n=1, samples=3, interval=1.0, mode='default'):
         """获取资源占用最高的应用（基于 cgroup 聚合）
         :param n: 返回前 n 个进程
@@ -239,6 +264,40 @@ class ResourceMonitor:
             cgroup_path = get_cgroup_path_by_pid(proc['pid'])
             if cgroup_path and cgroup_path != '/':
                 cgroup_paths.add(cgroup_path)
+
+        # Step 2b: For apps with explicit process_names, scan ALL their running
+        # processes and add their cgroups so they are always included in the
+        # aggregation pass (even when they are not in the top-N candidates).
+        # Build a reverse map: cgroup_path -> app_id for later merging.
+        multiapp_cgroup_to_app: dict[str, str] = {}
+        if self._multiprocess_apps:
+            try:
+                for proc in psutil.process_iter(['pid', 'name']):
+                    try:
+                        pname_lower = (proc.info.get('name') or '').lower()
+                        if pname_lower not in self._proc_name_to_app:
+                            # Fallback: Linux comm is capped at 15 chars; long process names
+                            # (e.g. "HeliconSearch_agent") get truncated.  Check the full
+                            # cmdline to catch these cases.
+                            try:
+                                cmdline_str = ' '.join(proc.cmdline()).lower()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                                continue
+                            matched = next(
+                                (k for k in self._proc_name_to_app if k in cmdline_str),
+                                None,
+                            )
+                            if not matched:
+                                continue
+                            pname_lower = matched
+                        cg = get_cgroup_path_by_pid(proc.info['pid'])
+                        if cg and cg != '/':
+                            cgroup_paths.add(cg)
+                            multiapp_cgroup_to_app[cg] = self._proc_name_to_app[pname_lower]
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception as e:
+                logger.warning(f"Multi-process app scan failed: {e}")
 
         # Step 3: 按 cgroup 聚合进程
         cgroup_data = defaultdict(lambda: {
@@ -348,6 +407,63 @@ class ResourceMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 
+        # Step 3b: Merge cgroup_data entries that belong to the same multi-process app.
+        # Entries whose cgroup_path appears in multiapp_cgroup_to_app are grouped by
+        # app_id; all but the first (primary) cgroup are folded in and deleted.
+        if multiapp_cgroup_to_app:
+            # Group cgroups by app_id
+            app_cgroup_groups: dict[str, list] = {}
+            for cg, app_id in multiapp_cgroup_to_app.items():
+                app_cgroup_groups.setdefault(app_id, []).append(cg)
+
+            for app_id, cg_list in app_cgroup_groups.items():
+                if len(cg_list) <= 1:
+                    continue  # only one cgroup, nothing to merge
+                # Use the lexicographically-first cgroup as the stable primary key
+                primary = min(cg_list)
+                # Capture per-cgroup breakdown BEFORE merging so the balancer can
+                # distribute limits proportionally (keyed by basename for easy lookup).
+                per_cg_mem_rss = {
+                    os.path.basename(cg): cgroup_data[cg]['mem_rss_total']
+                    for cg in cg_list if cg in cgroup_data
+                }
+                per_cg_cpu = {
+                    os.path.basename(cg): cgroup_data[cg]['cpu_total']
+                    for cg in cg_list if cg in cgroup_data
+                }
+                for other in cg_list:
+                    if other == primary or other not in cgroup_data:
+                        continue
+                    d = cgroup_data[other]
+                    cgroup_data[primary]['cpu_total'] += d['cpu_total']
+                    cgroup_data[primary]['mem_percent_total'] += d['mem_percent_total']
+                    cgroup_data[primary]['mem_rss_total'] += d['mem_rss_total']
+                    cgroup_data[primary]['io_read_total'] += d['io_read_total']
+                    cgroup_data[primary]['io_write_total'] += d['io_write_total']
+                    cgroup_data[primary]['io_read_count_total'] += d['io_read_count_total']
+                    cgroup_data[primary]['io_write_count_total'] += d['io_write_count_total']
+                    cgroup_data[primary]['count'] += d['count']
+                    cgroup_data[primary]['pids'] |= d['pids']
+                    cgroup_data[primary]['names'] |= d['names']
+                    cgroup_data[primary]['cmdlines'] |= d['cmdlines']
+                    # Update dominant process: use the entry with the strictly higher metric.
+                    # When metrics are equal we keep the primary cgroup's values, which is
+                    # already deterministic because primary was chosen as min(cg_list).
+                    if d['dominant_metric'] > cgroup_data[primary]['dominant_metric']:
+                        cgroup_data[primary]['dominant_metric'] = d['dominant_metric']
+                        cgroup_data[primary]['dominant_name'] = d['dominant_name']
+                        cgroup_data[primary]['dominant_cmdline'] = d['dominant_cmdline']
+                    # Attach extra cgroup paths so callers can apply limits to all of them
+                    cgroup_data[primary].setdefault('extra_cgroups', []).append(other)
+                    del cgroup_data[other]
+                # Store the per-cgroup breakdown for proportional limit distribution
+                cgroup_data[primary]['per_cgroup_mem_rss'] = per_cg_mem_rss
+                cgroup_data[primary]['per_cgroup_cpu'] = per_cg_cpu
+                logger.debug(
+                    f"[multi_process] Merged {len(cg_list)} cgroups for app_id='{app_id}' "
+                    f"into primary='{primary}'"
+                )
+
         # Step 4: 根据模式计算评分
         processes = []
         for cgroup_path, data in cgroup_data.items():
@@ -378,6 +494,12 @@ class ResourceMonitor:
                 processes.append({
                     'pids': list(data['pids']),
                     'cgroup': cgroup_path,
+                    # extra_cgroups is set only for merged multi-process app entries
+                    'extra_cgroups': data.get('extra_cgroups', []),
+                    # per-cgroup breakdown (basename -> raw value) for proportional limiting;
+                    # empty dicts for single-cgroup apps.
+                    'per_cgroup_mem_rss': data.get('per_cgroup_mem_rss', {}),
+                    'per_cgroup_cpu': data.get('per_cgroup_cpu', {}),
                     'score': round(score, 2),
                     'cpu_avg': round(data['cpu_total'] / self.cpu_cores, 1) if mode == 'default' else 0,
                     'mem_avg': round(data['mem_percent_total'], 1) if mode == 'default' else 0,
@@ -532,6 +654,25 @@ class ResourceMonitor:
         """尝试匹配桌面应用或systemd scope"""
         cgroup = process_info.get('cgroup')
 
+        # 0. For apps with explicit process_names configured, match before the
+        #    generic desktop-app lookup so they take priority.
+        if self._proc_name_to_app:
+            dominant_name = process_info.get('dominant_name', '')
+            names = process_info.get('names') or []
+            if isinstance(names, set):
+                names = list(names)
+            check_names = [dominant_name] if dominant_name else names
+            for pname in check_names:
+                app_id = self._proc_name_to_app.get(pname.lower())
+                if app_id:
+                    app_cfg = self._multiprocess_apps.get(app_id, {})
+                    logger.debug(f"try_match_app matched multi-process app '{app_cfg.get('name')}' by process_name '{pname}'")
+                    return {
+                        'type': 'configured',
+                        'id': app_id,
+                        'name': app_cfg.get('name', pname),
+                    }
+
         # 1. Try to match a registered desktop app by process name or exe path
         if self.desktop_apps:
             exe = process_info.get('exe', '')
@@ -654,7 +795,16 @@ class ResourceMonitor:
                     'mem_rss': process['mem_rss'],
                     'io_read_rate': process['io_read_rate']
                 },
-                'app': app_info
+                'app': app_info,
+                # Unit names (basename) of any additional cgroups merged into this
+                # entry (multi-process apps only).  Empty list for single-cgroup apps.
+                'extra_cgroups': [
+                    os.path.basename(c) for c in process.get('extra_cgroups', [])
+                ],
+                # Per-cgroup memory (bytes) and CPU (raw total) breakdown keyed by
+                # basename – used by the balancer for proportional limit distribution.
+                'per_cgroup_mem_rss': process.get('per_cgroup_mem_rss', {}),
+                'per_cgroup_cpu': process.get('per_cgroup_cpu', {}),
             })
 
         return results, reach_threshold
@@ -679,7 +829,12 @@ class ResourceMonitor:
                     'io_read_rate': process['io_read_rate'],
                     'io_write_rate': process['io_write_rate']
                 },
-                'app': app_info
+                'app': app_info,
+                'extra_cgroups': [
+                    os.path.basename(c) for c in process.get('extra_cgroups', [])
+                ],
+                'per_cgroup_mem_rss': process.get('per_cgroup_mem_rss', {}),
+                'per_cgroup_cpu': process.get('per_cgroup_cpu', {}),
             })
 
         return results

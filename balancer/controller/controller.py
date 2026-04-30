@@ -164,6 +164,16 @@ class Controller:
             result = subprocess.run(['systemctl', '--user', 'set-property', '--runtime', '%s' % service, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
+    def _is_system_service(self, unit_name: str) -> bool:
+        """Return True if *unit_name* lives under /sys/fs/cgroup/system.slice.
+
+        System services (e.g. ``hs_agent.service``) must be controlled via
+        ``sudo systemctl set-property --runtime`` without ``--user``.  User
+        services (under user.slice) use ``systemctl --user set-property``.
+        """
+        system_cg = os.path.join(self.cgroup_mount, 'system.slice', unit_name)
+        return os.path.isdir(system_cg)
+
     def _set_resource_quota(
             self,
             app_id: str,
@@ -206,7 +216,9 @@ class Controller:
             unit_type = 'scope' if matching_app in scopes else 'service'
         elif app_id.endswith('.service'):
             matching_app = app_id
-            unit_type = 'service'
+            # System services (under /sys/fs/cgroup/system.slice/) must use
+            # "sudo systemctl" without "--user"; user services use "--user".
+            unit_type = 'system_service' if self._is_system_service(app_id) else 'service'
         elif app_id.endswith('.desktop'):
             app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
             matching_app = next(
@@ -257,9 +269,11 @@ class Controller:
             # ['sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(), 'systemctl', 'set-property', '--runtime', matching_app]
 
             if getattr(self.config, "vendor", "") == "generic":
+                # scope and system_service both use "sudo systemctl" (no --user);
+                # user-space .service units go through the D-Bus session bus.
                 cmd_base = (
                     ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
-                    if unit_type == 'scope' else
+                    if unit_type in ('scope', 'system_service') else
                     [
                         'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
                         f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',

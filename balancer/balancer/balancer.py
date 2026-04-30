@@ -21,7 +21,8 @@ from controller.io import IOController
 
 g_limited_apps = OrderedDict()  # 记录被限制的应用
 g_limited_apps_manual = OrderedDict()  # 记录被限制的应用
-g_app_id_mapping = {}  # {app_id: effective_app_id}
+g_app_id_mapping = {}  # {app_id: list[effective_app_id] | str} – list for multi-cgroup apps (set by set_resource_limit), str fallback for legacy paths
+g_extra_cgroup_ids: dict = {}  # {primary_effective_app_id: [extra_id, ...]} for multi-cgroup apps
 is_limited_app_dominant = False  # critical情况下，用于判断拿到的Top进程是否为已限制的进程
 
 @dataclass
@@ -89,6 +90,39 @@ class MaxPriorityQueue:
         return len(self._queue.queue)
 
 
+def _split_proportionally(total_budget, all_ids: list, per_cg_usage: dict) -> dict:
+    """Distribute *total_budget* across *all_ids* proportionally to each entry in
+    *per_cg_usage* ({basename: raw_value}).
+
+    :param total_budget: Total budget to distribute (int MB or CPU%), or ``None``
+        meaning "no limit for this resource".  When ``None``, every entry in the
+        returned dict is also ``None`` so callers can safely forward the value to
+        ``adjust_resources`` which treats ``None`` as "no limit".
+    :param all_ids: Ordered list of cgroup basenames to distribute across.
+    :param per_cg_usage: {basename: raw usage value} used for proportional weights.
+
+    When *per_cg_usage* is missing or all values are zero, the budget is split
+    equally so that single-cgroup apps (empty *all_ids* or no per-cgroup data)
+    are never affected and multi-cgroup apps at worst receive equal shares rather
+    than N times the intended cap.
+
+    :returns: {basename: allocated_budget} where each value mirrors the type of
+              *total_budget* (int >= 1 when a positive budget is given, or None).
+              Values sum to approximately *total_budget*.
+    """
+    if total_budget is None or total_budget == 0:
+        return {cg: total_budget for cg in all_ids}
+    total_usage = sum(per_cg_usage.get(cg, 0) for cg in all_ids)
+    if total_usage <= 0:
+        n = len(all_ids) or 1
+        each = max(1, total_budget // n)
+        return {cg: each for cg in all_ids}
+    return {
+        cg: max(1, int(total_budget * per_cg_usage.get(cg, 0) / total_usage))
+        for cg in all_ids
+    }
+
+
 class DynamicBalancer:
     def __init__(self):
         self.bpf_monitor = AppIntercept("monitor/bpf_event.c")
@@ -141,7 +175,7 @@ class DynamicBalancer:
 
     def _run_monitor_resource_loop(self):
         logger.info("Monitor resource service started")
-        global g_limited_apps, is_limited_app_dominant
+        global g_limited_apps, g_extra_cgroup_ids, is_limited_app_dominant
         idle_check_interval = 10  # 单位：秒
         last_check_time = 0
         last_network_sample_time = 0
@@ -436,28 +470,56 @@ class DynamicBalancer:
                                     app_name = target.get('process', {}).get('name') or ''
                                     total_mem = self.resource_monitor.get_total_memory()
                                     logger.info(f"Adjusting resources for app: {app_id}")
+                                    extra_cgroup_ids = target.get('extra_cgroups', [])
+                                    per_cg_mem_rss = target.get('per_cgroup_mem_rss', {})
+                                    per_cg_cpu = target.get('per_cgroup_cpu', {})
 
                                     # 初始化限制结果标志
                                     resource_limited = False
                                     io_limited = False
 
-                                    # CPU/内存限制
+                                    # CPU/内存限制 – distribute proportionally for multi-cgroup apps
                                     cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
                                     mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get(
                                         "mem_rate") else None
 
                                     if (cpu_rate is not None or mem_rate is not None) and self.is_running:
-                                        auto_limit = self.controlManager.adjust_resources(
-                                            app_id,
-                                            "critical",
-                                            cpu_quota=cpu_rate,
-                                            mem_high=mem_rate,
-                                        )
-                                        if auto_limit:
-                                            resource_limited = True
-                                            logger.info(f"Successfully limited CPU/Memory for {app_name}")
+                                        if extra_cgroup_ids:
+                                            all_ids = [app_id] + extra_cgroup_ids
+                                            mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
+                                            cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
+                                            auto_limit = self.controlManager.adjust_resources(
+                                                app_id, "critical",
+                                                cpu_quota=cpu_dist.get(app_id, cpu_rate),
+                                                mem_high=mem_dist.get(app_id, mem_rate),
+                                            )
+                                            if auto_limit:
+                                                resource_limited = True
+                                                logger.info(f"Successfully limited CPU/Memory for {app_name} ({app_id})")
+                                            else:
+                                                logger.warning(f"Failed to limit CPU/Memory for {app_name} ({app_id})")
+                                            for extra_id in extra_cgroup_ids:
+                                                ok = self.controlManager.adjust_resources(
+                                                    extra_id, "critical",
+                                                    cpu_quota=cpu_dist.get(extra_id, cpu_rate),
+                                                    mem_high=mem_dist.get(extra_id, mem_rate),
+                                                )
+                                                logger.info(
+                                                    f"{'Successfully limited' if ok else 'Failed to limit'} "
+                                                    f"CPU/Memory for extra cgroup {extra_id}"
+                                                )
                                         else:
-                                            logger.warning(f"Failed to limit CPU/Memory for {app_name}")
+                                            auto_limit = self.controlManager.adjust_resources(
+                                                app_id,
+                                                "critical",
+                                                cpu_quota=cpu_rate,
+                                                mem_high=mem_rate,
+                                            )
+                                            if auto_limit:
+                                                resource_limited = True
+                                                logger.info(f"Successfully limited CPU/Memory for {app_name}")
+                                            else:
+                                                logger.warning(f"Failed to limit CPU/Memory for {app_name}")
 
                                     # 磁盘IO限制
                                     io_limits = limit_rates.get("disk_io_rate", {})
@@ -476,6 +538,8 @@ class DynamicBalancer:
                                         )
                                         if not io_limited:
                                             logger.error(f"Failed to set write IO limit for {app_name}")
+                                        for extra_id in extra_cgroup_ids:
+                                            self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
                                     # 只要CPU/内存或IO有一个限制成功，就记录到g_limited_apps
                                     if resource_limited or io_limited:
@@ -483,6 +547,8 @@ class DynamicBalancer:
                                             'cpu_mem_limited': resource_limited,
                                             'io_limited': io_limited
                                         }, None)  # None 表示完全限制
+                                        if extra_cgroup_ids:
+                                            g_extra_cgroup_ids[app_id] = extra_cgroup_ids
 
                                         if is_controlled:
                                             app_utils.update_app_status(app_id, "limited")
@@ -543,6 +609,8 @@ class DynamicBalancer:
                                                     f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
                                                     f"Partially restoring app {app_id} (twice the rate of limited resources)."
                                                 )
+                                                # Extra cgroups that were limited alongside the primary
+                                                extra_ids = g_extra_cgroup_ids.get(app_id, [])
 
                                                 restore_success = True
 
@@ -565,6 +633,13 @@ class DynamicBalancer:
                                                             logger.error(
                                                                 f"Failed to partially restore CPU/Memory for {app_name}")
                                                             restore_success = False
+                                                        for extra_id in extra_ids:
+                                                            self.controlManager.adjust_resources(
+                                                                extra_id, "medium",
+                                                                cpu_quota=cpu_restore,
+                                                                mem_high=mem_restore,
+                                                                is_restore=False,
+                                                            )
 
                                                 # 恢复IO限制（如果之前限制了）
                                                 if (limit_parts.get('io_limited', False) and "disk_io_rate" in limit_rates) and self.is_running:
@@ -588,6 +663,8 @@ class DynamicBalancer:
                                                         logger.error(
                                                             f"Failed to partially restore disk IO for {app_name}")
                                                         io_restored = False
+                                                    for extra_id in extra_ids:
+                                                        self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
                                                     if not io_restored:
                                                         restore_success = False
@@ -609,12 +686,15 @@ class DynamicBalancer:
                                             )
 
                                             restore_success = True
+                                            extra_ids = g_extra_cgroup_ids.pop(app_id, [])
 
                                             # 恢复CPU/内存（如果之前限制了）
                                             if limit_parts.get('cpu_mem_limited', False) and self.is_running:
                                                 if not self.controlManager.adjust_resources(app_id, "low"):
                                                     logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
                                                     restore_success = False
+                                                for extra_id in extra_ids:
+                                                    self.controlManager.adjust_resources(extra_id, "low")
 
                                             # 恢复IO限制（如果之前限制了）
                                             if limit_parts.get('io_limited', False) and self.is_running:
@@ -624,6 +704,8 @@ class DynamicBalancer:
                                                 if not self.io_ctl.restore_disk_io_throttle(app_id):
                                                     logger.error(f"Failed to remove IO limits for {app_name}")
                                                     io_restored = False
+                                                for extra_id in extra_ids:
+                                                    self.io_ctl.restore_disk_io_throttle(extra_id)
 
                                                 if not io_restored:
                                                     restore_success = False
@@ -713,9 +795,17 @@ class DynamicBalancer:
 
     def _apply_resource_limits(self, target_app, app_id, limit_rates, is_controlled, is_disk_io_stressed=False):
         """应用资源限制（公共逻辑）"""
+        global g_extra_cgroup_ids
         app_name = target_app.get('process', {}).get('name') or ''
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
+
+        # Extra cgroups for multi-process apps (e.g. hs_vlm.service alongside hs_agent.service).
+        # These are populated by the monitor when it merges multiple cgroups into one entry.
+        extra_cgroup_ids = target_app.get('extra_cgroups', [])
+        # Per-cgroup breakdown (basename -> raw bytes/cpu_total) for proportional distribution.
+        per_cg_mem_rss = target_app.get('per_cgroup_mem_rss', {})
+        per_cg_cpu = target_app.get('per_cgroup_cpu', {})
 
         # 初始化限制结果标志
         resource_limited = False
@@ -727,15 +817,40 @@ class DynamicBalancer:
             mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get("mem_rate") else None
 
             if (cpu_rate is not None or mem_rate is not None) and self.is_running:
-                auto_limit = self.controlManager.adjust_resources(
-                    app_id,
-                    "critical",
-                    cpu_quota=cpu_rate,
-                    mem_high=mem_rate,
-                )
-                if auto_limit:
-                    resource_limited = True
-                    logger.info(f"Successfully limited CPU/Memory for {app_name}")
+                if extra_cgroup_ids:
+                    # Multi-cgroup app: distribute total budget proportionally so that
+                    # the aggregate allowed headroom equals the intended cap, not N × cap.
+                    all_ids = [app_id] + extra_cgroup_ids
+                    mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
+                    cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
+                    primary_ok = self.controlManager.adjust_resources(
+                        app_id, "critical",
+                        cpu_quota=cpu_dist.get(app_id, cpu_rate),
+                        mem_high=mem_dist.get(app_id, mem_rate),
+                    )
+                    if primary_ok:
+                        resource_limited = True
+                        logger.info(f"Successfully limited CPU/Memory for {app_name} ({app_id})")
+                    for extra_id in extra_cgroup_ids:
+                        ok = self.controlManager.adjust_resources(
+                            extra_id, "critical",
+                            cpu_quota=cpu_dist.get(extra_id, cpu_rate),
+                            mem_high=mem_dist.get(extra_id, mem_rate),
+                        )
+                        logger.info(
+                            f"{'Successfully limited' if ok else 'Failed to limit'} "
+                            f"CPU/Memory for extra cgroup {extra_id}"
+                        )
+                else:
+                    auto_limit = self.controlManager.adjust_resources(
+                        app_id,
+                        "critical",
+                        cpu_quota=cpu_rate,
+                        mem_high=mem_rate,
+                    )
+                    if auto_limit:
+                        resource_limited = True
+                        logger.info(f"Successfully limited CPU/Memory for {app_name}")
 
         # 磁盘IO限制
         if is_disk_io_stressed and limit_rates.get("disk_io_rate"):
@@ -752,6 +867,8 @@ class DynamicBalancer:
                 io_limited = self.io_ctl.set_disk_io_throttle(app_id, limits=limits)
                 if not io_limited:
                     logger.error(f"Failed to set IO limit for {app_name}")
+                for extra_id in extra_cgroup_ids:
+                    self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         # 记录限制结果
         if resource_limited or io_limited:
@@ -761,6 +878,8 @@ class DynamicBalancer:
                 {'cpu_mem_limited': resource_limited, 'io_limited': io_limited},
                 None  # None表示完全限制
             )
+            if extra_cgroup_ids:
+                g_extra_cgroup_ids[app_id] = extra_cgroup_ids
 
             if is_controlled:
                 app_utils.update_app_status(app_id, "limited")
@@ -782,8 +901,10 @@ class DynamicBalancer:
         :param restore_type: 恢复类型（"partial" 或 "full"）
         :return: 是否恢复成功，以及恢复的部分详情
         """
-        global g_limited_apps
+        global g_limited_apps, g_extra_cgroup_ids
         restore_success = True
+        # Extra cgroups for multi-process apps (e.g. hs_vlm.service alongside hs_agent.service)
+        extra_ids = g_extra_cgroup_ids.get(app_id, [])
 
         if self.is_running:
             # 恢复CPU/内存
@@ -797,6 +918,10 @@ class DynamicBalancer:
                     ):
                         logger.error(f"Failed to partially restore CPU/Memory for {app_name}")
                         restore_success = False
+                    for extra_id in extra_ids:
+                        self.controlManager.adjust_resources(
+                            extra_id, "medium", cpu_quota=cpu_restore, mem_high=mem_restore, is_restore=False
+                        )
                 else:  # full restore
                     cpu_mem_restored = self.controlManager.adjust_resources(app_id, "low")
                     if not cpu_mem_restored:
@@ -807,6 +932,8 @@ class DynamicBalancer:
                             'cpu_mem_limited': False,
                             'io_limited': limit_parts['io_limited']
                         }, None)
+                    for extra_id in extra_ids:
+                        self.controlManager.adjust_resources(extra_id, "low")
             # 恢复IO限制
             if limit_parts.get('io_limited', False):
                 if restore_type == "partial" and "disk_io_rate" in limit_rates:
@@ -822,6 +949,8 @@ class DynamicBalancer:
                     if not self.io_ctl.set_disk_io_throttle(app_id, limits=limits):
                         logger.error(f"Failed to partially restore disk IO for {app_name}")
                         restore_success = False
+                    for extra_id in extra_ids:
+                        self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
                 elif restore_type == "full":
                     if not self.io_ctl.restore_disk_io_throttle(app_id):
                         logger.error(f"Failed to fully restore disk IO for {app_name}")
@@ -831,6 +960,11 @@ class DynamicBalancer:
                             'cpu_mem_limited': limit_parts['cpu_mem_limited'],
                             'io_limited': False
                         }, None)
+                    for extra_id in extra_ids:
+                        self.io_ctl.restore_disk_io_throttle(extra_id)
+            # Remove extra cgroup tracking on full restore
+            if restore_type == "full":
+                g_extra_cgroup_ids.pop(app_id, None)
 
         return restore_success
 
@@ -941,7 +1075,7 @@ class DynamicBalancer:
 
     def restore_all_limited_apps_resources(self):
         """Restore all limited apps resources"""
-        global g_limited_apps, g_limited_apps_manual
+        global g_limited_apps, g_limited_apps_manual, g_extra_cgroup_ids
         if not g_limited_apps and not g_limited_apps_manual:
             logger.info("No limited apps to restore")
             return
@@ -959,18 +1093,23 @@ class DynamicBalancer:
                 app_source = "manual" if app_id in g_limited_apps_manual else "auto"
                 logger.info(f"Restoring resources for {app_source} limited app: {app_id}, name: {app_name}")
                 restore_success = True
+                extra_ids = g_extra_cgroup_ids.pop(app_id, [])
 
                 # Restore CPU/Memory limits
                 if limit_parts.get('cpu_mem_limited', False):
                     if not self.controlManager.adjust_resources(app_id, "low"):
                         logger.error(f"Failed to restore CPU/Memory for {app_source} limited app {app_id}")
                         restore_success = False
+                    for extra_id in extra_ids:
+                        self.controlManager.adjust_resources(extra_id, "low")
 
                 # Restore IO limits
                 if limit_parts.get('io_limited', False):
                     if not self.io_ctl.restore_disk_io_throttle(app_id):
                         logger.error(f"Failed to remove IO limits for {app_source} limited app {app_id}")
                         restore_success = False
+                    for extra_id in extra_ids:
+                        self.io_ctl.restore_disk_io_throttle(extra_id)
 
                 if restore_success:
                     logger.info(f"{app_source.capitalize()} limited app resources restoration completed")
@@ -1047,7 +1186,7 @@ class DynamicBalancer:
 
     def set_resource_limit(self, app_id: str, app_name: str, priority: str = None) -> bool:
         """设置应用资源限制（平衡版）"""
-        global g_limited_apps_manual, g_app_id_mapping
+        global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids
 
         # Get limit rates based on priority
         priority = priority or "undefined"
@@ -1062,7 +1201,18 @@ class DynamicBalancer:
             logger.warning(f"No resource usage data for {app_name}, using empty defaults")
             usage = {}
 
-        effective_app_id = os.path.basename(usage.get("cgroup_path", ""))
+        # For multi-process apps usage.cgroup_paths lists every cgroup; for
+        # single-cgroup apps fall back to the single cgroup_path.
+        all_cgroup_paths = usage.get("cgroup_paths") or (
+            [usage["cgroup_path"]] if usage.get("cgroup_path") else []
+        )
+        effective_app_ids = [os.path.basename(p) for p in all_cgroup_paths if p]
+        if not effective_app_ids:
+            logger.warning(f"Could not determine cgroup path for {app_name} (ID: {app_id})")
+            return False
+        effective_app_id = effective_app_ids[0]   # primary (lexicographically smallest cgroup)
+        extra_effective_ids = effective_app_ids[1:]
+
         cpu_usage_percent = usage.get("cpu_percent", 0) if usage.get("cpu_percent", 0) >= 10 else 0
         mem_current = usage.get("mem_current", 0) + usage.get("mem_swap_current", 0)  # RSS + swap = true working set
         io_read_mb = usage.get("io_read_mb", 0)
@@ -1099,22 +1249,56 @@ class DynamicBalancer:
         resource_limited = False
         io_limited = False
 
-        # CPU/内存限制
-        if (cpu_quota is not None or mem_high is not None) and self.is_running:
-            if self.controlManager.adjust_resources(
-                    effective_app_id, "critical",
-                    cpu_quota=cpu_quota,
-                    mem_high=mem_high
-            ):
-                resource_limited = True
-                # The memory limit will affect the data of PSI, causing misjudgment of the system pressure,
-                # and it is necessary to reduce the effect of data on psi
-                self.controlManager.set_limited_app_dominant(True)
-                logger.info(f"Successfully set CPU/Memory limits for {app_name}")
-            else:
-                logger.error(f"Failed to set CPU/Memory limits for {app_name}")
+        # Per-cgroup breakdown for proportional distribution (keyed by basename).
+        # Only present for multi-process apps from _get_multi_process_app_resource_usage.
+        per_cg_mem = usage.get('per_cgroup_mem', {})       # {basename: bytes}
+        per_cg_cpu_delta = usage.get('per_cgroup_cpu_delta', {})  # {basename: cpu usec delta}
 
-        # 磁盘IO限制
+        # CPU/内存限制 – distribute proportionally for multi-cgroup apps so the
+        # aggregate allowed headroom equals the intended cap, not N × cap.
+        if (cpu_quota is not None or mem_high is not None) and self.is_running:
+            if extra_effective_ids:
+                all_ids = [effective_app_id] + extra_effective_ids
+                mem_dist = _split_proportionally(mem_high, all_ids, per_cg_mem)
+                cpu_dist = _split_proportionally(cpu_quota, all_ids, per_cg_cpu_delta)
+                primary_ok = self.controlManager.adjust_resources(
+                    effective_app_id, "critical",
+                    cpu_quota=cpu_dist.get(effective_app_id, cpu_quota),
+                    mem_high=mem_dist.get(effective_app_id, mem_high),
+                )
+                if primary_ok:
+                    resource_limited = True
+                    # The memory limit will affect the data of PSI, causing misjudgment of the system pressure,
+                    # and it is necessary to reduce the effect of data on psi
+                    self.controlManager.set_limited_app_dominant(True)
+                    logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
+                else:
+                    logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
+                for extra_id in extra_effective_ids:
+                    ok = self.controlManager.adjust_resources(
+                        extra_id, "critical",
+                        cpu_quota=cpu_dist.get(extra_id, cpu_quota),
+                        mem_high=mem_dist.get(extra_id, mem_high),
+                    )
+                    logger.info(
+                        f"{'Successfully set' if ok else 'Failed to set'} "
+                        f"CPU/Memory limits for extra cgroup {extra_id}"
+                    )
+            else:
+                if self.controlManager.adjust_resources(
+                        effective_app_id, "critical",
+                        cpu_quota=cpu_quota,
+                        mem_high=mem_high
+                ):
+                    resource_limited = True
+                    # The memory limit will affect the data of PSI, causing misjudgment of the system pressure,
+                    # and it is necessary to reduce the effect of data on psi
+                    self.controlManager.set_limited_app_dominant(True)
+                    logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
+                else:
+                    logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
+
+        # 磁盘IO限制 – apply to primary and all extra cgroups
         if is_io_limit and io_limits and self.is_running:
             limits = {
                 "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
@@ -1124,15 +1308,13 @@ class DynamicBalancer:
                     "riops": io_limits['read_iops']
                 }
             }
-            io_limited = self.io_ctl.set_disk_io_throttle(
-                effective_app_id,
-                limits=limits
-            )
-
+            io_limited = self.io_ctl.set_disk_io_throttle(effective_app_id, limits=limits)
             if io_limited:
-                logger.info(f"Successfully set disk IO limits for {app_name}")
+                logger.info(f"Successfully set disk IO limits for {app_name} ({effective_app_id})")
             else:
-                logger.error(f"Failed to set disk IO limit for {app_name}")
+                logger.error(f"Failed to set disk IO limit for {app_name} ({effective_app_id})")
+            for extra_id in extra_effective_ids:
+                self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
         # 6. 记录限制状态（只要有一个限制成功就记录）
         if resource_limited or io_limited:
@@ -1140,7 +1322,9 @@ class DynamicBalancer:
                 'cpu_mem_limited': resource_limited,
                 'io_limited': io_limited
             }, None)  # None 表示完全限制
-            g_app_id_mapping[app_id] = effective_app_id
+            g_app_id_mapping[app_id] = effective_app_ids  # store full list for restore
+            if extra_effective_ids:
+                g_extra_cgroup_ids[effective_app_id] = extra_effective_ids
             app_utils.update_app_status(app_id, "a_limited")
             app_utils.callback_manager.send_callback_notification({
                 'app_id': app_id,
@@ -1156,26 +1340,36 @@ class DynamicBalancer:
 
     def set_restore_resource(self, app_id: str) -> bool:
         """根据 app_id 恢复资源限制"""
-        global g_limited_apps_manual, g_app_id_mapping
+        global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids
 
-        # 获取有效应用ID
-        effective_app_id = g_app_id_mapping.pop(app_id, app_id)
-        app_name, _, limit_parts, _ = g_limited_apps_manual.pop(effective_app_id, None)
+        # 获取有效应用ID – may be a list for multi-cgroup apps
+        raw = g_app_id_mapping.pop(app_id, app_id)
+        effective_app_ids = raw if isinstance(raw, list) else [raw]
+        effective_app_id = effective_app_ids[0]
+        extra_effective_ids = effective_app_ids[1:]
+        # Also pick up any extras recorded via g_extra_cgroup_ids (e.g. from auto path)
+        extra_effective_ids = extra_effective_ids or g_extra_cgroup_ids.pop(effective_app_id, [])
+
+        app_name, _, limit_parts, _ = g_limited_apps_manual.pop(effective_app_id, (None, None, {}, None))
         restore_success = True
         try:
             logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
 
-            # 恢复CPU/内存
+            # 恢复CPU/内存 – primary and all extra cgroups
             if limit_parts.get('cpu_mem_limited', False):
                 if not self.controlManager.adjust_resources(effective_app_id, "low"):
-                    logger.error(f"Failed to restore CPU/Memory for {app_id}")
+                    logger.error(f"Failed to restore CPU/Memory for {app_id} ({effective_app_id})")
                     restore_success = False
+                for extra_id in extra_effective_ids:
+                    self.controlManager.adjust_resources(extra_id, "low")
 
-            # 恢复IO限制
+            # 恢复IO限制 – primary and all extra cgroups
             if limit_parts.get('io_limited', False):
                 if not self.io_ctl.restore_disk_io_throttle(effective_app_id):
-                    logger.error(f"Failed to remove IO limits for {app_id}")
+                    logger.error(f"Failed to remove IO limits for {app_id} ({effective_app_id})")
                     restore_success = False
+                for extra_id in extra_effective_ids:
+                    self.io_ctl.restore_disk_io_throttle(extra_id)
 
             if restore_success:
                 app_utils.update_app_status(app_id, "running")

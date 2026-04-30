@@ -12,51 +12,71 @@ weights:
   cpu: 2
   memory: 7
   io: 1
-dominant_app_reduce_factor: 3  # When a limited app is dominant and system is not busy, divide both weights and resource_adjust_factor by this value
+dominant_app_reduce_factor: 3.5  # When a limited app is dominant and system is not busy, divide both weights and resource_adjust_factor by this value
 cpu_busy_threshold: 90
 memory_busy_threshold: 90
 disk_utilization_threshold: 95
 disk_iowait_threshold: 10
 disk_io_throughput_threshold_kb: 102400  # KB/s, i.e. 100 MB/s
-all_apps:
-  - name: "calculator"  # calculator
-    id: "org.gnome.Calculator.desktop"  # org.gnome.Calculator.desktop
-    commandline: "gnome-calculator"  # gnome-calculator
-  - name: "vlc" # VLC media player
+controlled_apps:
+  # Each entry supports five fields:
+  #   name        – display name; also used as the DB app_name key
+  #   id          – unique identifier; used as DB primary key and for systemd
+  #                 scope/service matching when applying resource limits
+  #   commandline – command line of the main process; used by pgrep when
+  #                 adjusting OOM scores; optional but recommended
+  #   bpf_name    – list of executable names (comm/basename) that BPF should
+  #                 watch for execve events to detect app launch/exit
+  #   process_names – list of process names that belong to this app; if empty
+  #                   the balancer uses the standard cgroup-based auto-discovery;
+  #                   if non-empty these processes are looked up explicitly and
+  #                   their resources are aggregated across all cgroups they may
+  #                   reside in (useful for multi-process / multi-cgroup apps)
+  - name: "calculator"
+    id: "org.gnome.Calculator.desktop"
+    commandline: "gnome-calculator"
+    bpf_name: ["gnome-calculator"]
+    process_names: []
+  - name: "vlc"
     id: "vlc.desktop"
     commandline: "/usr/bin/vlc"
-  - name: "ollama serve" # ollama qwen
+    bpf_name: ["vlc"]
+    process_names: []
+  - name: "ollama serve"
     id: "start-ollama.sh"
     commandline: "./start-ollama.sh"
-  - name: "Text Editor" # Text Editor
+    bpf_name: ["start-ollama.sh"]
+    process_names: []
+  - name: "Text Editor"
     id: "org.gnome.TextEditor.desktop"
     commandline: "gnome-text-editor %U"
-  - name: "llama-server" # llama-server
+    bpf_name: ["gnome-text-editor"]
+    process_names: []
+  - name: "llama-server"
     id: "llama-server"
     commandline: "./llama-server -m"
-  - name: "bm_ovqwen3-8b" # benchmark
+    bpf_name: ["llama-server"]
+    process_names: []
+  - name: "bm_ovqwen3-8b"
     id: "benchmark.py"
     commandline: "python benchmark.py"
+    bpf_name: ["mybench"]
+    process_names: []
+  - name: "System Monitor"
+    id: "gnome-system-monitor"
+    commandline: "gnome-system-monitor"
+    bpf_name: ["gnome-system-monitor"]
+    process_names: []
+  - name: "helicon search"
+    id: "hs_agent.service"
+    commandline: "system service"
+    bpf_name: ["hs_agent"]
+    process_names: ["HeliconSearch_agent", "VLMService"]
 weights_top:
   cpu: 2
   memory: 7
   io: 1  # reserved; IO is ranked separately via mode='io' and does not contribute to the default score
-  gpu: 1  # added to the default score as a secondary factor after GPU data is collected
-monitor_apps:  # Some specific apps to monitor by BPF
-  - name: "Calculator"
-    bpf_name: ["gnome-calculator"]
-  - name: "VLC media player"
-    bpf_name: ["vlc"]
-  - name: "System Monitor"
-    bpf_name: ["gnome-system-monitor"]
-  - name: "Text Editor"
-    bpf_name: ["gnome-text-editor"]
-  - name: "ollama serve"
-    bpf_name: [ "start-ollama.sh" ]
-  - name: "llama-server"
-    bpf_name: [ "llama-server" ]
-  - name: "bm_ovqwen3-8b"
-    bpf_name: [ "mybench" ]
+  gpu: 5  # added to the default score as a secondary factor after GPU data is collected
 blacklist:
   - systemd
   - kworker
@@ -80,9 +100,9 @@ limit_policy: # 默认对不同优先级应用设置的资源限制比率
   memory:
     enabled: true
     rate:
-      high: 0.5  # MemoryHigh软限制
-      medium: 0.3
-      low: 0.2
+      high: 0.3  # MemoryHigh软限制
+      medium: 0.2
+      low: 0.1
       undefined: 0.1
   disk_io:  #
     enabled: true  # 是否启用磁盘 IO 限制，默认不对不同应用做统一的被动限制，推荐通过 API 为各应用配置差异化的主动限制
