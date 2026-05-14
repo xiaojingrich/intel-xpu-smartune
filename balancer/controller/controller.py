@@ -213,7 +213,12 @@ class Controller:
         # 铁威马系统上service与scope一样的执行cmd，不需要unit_type
         if app_id.endswith('.scope'):
             matching_app = app_id
-            unit_type = 'scope' if matching_app in scopes else 'service'
+            if matching_app in scopes:
+                unit_type = 'scope'
+            elif self._is_system_service(app_id):
+                unit_type = 'system_service'
+            else:
+                unit_type = 'service'
         elif app_id.endswith('.service'):
             matching_app = app_id
             # System services (under /sys/fs/cgroup/system.slice/) must use
@@ -287,6 +292,7 @@ class Controller:
 
             cmd = cmd_base + properties
 
+            logger.debug(f"Executing command: {' '.join(cmd)}")
             for attempt in range(1, _MAX_RETRIES + 1):
                 try:
                     result = subprocess.run(
