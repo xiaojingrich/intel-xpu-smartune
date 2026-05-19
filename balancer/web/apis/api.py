@@ -63,6 +63,7 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         self.app_set_oom_score_url = MULTIAPPS_URL + '/app/set_oom_score'
         self.app_cancel_relaunch_url = MULTIAPPS_URL + '/app/cancel_relaunch'
         self.app_resource_limit_url = MULTIAPPS_URL + '/app/resource_limit'
+        self.app_resource_limit_profile_url = MULTIAPPS_URL + '/app/resource_limit_profile'
         self.app_resource_restore_url = MULTIAPPS_URL + '/app/resource_restore'
         self.app_get_pending_url = MULTIAPPS_URL + '/app/get_pending_app'
         self.app_obtain_url = MULTIAPPS_URL + '/app/get_apps'
@@ -151,12 +152,30 @@ class Client_multiapps_api(metaclass=SingletonMeta):
         """
         return self.ma_bridge.cancel_relaunch(self.app_cancel_relaunch_url, app_id, self.session)
 
-    def resource_limit(self, app_id, app_name, priority):
+    def resource_limit(self, app_id, app_name, priority, limit_overrides=None):
         """
         :param app_id: according to app_id to do the resource limit.
         :return:
         """
-        return self.ma_bridge.resource_limit(self.app_resource_limit_url, app_id, app_name, priority, self.session)
+        return self.ma_bridge.resource_limit(
+            self.app_resource_limit_url, app_id, app_name, priority, self.session, limit_overrides=limit_overrides
+        )
+
+    def resource_limit_profile(self, app_id, app_name, priority):
+        data = {"app_id": app_id, "app_name": app_name, "priority": priority}
+        try:
+            response = self.session.post(self.app_resource_limit_profile_url, json=data, timeout=5)
+            response.raise_for_status()
+            response_data = response.json()
+            if "retcode" in response_data and response_data["retcode"] == 0:
+                return response_data.get("data", {})
+            return {}
+        except requests.exceptions.SSLError as e:
+            print(f"SSL verification failed: {e}, please check your SSL configuration.")
+            return {}
+        except requests.exceptions.RequestException as e:
+            print('resource_limit_profile request error: ', e)
+            return {}
 
     def restore_resource(self, app_id):
         """

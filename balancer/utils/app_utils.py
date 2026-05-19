@@ -832,6 +832,7 @@ def fetch_all_apps():
                 "app_name": name,          # normalized key expected by the React dashboard
                 "app_id": app_id,
                 "cmdline": app.get("commandline", ""),
+                "process_names": app.get("process_names", []) or [],
                 "display_name": name,
             }
             app_list.append(app_data)
@@ -843,6 +844,7 @@ def fetch_all_apps():
                 "app_name": app.get_name(),  # normalized key expected by the React dashboard
                 "app_id": app.get_id(),  # org.gnome.Calculator.desktop
                 "cmdline": app.get_commandline() or "",  # gnome-calculator
+                "process_names": [],
                 "display_name": app.get_display_name()
             }
             app_list.append(app_data)

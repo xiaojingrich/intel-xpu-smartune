@@ -14,6 +14,7 @@ import type {
   AppIdPayload,
   SetPriorityPayload,
   ResourceLimitPayload,
+  ResourceLimitProfileData,
 } from './types'
 
 const client = axios.create({
@@ -88,6 +89,8 @@ export const api = {
     post<void>('/app/cancel_relaunch', payload),
   resourceLimit: (payload: ResourceLimitPayload) =>
     post<void>('/app/resource_limit', payload),
+  getResourceLimitProfile: (payload: Pick<ResourceLimitPayload, 'app_id' | 'app_name' | 'priority'>) =>
+    post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
   resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/resource_restore', payload),
 }

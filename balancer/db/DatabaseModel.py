@@ -151,6 +151,7 @@ class AIAppPriority(DataBaseModel):
     remark = CharField(max_length=255, null=True, help_text="remark for this app", index=True)
     up_time = DateTimeField(null=True, index=True)
     status = CharField(default="NA", max_length=32, null=True, help_text="app status, NA, running, pending, stopped", index=True)
+    limit_overrides_json = TextField(null=True, help_text="per-app manual resource limit overrides (JSON)")
 
 
 class MonitorSnapshot(DataBaseModel):
@@ -223,8 +224,22 @@ class MonitorSnapshot(DataBaseModel):
                 return 0
 
 
+def _apply_migrations():
+    """Apply incremental schema migrations for existing databases."""
+    migrations = [
+        "ALTER TABLE aiapppriority ADD COLUMN limit_overrides_json TEXT",
+    ]
+    for sql in migrations:
+        try:
+            db.execute_sql(sql)
+        except OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                print(f"Migration warning ({sql!r}): {e}")
+
+
 def init_database():
     db.create_tables([AIAppPriority, MonitorSnapshot])  # Add other tables as needed
+    _apply_migrations()
 
 
 if __name__ == "__main__":

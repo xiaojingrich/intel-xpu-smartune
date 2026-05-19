@@ -1,9 +1,10 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os, signal, time
 from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from collections import OrderedDict
 from monitor import AppIntercept
@@ -23,7 +24,12 @@ g_limited_apps = OrderedDict()  # 记录被限制的应用
 g_limited_apps_manual = OrderedDict()  # 记录被限制的应用
 g_app_id_mapping = {}  # {app_id: list[effective_app_id] | str} – list for multi-cgroup apps (set by set_resource_limit), str fallback for legacy paths
 g_extra_cgroup_ids: dict = {}  # {primary_effective_app_id: [extra_id, ...]} for multi-cgroup apps
+g_manual_limit_baseline: dict = {}  # {effective_app_id: peak usage snapshot} – persists across restore→limit cycles
+                                    # to prevent an artificially low second sample (caused by an active limit)
+                                    # from computing an even tighter cap on subsequent limit invocations
 is_limited_app_dominant = False  # critical情况下，用于判断拿到的Top进程是否为已限制的进程
+IO_LIMIT_MBPS_THRESHOLD = 100
+IO_LIMIT_IOPS_THRESHOLD = 1000
 
 @dataclass
 class WorkloadGroup:
@@ -1075,7 +1081,7 @@ class DynamicBalancer:
 
     def restore_all_limited_apps_resources(self):
         """Restore all limited apps resources"""
-        global g_limited_apps, g_limited_apps_manual, g_extra_cgroup_ids
+        global g_limited_apps, g_limited_apps_manual, g_extra_cgroup_ids, g_manual_limit_baseline
         if not g_limited_apps and not g_limited_apps_manual:
             logger.info("No limited apps to restore")
             return
@@ -1119,6 +1125,7 @@ class DynamicBalancer:
                 # Remove app from tracking regardless of restore success to avoid repeated attempts on failure
                 g_limited_apps.pop(app_id, None)
                 g_limited_apps_manual.pop(app_id, None)
+                g_manual_limit_baseline.pop(app_id, None)
 
         logger.info("All limited apps resources restoration completed")
 
@@ -1145,7 +1152,175 @@ class DynamicBalancer:
 
         return killed
 
-    def get_limited_rates(self, priority: str) -> Dict[str, Union[float, Dict[str, int], None]]:
+    def _get_limit_rate_bounds(self, priority: str) -> Dict[str, Dict[str, float]]:
+        priority = (priority or "undefined").lower()
+        cpu_bounds = {
+            "high": {"min": 0.10, "max": 0.90},
+            "medium": {"min": 0.05, "max": 0.70},
+            "low": {"min": 0.01, "max": 0.50},
+            "undefined": {"min": 0.01, "max": 0.40},
+        }
+        mem_bounds = {
+            "high": {"min": 0.10, "max": 0.60},
+            "medium": {"min": 0.05, "max": 0.40},
+            "low": {"min": 0.01, "max": 0.30},
+            "undefined": {"min": 0.01, "max": 0.30},
+        }
+        return {
+            "cpu": cpu_bounds.get(priority, cpu_bounds["undefined"]),
+            "memory": mem_bounds.get(priority, mem_bounds["undefined"]),
+        }
+
+    @staticmethod
+    def _clamp_rate(value: Optional[float], low: float, high: float) -> Optional[float]:
+        if value is None:
+            return None
+        return max(low, min(high, float(value)))
+
+    def _get_policy_rate_options(self, resource: str, priority: str, current_rate: Optional[float]) -> list[float]:
+        """Return sorted percentage options derived from yaml limit_policy rates."""
+        policy = (self.config.limit_policy or {}).get(resource, {}) if hasattr(self.config, 'limit_policy') else {}
+        rate_cfg = policy.get("rate", {}) if isinstance(policy, dict) else {}
+        values: list[float] = []
+
+        if isinstance(rate_cfg, dict):
+            for raw in rate_cfg.values():
+                try:
+                    v = float(raw)
+                    if v > 0:
+                        values.append(v)
+                except (TypeError, ValueError):
+                    continue
+
+            # Make sure current-priority config is always included if present.
+            p_val = rate_cfg.get((priority or "undefined").lower())
+            try:
+                if p_val is not None:
+                    pv = float(p_val)
+                    if pv > 0:
+                        values.append(pv)
+            except (TypeError, ValueError):
+                pass
+
+        if current_rate is not None:
+            values.append(float(current_rate))
+
+        if not values:
+            return []
+
+        unique_sorted = sorted({round(v * 100, 1) for v in values if v > 0})
+        return unique_sorted
+
+    @staticmethod
+    def _is_io_limit_reached(io_read_mb: float, io_write_mb: float, io_read_iops: float, io_write_iops: float) -> bool:
+        return (
+            (io_read_mb + io_write_mb) >= IO_LIMIT_MBPS_THRESHOLD or
+            (io_read_iops + io_write_iops) >= IO_LIMIT_IOPS_THRESHOLD
+        )
+
+    def _load_app_limit_overrides(self, app_id: str) -> Optional[Dict[str, Any]]:
+        """Load per-app manually saved limit overrides from the DB."""
+        try:
+            from db.DatabaseModel import AIAppPriority
+            record = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
+            if record and record.limit_overrides_json:
+                return json.loads(record.limit_overrides_json)
+        except Exception as e:
+            logger.debug(f"Could not load per-app limit overrides for '{app_id}': {e}")
+        return None
+
+    def get_resource_limit_profile(self, app_id: str, app_name: str, priority: str = "undefined") -> Dict[str, Any]:
+        priority = (priority or "undefined").lower()
+        app_overrides = self._load_app_limit_overrides(app_id)
+        rates = self.get_limited_rates(priority, limit_overrides=app_overrides)
+        bounds = self._get_limit_rate_bounds(priority)
+
+        cpu_rate = rates.get("cpu_rate")
+        mem_rate = rates.get("mem_rate")
+        # Use the saved per-app disk IO rate values for display regardless of whether the
+        # enabled switch is on or off.  get_limited_rates() skips populating disk_io_rate
+        # when disk_enabled=False, which would cause the form to fall back to config defaults
+        # instead of the previously saved values.
+        saved_disk_rate = (
+            app_overrides.get("disk_io", {}).get("rate")
+            if isinstance(app_overrides, dict) and isinstance(app_overrides.get("disk_io"), dict)
+            else None
+        )
+        io_rate = rates.get("disk_io_rate") or (saved_disk_rate if isinstance(saved_disk_rate, dict) else {})
+        cpu_options = self._get_policy_rate_options("cpu", priority, cpu_rate)
+        mem_options = self._get_policy_rate_options("memory", priority, mem_rate)
+
+        usage = app_utils.get_app_resource_usage(app_id, app_name) or {}
+        io_read_mb = usage.get("io_read_mb", 0)
+        io_write_mb = usage.get("io_write_mb", 0)
+        io_read_iops = usage.get("io_read_iops", 0)
+        io_write_iops = usage.get("io_write_iops", 0)
+        is_io_limit = self._is_io_limit_reached(io_read_mb, io_write_mb, io_read_iops, io_write_iops)
+
+        process_names = app_utils._get_app_process_names(app_id=app_id, app_name=app_name) or []
+        cgroup_paths = usage.get("cgroup_paths") or ([usage.get("cgroup_path")] if usage.get("cgroup_path") else [])
+        cgroup_ids = [os.path.basename(path) for path in cgroup_paths if path]
+
+        # Config-level defaults for disk IO at this priority, used as fallback when no per-app override is active.
+        disk_policy = (self.config.limit_policy or {}).get('disk_io', {}) if hasattr(self.config, 'limit_policy') else {}
+        disk_rates_cfg = disk_policy.get('rate', {}) if isinstance(disk_policy, dict) else {}
+        cfg_disk_rate = (
+            disk_rates_cfg.get(priority)
+            or disk_rates_cfg.get('undefined')
+            or {}
+        )
+
+        def _io_item(key: str, v: Any) -> Dict[str, int]:
+            cfg_default = cfg_disk_rate.get(key) if isinstance(cfg_disk_rate, dict) else None
+            if v is not None:
+                value = max(1, int(v))
+            elif cfg_default is not None:
+                value = max(1, int(cfg_default))
+            else:
+                value = 1
+            return {"value": value, "min": 1, "max": value}
+
+        # disk IO section is enabled if the user has previously saved a per-app override with
+        # enabled=True, OR if the app currently exhibits high IO pressure.
+        has_app_io_override = bool(
+            isinstance(app_overrides, dict)
+            and isinstance(app_overrides.get("disk_io"), dict)
+            and app_overrides["disk_io"].get("enabled", False)
+        )
+        disk_io_enabled = has_app_io_override or (bool(io_rate) and is_io_limit)
+
+        return {
+            "cpu": {
+                "enabled": cpu_rate is not None,
+                "value": round((cpu_rate or 0) * 100, 2),
+                "min": round(bounds["cpu"]["min"] * 100, 2),
+                "max": round(bounds["cpu"]["max"] * 100, 2),
+                "options": cpu_options,
+            },
+            "memory": {
+                "enabled": mem_rate is not None,
+                "value": round((mem_rate or 0) * 100, 2),
+                "min": round(bounds["memory"]["min"] * 100, 2),
+                "max": round(bounds["memory"]["max"] * 100, 2),
+                "options": mem_options,
+            },
+            "disk_io": {
+                "enabled": disk_io_enabled,
+                "is_io_limit": is_io_limit,
+                "write": _io_item("write", io_rate.get("write")),
+                "read": _io_item("read", io_rate.get("read")),
+                "write_iops": _io_item("write_iops", io_rate.get("write_iops")),
+                "read_iops": _io_item("read_iops", io_rate.get("read_iops")),
+            },
+            "process_names": process_names,
+            "cgroup_ids": sorted(set(cgroup_ids)),
+        }
+
+    def get_limited_rates(
+            self,
+            priority: str,
+            limit_overrides: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Union[float, Dict[str, int], None]]:
         """
         根据优先级获取所有已启用的资源限制配置
         :return:
@@ -1166,31 +1341,77 @@ class DynamicBalancer:
         if not hasattr(self.config, 'limit_policy'):
             return result
 
+        bounds = self._get_limit_rate_bounds(priority)
+        overrides = limit_overrides or {}
+
+        limit_policy_cfg = self.config.limit_policy or {}
+
         # 处理CPU限制
-        if 'cpu' in self.config.limit_policy and self.config.limit_policy['cpu'].get('enabled', False):
-            cpu_rates = self.config.limit_policy['cpu'].get('rate', {})
-            result['cpu_rate'] = cpu_rates.get(priority)
+        cpu_cfg = limit_policy_cfg.get('cpu', {})
+        cpu_rates = cpu_cfg.get('rate', {})
+        cpu_ovr = overrides.get("cpu", {}) if isinstance(overrides.get("cpu", {}), dict) else {}
+        cpu_enabled = cpu_ovr.get("enabled", cpu_cfg.get('enabled', False))
+        cpu_rate = cpu_ovr.get("rate", cpu_rates.get(priority))
+        if cpu_enabled and cpu_rate is not None:
+            result['cpu_rate'] = self._clamp_rate(cpu_rate, bounds["cpu"]["min"], bounds["cpu"]["max"])
 
         # 处理内存限制
-        if 'memory' in self.config.limit_policy and self.config.limit_policy['memory'].get('enabled', False):
-            mem_rates = self.config.limit_policy['memory'].get('rate', {})
-            result['mem_rate'] = mem_rates.get(priority)
+        mem_cfg = limit_policy_cfg.get('memory', {})
+        mem_rates = mem_cfg.get('rate', {})
+        mem_ovr = overrides.get("memory", {}) if isinstance(overrides.get("memory", {}), dict) else {}
+        mem_enabled = mem_ovr.get("enabled", mem_cfg.get('enabled', False))
+        mem_rate = mem_ovr.get("rate", mem_rates.get(priority))
+        if mem_enabled and mem_rate is not None:
+            result['mem_rate'] = self._clamp_rate(mem_rate, bounds["memory"]["min"], bounds["memory"]["max"])
 
         # 处理磁盘IO限制
-        if 'disk_io' in self.config.limit_policy and self.config.limit_policy['disk_io'].get('enabled', False):
-            disk_rates = self.config.limit_policy['disk_io'].get('rate', {})
-            result['disk_io_rate'] = disk_rates.get(priority)
+        disk_cfg = limit_policy_cfg.get('disk_io', {})
+        disk_rates = disk_cfg.get('rate', {})
+        default_disk_rate = disk_rates.get(priority)
+        disk_ovr = overrides.get("disk_io", {}) if isinstance(overrides.get("disk_io", {}), dict) else {}
+        disk_enabled = disk_ovr.get("enabled", disk_cfg.get('enabled', False))
+        disk_rate = disk_ovr.get("rate", default_disk_rate)
+        if disk_enabled and isinstance(disk_rate, dict):
+            def _to_pos_int(name: str, fallback: int) -> int:
+                raw = disk_rate.get(name, fallback)
+                try:
+                    return max(1, int(float(raw)))
+                except (TypeError, ValueError):
+                    return max(1, int(fallback))
+
+            default_write = default_disk_rate.get("write", 1) if default_disk_rate else 1
+            default_read = default_disk_rate.get("read", 1) if default_disk_rate else 1
+            default_wiops = default_disk_rate.get("write_iops", 1) if default_disk_rate else 1
+            default_riops = default_disk_rate.get("read_iops", 1) if default_disk_rate else 1
+            result['disk_io_rate'] = {
+                "write": _to_pos_int("write", default_write),
+                "read": _to_pos_int("read", default_read),
+                "write_iops": _to_pos_int("write_iops", default_wiops),
+                "read_iops": _to_pos_int("read_iops", default_riops),
+            }
 
         logger.debug(f"Priority '{priority}' limit rates: {result}")
         return result
 
-    def set_resource_limit(self, app_id: str, app_name: str, priority: str = None) -> bool:
+    def set_resource_limit(
+            self,
+            app_id: str,
+            app_name: str,
+            priority: str = None,
+            limit_overrides: Optional[Dict[str, Any]] = None
+    ) -> bool:
         """设置应用资源限制（平衡版）"""
-        global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids
+        global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids, g_manual_limit_baseline
 
         # Get limit rates based on priority
         priority = priority or "undefined"
-        limit_rates = self.get_limited_rates(priority)
+        if isinstance(limit_overrides, dict):
+            try:
+                from db.DatabaseModel import AIAppPriority
+                AIAppPriority.update_record(id=app_id, limit_overrides_json=json.dumps(limit_overrides))
+            except Exception as e:
+                logger.warning(f"Failed to persist per-app limit overrides for '{app_id}': {e}")
+        limit_rates = self.get_limited_rates(priority, limit_overrides=limit_overrides)
         if not limit_rates:
             logger.error(f"No limit rates defined for priority: {priority}")
             return False
@@ -1213,25 +1434,55 @@ class DynamicBalancer:
         effective_app_id = effective_app_ids[0]   # primary (lexicographically smallest cgroup)
         extra_effective_ids = effective_app_ids[1:]
 
-        cpu_usage_percent = usage.get("cpu_percent", 0) if usage.get("cpu_percent", 0) >= 10 else 0
+        # Collect raw (unfiltered) resource values from the current sample.
+        raw_cpu_percent = usage.get("cpu_percent", 0)
         mem_current = usage.get("mem_current", 0) + usage.get("mem_swap_current", 0)  # RSS + swap = true working set
         io_read_mb = usage.get("io_read_mb", 0)
         io_write_mb = usage.get("io_write_mb", 0)
         io_read_iops = usage.get("io_read_iops", 0)
         io_write_iops = usage.get("io_write_iops", 0)
-        is_io_limit = (io_read_mb + io_write_mb) >= 100 or (io_read_iops + io_write_iops) >= 1000  # 100MB/s或1000 IOPS
+
+        # Peak-latch: if this app was previously manually limited, compare the current
+        # sample against the stored peak and take the higher value for each resource.
+        # This prevents a second "limit" invocation from computing an even tighter cap
+        # because the first limit is still active and artificially suppresses the reading.
+        # The baseline stores raw (pre-filter) cpu_percent so comparisons remain meaningful
+        # even when the first sample was below the 10% threshold.
+        baseline = g_manual_limit_baseline.get(effective_app_id, {})
+        if baseline:
+            raw_cpu_percent = max(raw_cpu_percent, baseline.get("cpu_percent", 0))
+            mem_current = max(mem_current, baseline.get("mem_total", 0))
+            io_read_mb = max(io_read_mb, baseline.get("io_read_mb", 0))
+            io_write_mb = max(io_write_mb, baseline.get("io_write_mb", 0))
+            io_read_iops = max(io_read_iops, baseline.get("io_read_iops", 0))
+            io_write_iops = max(io_write_iops, baseline.get("io_write_iops", 0))
+            logger.debug(
+                f"[peak-latch] {app_name}: CPU {usage.get('cpu_percent', 0):.1f}%→{raw_cpu_percent:.1f}% "
+                f"Mem {usage.get('mem_current', 0) + usage.get('mem_swap_current', 0):.1f}→{mem_current:.1f} MB"
+            )
+
+        # Apply the 10% CPU threshold filter once, after peak-latch is resolved.
+        cpu_usage_percent = raw_cpu_percent if raw_cpu_percent >= 10 else 0
+
+        # Keep automatic IO-pressure gating for legacy/auto paths, but if user passes
+        # disk_io overrides from UI, honor user decision directly.
+        is_io_limit = self._is_io_limit_reached(io_read_mb, io_write_mb, io_read_iops, io_write_iops)
+        force_user_io_limit = bool(
+            isinstance(limit_overrides, dict) and isinstance(limit_overrides.get("disk_io"), dict)
+        )
 
         # Set limits based on usage and configured rates
         cpu_quota = int(cpu_usage_percent * limit_rates["cpu_rate"]) if (limit_rates.get("cpu_rate") and
                                                                          cpu_usage_percent > 0) else None
         mem_high = int(mem_current * limit_rates["mem_rate"]) if (limit_rates.get("mem_rate") and mem_current > 0) else None
         io_limits = limit_rates.get("disk_io_rate", {})
+        should_apply_io_limit = bool(io_limits) and (force_user_io_limit or is_io_limit)
 
         # If there is nothing to limit (process undetectable or usage too low), notify the
         # user so they can choose a different app to throttle, then bail out early.
         no_cpu_limit = cpu_quota is None
         no_mem_limit = mem_high is None
-        no_io_limit = not is_io_limit or not io_limits
+        no_io_limit = not should_apply_io_limit
         if no_cpu_limit and no_mem_limit and no_io_limit:
             reason = (
                 f"无法检测到 {app_name} 的资源使用情况，跳过限制。请选择其他应用进行限制。"
@@ -1243,7 +1494,8 @@ class DynamicBalancer:
             return False
 
         logger.debug(f"Calculated limits - CPU: {cpu_quota if cpu_quota else 'No Limit'}, "
-                     f"Memory: {mem_high if mem_high else 'No Limit'}, is_io_limit: {is_io_limit}")
+                     f"Memory: {mem_high if mem_high else 'No Limit'}, is_io_limit: {is_io_limit}, "
+                     f"force_user_io_limit: {force_user_io_limit}, should_apply_io_limit: {should_apply_io_limit}")
 
         # 5. 应用资源限制
         resource_limited = False
@@ -1253,6 +1505,21 @@ class DynamicBalancer:
         # Only present for multi-process apps from _get_multi_process_app_resource_usage.
         per_cg_mem = usage.get('per_cgroup_mem', {})       # {basename: bytes}
         per_cg_cpu_delta = usage.get('per_cgroup_cpu_delta', {})  # {basename: cpu usec delta}
+
+        # Apply peak-latch to per-cgroup breakdowns so proportional distribution uses historical peak weights.
+        if baseline:
+            baseline_pcg_mem = baseline.get("per_cgroup_mem", {})
+            baseline_pcg_cpu = baseline.get("per_cgroup_cpu_delta", {})
+            if baseline_pcg_mem:
+                per_cg_mem = {
+                    cg: max(per_cg_mem.get(cg, 0), baseline_pcg_mem.get(cg, 0))
+                    for cg in set(per_cg_mem) | set(baseline_pcg_mem)
+                }
+            if baseline_pcg_cpu:
+                per_cg_cpu_delta = {
+                    cg: max(per_cg_cpu_delta.get(cg, 0), baseline_pcg_cpu.get(cg, 0))
+                    for cg in set(per_cg_cpu_delta) | set(baseline_pcg_cpu)
+                }
 
         # CPU/内存限制 – distribute proportionally for multi-cgroup apps so the
         # aggregate allowed headroom equals the intended cap, not N × cap.
@@ -1299,7 +1566,7 @@ class DynamicBalancer:
                     logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
 
         # 磁盘IO限制 – apply to primary and all extra cgroups
-        if is_io_limit and io_limits and self.is_running:
+        if should_apply_io_limit and io_limits and self.is_running:
             limits = {
                 "default": {  # 如果需要为不同disk设置不同参数，可增加类似"nvme0n1": {...}配置
                     "rbps": io_limits['read'] * 1024 ** 2,
@@ -1332,6 +1599,20 @@ class DynamicBalancer:
                 'status': "a_limited",
                 'purpose': "app"
             }, False)
+            # Save/update the peak-latch baseline so future limit invocations use max(current, peak).
+            # Intentionally not cleared on restore so that a re-limit after restore still benefits
+            # from the historical high-water mark.  raw_cpu_percent already holds max(current, baseline)
+            # after the peak-latch block above.
+            g_manual_limit_baseline[effective_app_id] = {
+                "cpu_percent": raw_cpu_percent,
+                "mem_total": mem_current,
+                "io_read_mb": io_read_mb,
+                "io_write_mb": io_write_mb,
+                "io_read_iops": io_read_iops,
+                "io_write_iops": io_write_iops,
+                "per_cgroup_mem": per_cg_mem,
+                "per_cgroup_cpu_delta": per_cg_cpu_delta,
+            }
             logger.info(f"Recorded resource limits for {app_name}")
             return True
 

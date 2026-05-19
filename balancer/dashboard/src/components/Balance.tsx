@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react'
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import {
   Row,
   Col,
@@ -14,6 +14,10 @@ import {
   Tooltip,
   Modal,
   message,
+  Switch,
+  InputNumber,
+  Divider,
+  Tabs,
 } from 'antd'
 import {
   PlusOutlined,
@@ -24,11 +28,12 @@ import {
   ArrowUpOutlined,
   DatabaseOutlined,
   ReloadOutlined,
+  QuestionCircleOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
-import type { AppInfo } from '../api/types'
+import type { AppInfo, ResourceLimitProfileData } from '../api/types'
 import { useAppEvents } from '../hooks/useAppEvents'
 
 const { Text } = Typography
@@ -47,6 +52,38 @@ interface Props {
   active: boolean
 }
 
+interface LimitDialogState {
+  app: AppInfo | null
+  open: boolean
+  submitting: boolean
+  loadingProfile: boolean
+}
+
+interface LimitFormValues {
+  cpuEnabled: boolean
+  cpuPercent: number
+  cpuMin: number
+  cpuMax: number
+  cpuOptions: number[]
+  memEnabled: boolean
+  memPercent: number
+  memMin: number
+  memMax: number
+  memOptions: number[]
+  diskEnabled: boolean
+  diskDetected: boolean
+  writeMbps: number
+  writeMbpsMax: number
+  readMbps: number
+  readMbpsMax: number
+  writeIops: number
+  writeIopsMax: number
+  readIops: number
+  readIopsMax: number
+  processNames: string[]
+  cgroupIds: string[]
+}
+
 const PRIORITY_OPTIONS = [
   { value: 'low', label: 'Low', color: COLORS.green },
   { value: 'medium', label: 'Medium', color: COLORS.yellow },
@@ -62,6 +99,13 @@ function priorityColor(p?: string): string {
     case 'critical': return COLORS.red
     default: return COLORS.textMuted
   }
+}
+
+function normalizePercentOptions(options: number[] | undefined, fallback: number): number[] {
+  const base = [...(options ?? []), fallback]
+    .map((v) => Number(v))
+    .filter((v) => Number.isFinite(v) && v > 0)
+  return Array.from(new Set(base)).sort((a, b) => a - b)
 }
 
 function PriorityTag({ priority }: { priority?: string }) {
@@ -99,6 +143,40 @@ export default function Balance({ active }: Props) {
   // Per-row priority edit state
   const [rowPriorities, setRowPriorities] = useState<Record<string, string>>({})
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({})
+  const [limitDialog, setLimitDialog] = useState<LimitDialogState>({
+    app: null,
+    open: false,
+    submitting: false,
+    loadingProfile: false,
+  })
+  const [limitForm, setLimitForm] = useState<LimitFormValues>({
+    cpuEnabled: true,
+    cpuPercent: 30,
+    cpuMin: 1,
+    cpuMax: 100,
+    cpuOptions: [30],
+    memEnabled: true,
+    memPercent: 10,
+    memMin: 1,
+    memMax: 100,
+    memOptions: [10],
+    diskEnabled: true,
+    diskDetected: false,
+    writeMbps: 50,
+    writeMbpsMax: 50,
+    readMbps: 60,
+    readMbpsMax: 60,
+    writeIops: 2200,
+    writeIopsMax: 2200,
+    readIops: 20000,
+    readIopsMax: 20000,
+    processNames: [],
+    cgroupIds: [],
+  })
+  // Per-cgroup independent form state for multi-cgroup apps.
+  // Key = cgroup_id. Only populated when cgroupIds.length > 1.
+  const [perTargetForms, setPerTargetForms] = useState<Record<string, LimitFormValues>>({})
+  const [activeLimitTarget, setActiveLimitTarget] = useState<string>('')
 
   const fetchData = useCallback(async () => {
     try {
@@ -265,21 +343,130 @@ export default function Balance({ active }: Props) {
       messageApi.success(`Priority updated for ${app.app_name}`)
     })()
 
-  const handleResourceLimit = (app: AppInfo) =>
-    withLoading(`limit-${app.app_id}`, async () => {
-      try {
+  function applyLimitProfile(profile: ResourceLimitProfileData) {
+    const cpuOptions = normalizePercentOptions(profile.cpu.options, profile.cpu.value)
+    const memOptions = normalizePercentOptions(profile.memory.options, profile.memory.value)
+    const cgIds = profile.cgroup_ids ?? []
+
+    const baseForm: LimitFormValues = {
+      cpuEnabled: profile.cpu.enabled,
+      cpuPercent: Number(profile.cpu.value),
+      cpuMin: profile.cpu.min,
+      cpuMax: profile.cpu.max,
+      cpuOptions,
+      memEnabled: profile.memory.enabled,
+      memPercent: Number(profile.memory.value),
+      memMin: profile.memory.min,
+      memMax: profile.memory.max,
+      memOptions,
+      diskEnabled: Boolean(profile.disk_io.enabled),
+      diskDetected: Boolean(profile.disk_io.is_io_limit),
+      writeMbps: profile.disk_io.write.value,
+      writeMbpsMax: profile.disk_io.write.max,
+      readMbps: profile.disk_io.read.value,
+      readMbpsMax: profile.disk_io.read.max,
+      writeIops: profile.disk_io.write_iops.value,
+      writeIopsMax: profile.disk_io.write_iops.max,
+      readIops: profile.disk_io.read_iops.value,
+      readIopsMax: profile.disk_io.read_iops.max,
+      processNames: profile.process_names ?? [],
+      cgroupIds: cgIds,
+    }
+
+    setLimitForm(baseForm)
+
+    // For multi-cgroup apps, initialise each tab with the same defaults so
+    // they can be edited independently before submitting.
+    if (cgIds.length > 1) {
+      const initialPerTarget: Record<string, LimitFormValues> = {}
+      cgIds.forEach((cg) => { initialPerTarget[cg] = { ...baseForm } })
+      setPerTargetForms(initialPerTarget)
+      setActiveLimitTarget(cgIds[0])
+    } else {
+      setPerTargetForms({})
+      setActiveLimitTarget(cgIds[0] ?? '')
+    }
+  }
+
+  const handleResourceLimit = async (app: AppInfo) => {
+    setLimitDialog({ app, open: true, loadingProfile: true, submitting: false })
+    try {
+      const priority = rowPriorities[app.app_id] ?? app.priority ?? 'medium'
+      const profile = await api.getResourceLimitProfile({
+        app_id: app.app_id,
+        app_name: app.app_name,
+        priority,
+      })
+      applyLimitProfile(profile)
+    } catch (e: unknown) {
+      setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
+      messageApi.error(e instanceof Error ? e.message : 'Failed to load limit profile')
+    } finally {
+      setLimitDialog((prev) => ({ ...prev, loadingProfile: false }))
+    }
+  }
+
+  const submitResourceLimit = async () => {
+    if (!limitDialog.app) return
+
+    setLimitDialog((prev) => ({ ...prev, submitting: true }))
+    try {
+      const priority = rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium'
+      const isMultiTarget = limitForm.cgroupIds.length > 1
+
+      if (isMultiTarget) {
+        const selectedTarget = activeLimitTarget || limitForm.cgroupIds[0]
+        const form = perTargetForms[selectedTarget] ?? limitForm
         await api.resourceLimit({
-          app_id: app.app_id,
-          app_name: app.app_name,
-          priority: rowPriorities[app.app_id] ?? app.priority ?? 'medium',
+          app_id: limitDialog.app.app_id,
+          app_name: limitDialog.app.app_name,
+          priority,
+          cgroup_id: selectedTarget,
+          limit_overrides: {
+            cpu: { enabled: form.cpuEnabled, rate: form.cpuPercent / 100 },
+            memory: { enabled: form.memEnabled, rate: form.memPercent / 100 },
+            disk_io: {
+              enabled: form.diskEnabled,
+              rate: {
+                write: form.writeMbps,
+                read: form.readMbps,
+                write_iops: form.writeIops,
+                read_iops: form.readIops,
+              },
+            },
+          },
         })
-        messageApi.success(`Resource limit applied to ${app.app_name}`)
-      } catch (e: unknown) {
-        messageApi.warning(
-          `Cannot limit ${app.app_name}: resource usage is too low or the process is undetectable. Please choose another app.`
-        )
+      } else {
+        await api.resourceLimit({
+          app_id: limitDialog.app.app_id,
+          app_name: limitDialog.app.app_name,
+          priority,
+          limit_overrides: {
+            cpu: { enabled: limitForm.cpuEnabled, rate: limitForm.cpuPercent / 100 },
+            memory: { enabled: limitForm.memEnabled, rate: limitForm.memPercent / 100 },
+            disk_io: {
+              enabled: limitForm.diskEnabled,
+              rate: {
+                write: limitForm.writeMbps,
+                read: limitForm.readMbps,
+                write_iops: limitForm.writeIops,
+                read_iops: limitForm.readIops,
+              },
+            },
+          },
+        })
       }
-    })()
+      messageApi.success(`Resource limit applied to ${limitDialog.app.app_name}`)
+      setActiveLimitTarget('')
+      setPerTargetForms({})
+      setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
+      await fetchData()
+    } catch (e: unknown) {
+      messageApi.error(e instanceof Error ? e.message : 'Failed to apply resource limit')
+    } finally {
+      setLimitDialog((prev) => ({ ...prev, submitting: false }))
+    }
+  }
 
   const handleResourceRestore = (app: AppInfo) =>
     withLoading(`restore-${app.app_id}`, async () => {
@@ -310,9 +497,9 @@ export default function Balance({ active }: Props) {
         const tooltipContent = record.remark ? `${displayName} — ${record.remark}` : displayName
         return (
           <Tooltip title={tooltipContent}>
-            <span style={{ color: COLORS.accent, fontWeight: 500 }}>
-              {displayName}
-            </span>
+            <div style={{ color: COLORS.accent, fontWeight: 500, lineHeight: 1.2 }}>
+              <div>{displayName}</div>
+            </div>
           </Tooltip>
         )
       },
@@ -414,7 +601,7 @@ export default function Balance({ active }: Props) {
                   size="small"
                   icon={<DatabaseOutlined />}
                   disabled={!isRunning}
-                  loading={actionLoading[`limit-${record.app_id}`]}
+                  loading={limitDialog.loadingProfile && limitDialog.app?.app_id === record.app_id}
                   onClick={() => handleResourceLimit(record)}
                 >
                   Limit
@@ -488,6 +675,186 @@ export default function Balance({ active }: Props) {
 
   const uncontrolledApps = allApps.filter(
     (a) => !controlledApps.some((c) => c.app_id === a.app_id)
+  )
+  const limitDialogPriority = limitDialog.app
+    ? (rowPriorities[limitDialog.app.app_id] ?? limitDialog.app.priority ?? 'medium').toLowerCase()
+    : 'medium'
+  const limitDialogPriorityColor = priorityColor(limitDialogPriority)
+  const limitDialogTitle = limitDialog.app
+    ? (
+      <Text strong>
+        {`Limit Configuration - ${limitDialog.app.app_name} `}
+        <Text strong style={{ color: limitDialogPriorityColor }}>
+          ({limitDialogPriority.toUpperCase()})
+        </Text>
+      </Text>
+    )
+    : <Text strong>Limit Configuration</Text>
+
+  // Show multi-tab only when there are genuinely distinct cgroups.
+  // Use process names as labels when there is a 1:1 match with cgroup IDs.
+  const tabTargets = useMemo(() => {
+    const cgIds = limitForm.cgroupIds
+    const procNames = limitForm.processNames
+    if (cgIds.length <= 1) return []
+    return cgIds.map((cg, i) => ({
+      key: cg,
+      label: procNames.length === cgIds.length ? procNames[i] : cg,
+    }))
+  }, [limitForm.cgroupIds, limitForm.processNames])
+
+  // renderLimitSettings accepts a form snapshot and a typed setter so each
+  // context (single-cgroup or per-tab) can be fully independent.
+  const renderLimitSettings = (
+    form: LimitFormValues,
+    updateForm: (updater: (prev: LimitFormValues) => LimitFormValues) => void
+  ) => (
+    <>
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Space size={4}>
+            <Text strong>CPU Limit</Text>
+            <Tooltip title="Controls how much CPU this app can consume.">
+              <Button
+                size="small"
+                type="text"
+                icon={<QuestionCircleOutlined />}
+                aria-label="Help: CPU Limit"
+                style={{ color: COLORS.textMuted }}
+              />
+            </Tooltip>
+          </Space>
+          <Switch
+            checked={form.cpuEnabled}
+            onChange={(checked) => updateForm((prev) => ({ ...prev, cpuEnabled: checked }))}
+          />
+        </div>
+        <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <InputNumber
+            style={{ width: '100%' }}
+            disabled={!form.cpuEnabled}
+            value={form.cpuPercent}
+            controls
+            min={form.cpuMin}
+            max={form.cpuMax}
+            onChange={(v) => updateForm((prev) => ({ ...prev, cpuPercent: Number(v ?? prev.cpuPercent) }))}
+          />
+          <Text type="secondary">%</Text>
+        </div>
+      </div>
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Space size={4}>
+            <Text strong>Memory Limit</Text>
+            <Tooltip title="Controls the memory pressure boundary for this app.">
+              <Button
+                size="small"
+                type="text"
+                icon={<QuestionCircleOutlined />}
+                aria-label="Help: Memory Limit"
+                style={{ color: COLORS.textMuted }}
+              />
+            </Tooltip>
+          </Space>
+          <Switch
+            checked={form.memEnabled}
+            onChange={(checked) => updateForm((prev) => ({ ...prev, memEnabled: checked }))}
+          />
+        </div>
+        <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <InputNumber
+            style={{ width: '100%' }}
+            disabled={!form.memEnabled}
+            value={form.memPercent}
+            controls
+            min={form.memMin}
+            max={form.memMax}
+            onChange={(v) => updateForm((prev) => ({ ...prev, memPercent: Number(v ?? prev.memPercent) }))}
+          />
+          <Text type="secondary">%</Text>
+        </div>
+      </div>
+
+      <Divider style={{ margin: '4px 0' }} />
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Space size={4}>
+            <Text strong>Disk IO Limit</Text>
+            <Tooltip title="Controls disk throughput and IOPS caps for this app.">
+              <Button
+                size="small"
+                type="text"
+                icon={<QuestionCircleOutlined />}
+                aria-label="Help: Disk IO Limit"
+                style={{ color: COLORS.textMuted }}
+              />
+            </Tooltip>
+          </Space>
+          <Switch
+            checked={form.diskEnabled}
+            onChange={(checked) => updateForm((prev) => ({ ...prev, diskEnabled: checked }))}
+          />
+        </div>
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+          {form.diskDetected
+            ? 'This application is experiencing significant disk I/O pressure; applying limits is recommended.'
+            : 'This application currently shows low disk I/O pressure, so applying limits is not recommended.'}
+        </Text>
+        <Row gutter={[8, 8]} style={{ marginTop: 8 }}>
+          <Col span={12}>
+            <InputNumber
+              style={{ width: '100%' }}
+              addonBefore="Write"
+              addonAfter="MB/s"
+              controls
+              disabled={!form.diskEnabled}
+              min={1}
+              value={form.writeMbps}
+              onChange={(v) => updateForm((prev) => ({ ...prev, writeMbps: Number(v ?? prev.writeMbps) }))}
+            />
+          </Col>
+          <Col span={12}>
+            <InputNumber
+              style={{ width: '100%' }}
+              addonBefore="Read"
+              addonAfter="MB/s"
+              controls
+              disabled={!form.diskEnabled}
+              min={1}
+              value={form.readMbps}
+              onChange={(v) => updateForm((prev) => ({ ...prev, readMbps: Number(v ?? prev.readMbps) }))}
+            />
+          </Col>
+          <Col span={12}>
+            <InputNumber
+              style={{ width: '100%' }}
+              addonBefore="Write IOPS"
+              controls
+              disabled={!form.diskEnabled}
+              min={1}
+              value={form.writeIops}
+              onChange={(v) => updateForm((prev) => ({ ...prev, writeIops: Number(v ?? prev.writeIops) }))}
+            />
+          </Col>
+          <Col span={12}>
+            <InputNumber
+              style={{ width: '100%' }}
+              addonBefore="Read IOPS"
+              controls
+              disabled={!form.diskEnabled}
+              min={1}
+              value={form.readIops}
+              onChange={(v) => updateForm((prev) => ({ ...prev, readIops: Number(v ?? prev.readIops) }))}
+            />
+          </Col>
+        </Row>
+      </div>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        Note: In rare cases, excessively strict limit settings may prevent certain specialized applications from obtaining even their minimum required resources.
+      </Text>
+    </>
   )
 
   return (
@@ -663,6 +1030,82 @@ export default function Balance({ active }: Props) {
           />
         )}
       </Card>
+
+      <Modal
+        title={(
+          <Space size={8}>
+            {limitDialogTitle}
+            <Tooltip
+              title={(
+                <div>
+                  <div>1) Use switches to enable/disable each resource limit for this apply action.</div>
+                  <div>2) Default values are aligned with the balancer's passive control policy.</div>
+                  <div>3) Please tune limit values based on the application workload. CPU/Memory and Disk I/O limits can affect GPU utilization, so configure them according to your performance goals.</div>
+                </div>
+              )}
+            >
+              <Button
+                size="small"
+                type="text"
+                icon={<QuestionCircleOutlined />}
+                aria-label="Help: Configuration Guidelines"
+                style={{ color: COLORS.textMuted }}
+              />
+            </Tooltip>
+          </Space>
+        )}
+        open={limitDialog.open}
+        onCancel={() => {
+          setActiveLimitTarget('')
+          setPerTargetForms({})
+          setLimitDialog({ app: null, open: false, loadingProfile: false, submitting: false })
+        }}
+        onOk={submitResourceLimit}
+        okText="Apply Limit"
+        confirmLoading={limitDialog.submitting}
+        width={760}
+        destroyOnClose
+      >
+        <div style={{ opacity: limitDialog.loadingProfile ? 0.6 : 1, pointerEvents: limitDialog.loadingProfile ? 'none' : 'auto' }}>
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            {tabTargets.length > 1 && (
+              <Tabs
+                activeKey={activeLimitTarget || tabTargets[0].key}
+                onChange={setActiveLimitTarget}
+                items={tabTargets.map(({ key, label }) => ({
+                  key,
+                  label,
+                  children: (
+                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      {renderLimitSettings(
+                        perTargetForms[key] ?? limitForm,
+                        (updater) => setPerTargetForms((prev) => ({
+                          ...prev,
+                          [key]: updater(prev[key] ?? limitForm),
+                        }))
+                      )}
+                    </Space>
+                  ),
+                }))}
+              />
+            )}
+
+            {tabTargets.length === 0 && limitForm.cgroupIds.length === 1 && (
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>Target</Text>
+                <div style={{ marginTop: 6 }}>
+                  <Tag color="blue" style={{ marginBottom: 6 }}>
+                    {limitForm.processNames.length > 0
+                      ? limitForm.processNames.join(' | ')
+                      : limitForm.cgroupIds[0]}
+                  </Tag>
+                </div>
+              </div>
+            )}
+            {tabTargets.length <= 1 && renderLimitSettings(limitForm, setLimitForm)}
+          </Space>
+        </div>
+      </Modal>
 
       <style>{`
         .table-row-alt td { background: ${COLORS.rowAlt} !important; }

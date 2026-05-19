@@ -54,6 +54,7 @@ export interface AppInfo {
   remark?: string
   cmdline?: string
   cgroup?: string
+  process_names?: string[]
   is_running?: boolean
   is_pending?: boolean
 }
@@ -135,6 +136,53 @@ export interface ResourceLimitPayload {
   app_id: string
   app_name: string
   priority: string
+  cgroup_id?: string
+  limit_overrides?: {
+    cpu?: {
+      enabled: boolean
+      rate?: number
+    }
+    memory?: {
+      enabled: boolean
+      rate?: number
+    }
+    disk_io?: {
+      enabled: boolean
+      rate?: {
+        write: number
+        read: number
+        write_iops: number
+        read_iops: number
+      }
+    }
+  }
+}
+
+export interface ResourceLimitProfileData {
+  cpu: {
+    enabled: boolean
+    value: number
+    min: number
+    max: number
+    options?: number[]
+  }
+  memory: {
+    enabled: boolean
+    value: number
+    min: number
+    max: number
+    options?: number[]
+  }
+  disk_io: {
+    enabled: boolean
+    is_io_limit?: boolean
+    write: { value: number; min: number; max: number }
+    read: { value: number; min: number; max: number }
+    write_iops: { value: number; min: number; max: number }
+    read_iops: { value: number; min: number; max: number }
+  }
+  process_names?: string[]
+  cgroup_ids?: string[]
 }
 
 export interface PackageInfo {

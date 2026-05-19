@@ -63,8 +63,11 @@ class DynamicService:
     def cancel_relaunch(self, app_id):
         return self.balancer.cancel_relaunch_by_app_id(app_id)
 
-    def resource_limit(self, app_id, app_name, priority):
-        return self.balancer.set_resource_limit(app_id, app_name, priority)
+    def resource_limit(self, app_id, app_name, priority, limit_overrides=None):
+        return self.balancer.set_resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
+
+    def resource_limit_profile(self, app_id, app_name, priority):
+        return self.balancer.get_resource_limit_profile(app_id, app_name, priority)
 
     def restore_resource(self, app_id):
         return self.balancer.set_restore_resource(app_id)
@@ -492,13 +495,14 @@ def get_controlled_app():
                 data=[]
             )
 
-        # Build a lookup map from config/system apps so we can fill in blank names
-        config_name_map = {a["app_id"]: a.get("app_name") or a.get("name") for a in fetch_all_apps()}
+        # Build a lookup map from config/system apps so we can fill in metadata
+        config_app_map = {a["app_id"]: a for a in fetch_all_apps()}
 
         result_data = []
         for app in controlled_apps:
             # Prefer the DB name, or fall back to the config-derived human-readable name
-            app_name = app.name if app.name and app.name.strip() else config_name_map.get(app.app_id, "")
+            cfg_app = config_app_map.get(app.app_id, {})
+            app_name = app.name if app.name and app.name.strip() else (cfg_app.get("app_name") or cfg_app.get("name") or "")
             result_data.append({
                 "app_id": app.app_id,
                 "app_name": app_name,
@@ -507,6 +511,7 @@ def get_controlled_app():
                 "oom_score": app.oom_score,
                 "cmdline": app.cmdline,
                 "cgroup": app.cgroup,
+                "process_names": cfg_app.get("process_names", []) or [],
                 "remark": app.remark,
                 "status": app.status
             })
@@ -684,6 +689,7 @@ def app_resource_limit():
         app_id = data.get('app_id', "")
         app_name = data.get('app_name', "")
         priority = data.get('priority', "")
+        limit_overrides = data.get('limit_overrides')
 
         # 验证必要参数
         if not app_id and not app_name and not priority:
@@ -693,7 +699,7 @@ def app_resource_limit():
                 retmsg="app_id, app_name and priority must be provided"
             )
 
-        result = _service.resource_limit(app_id, app_name, priority)
+        result = _service.resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
 
         if result:
             return construct_response(
@@ -708,6 +714,36 @@ def app_resource_limit():
             )
     except Exception as e:
         logger.error(f"Set resource limit failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@app.route('/app/resource_limit_profile', methods=['POST'])
+def app_resource_limit_profile():
+    """Get editable resource-limit profile (defaults + bounds) for UI."""
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id', "")
+        app_name = data.get('app_name', "")
+        priority = data.get('priority', "")
+
+        if not app_id and not app_name:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id or app_name must be provided"
+            )
+
+        profile = _service.resource_limit_profile(app_id, app_name, priority or "undefined")
+        return construct_response(
+            data=profile,
+            retmsg="Successfully fetched resource limit profile"
+        )
+    except Exception as e:
+        logger.error(f"Get resource limit profile failed: {str(e)}")
         return construct_response(
             data={},
             retcode=RetCode.EXCEPTION_ERROR,
