@@ -108,7 +108,7 @@ class ControlManager:
         return all(results)
 
     def _critical_pressure_adjustment(self, app_id: str, **kwargs):
-        """Critical Update. """
+        """Critical pressure adjustments."""
         logger.info("Performing critical pressure adjustments for app_id=%s", app_id)
         cpu_quota = kwargs.get('cpu_quota', None)
         mem_high = kwargs.get('mem_high', None)
@@ -116,7 +116,6 @@ class ControlManager:
 
         return all([
             self.governor.set_performance(),
-            # TODO: 分别控制各组件，根据不同的config配置
             self.controller.set_all_resources(
                 app_id,
                 cpu_quota=int(cpu_quota) if cpu_quota is not None else None,
@@ -124,10 +123,8 @@ class ControlManager:
                 io_weight=int(io_weight) if io_weight is not None else None,
                 is_restore=False
             )
-            # self.cpu.set_weight("critical", 500),
-            # self.memory.protect("critical", "min", "4G")
         ])
 
     def __del__(self):
-        """清理线程池资源"""
+        """Clean up the thread pool."""
         self._executor.shutdown(wait=False)

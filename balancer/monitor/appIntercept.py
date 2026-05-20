@@ -14,7 +14,7 @@ from utils import app_utils
 from utils.logger import logger
 
 
-# 定义与BPF代码中相同的常量
+# Constants matching those defined in the BPF C code
 COMM_LEN = 32
 PY_MAX_FILE_LEN = 64
 
@@ -33,13 +33,13 @@ class AppIntercept(metaclass=SingletonMeta):
         self.bpf = BPF(src_file=c_src_file, cflags=["-Wno-duplicate-decl-specifier"])
         self.controlManager = ControlManager()
         self.monitored_apps: Set[str] = set()
-        self.handled_processes: Set[int] = set()  # 初始化已处理进程集合
+        self.handled_processes: Set[int] = set()  # set of already-handled process IDs
         self.controlled_app_map = []
-        self._app_map_index = {}  # 把map做成索引形式，方便查找
+        self._app_map_index = {}  # index of controlled_app_map for O(1) lookup
         self.relaunch_apps = {}
         self.app_pending_queue = JoinableQueue(1000000)
-        self.monitored_app_launched = {}  # 当前已经启动的监控app
-        self.pending_exit_events = {}  # 待处理的退出事件（PID: Timer）
+        self.monitored_app_launched = {}  # currently launched monitored apps
+        self.pending_exit_events = {}  # pending exit events keyed by PID
         # Fast-lookup structures for get_main_process (rebuilt by _rebuild_match_cache)
         self._comm_to_app: dict = {}          # comm_lower -> app_name  (O(1) bpf_name exact match)
         self._filename_exe_to_app: dict = {}  # exe_lower  -> app_name  (filename path match)
@@ -165,7 +165,7 @@ class AppIntercept(metaclass=SingletonMeta):
 
     def is_process_alive(self, pid):
         try:
-            # 检查 /proc/[pid]/status 是否存在
+            # Check whether /proc/[pid]/status exists
             with open(f"/proc/{pid}/status") as f:
                 return True
         except FileNotFoundError:
@@ -173,7 +173,7 @@ class AppIntercept(metaclass=SingletonMeta):
 
 
     def handle_exit_event(self, pid, app_id, app_name, old_comm, old_filename):
-        """延迟检查进程是否真正退出"""
+        """Deferred check to confirm whether the process has truly exited."""
         if self.is_process_alive(pid):
             logger.debug(f"[Delay Check] PID={pid} still alive, not exiting normally.")
             return
@@ -187,7 +187,7 @@ class AppIntercept(metaclass=SingletonMeta):
         }, True)
         del self.monitored_app_launched[pid]
 
-        # 清理 pending_exit_events
+        # Clean up pending_exit_events
         if pid in self.pending_exit_events:
             del self.pending_exit_events[pid]
 
@@ -201,7 +201,7 @@ class AppIntercept(metaclass=SingletonMeta):
 
         # logger.debug(f"*** Event: PID={pid}, type={type} COMM={comm}, FILENAME={filename} ***")
 
-        if type == 0: # 启动事件
+        if type == 0:  # launch event
             comm_lower = comm.lower()
             filename_lower = filename.lower()
             # Fast pre-filter: skip the vast majority of unrelated BPF exec events
@@ -215,7 +215,7 @@ class AppIntercept(metaclass=SingletonMeta):
             # logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
             if is_main_process:
                 logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-                # 防止重复处理同一个进程树
+                # Prevent processing the same process tree more than once
                 if not self.is_process_handled(pid):
                     app_data = self._app_map_index.get(app_name.lower())
                     app_id, app_priority = app_data['app_id'], app_data.get('priority', 'low') if app_data else ("", "low")
@@ -252,26 +252,26 @@ class AppIntercept(metaclass=SingletonMeta):
                             }, True)
                     self.mark_process_handled(pid)
 
-        elif type == 1:  # 退出事件
+        elif type == 1:  # exit event
             if pid not in self.monitored_app_launched:
                 return
 
-            # 如果已经有待处理的退出事件，取消旧的定时器
+            # Cancel any existing pending exit timer for this PID
             if pid in self.pending_exit_events:
                 self.pending_exit_events[pid].cancel()
 
             app_id, app_name, old_comm, old_filename = self.monitored_app_launched[pid]
             # logger.debug(f"Detected possible exit: PID={pid}, comm={comm}")
 
-            # 延迟 1.5 秒后检查进程是否真正退出
+            # Schedule a deferred check 1.5 s later to confirm the process has exited
             timer = Timer(1.5, self.handle_exit_event, args=[pid, app_id, app_name, old_comm, old_filename])
             self.pending_exit_events[pid] = timer
             timer.start()
 
 
     def is_process_handled(self, pid: int) -> bool:
-        """检查该进程是否已经被处理过"""
-        # 检查当前进程及其父进程是否已被处理
+        """Return True if this process (or a parent) has already been handled."""
+        # Check the process and its ancestors
         try:
             process = psutil.Process(pid)
             for p in [process] + process.parents():
@@ -282,7 +282,7 @@ class AppIntercept(metaclass=SingletonMeta):
         return False
 
     def mark_process_handled(self, pid: int) -> None:
-        """标记进程为已处理"""
+        """Mark a process as handled."""
         self.handled_processes.add(pid)
 
     def handle_monitored_app(self, pid: int, comm: str, filename: str, app_name: str, app_id: str) -> None:
@@ -310,7 +310,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 }, True)
             else:
                 logger.info(f"System resources busy, skipping relaunch of {app_name}")
-                app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动", icon='dialog-warning')
+                app_utils.safe_notify("System resources busy", f"Paused startup of app: {app_name}", icon='dialog-warning')
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
                     'app_name': app_name,
@@ -325,14 +325,14 @@ class AppIntercept(metaclass=SingletonMeta):
             logger.debug(f"Error handling {app_name} (PID: {pid}): {str(e)}")
 
     def add_to_monitorlist(self, app_names: Union[str, List[str]]) -> None:
-        """添加应用到监控列表（支持批量操作）"""
+        """Add one or more applications to the monitor list (supports batch operations)."""
         if not app_names:
             return
 
-        # 统一转为列表处理
+        # Normalise to a list
         names = [app_names] if isinstance(app_names, str) else app_names
 
-        # 转换为小写用于比较
+        # Lowercase for comparison
         existing_lower = {name.lower() for name in self.monitored_apps}
 
         added_count = 0
@@ -342,7 +342,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 continue
             if name.lower() not in existing_lower:
                 self.monitored_apps.add(name)
-                existing_lower.add(name.lower())  # 更新检查集
+                existing_lower.add(name.lower())
                 added_count += 1
                 logger.debug(f"Added '{name}' to monitoring list")
 
@@ -354,7 +354,7 @@ class AppIntercept(metaclass=SingletonMeta):
             self._rebuild_match_cache()
 
     def remove_from_monitorlist(self, app_name: str) -> None:
-        """从监控列表中移除应用"""
+        """Remove one or more applications from the monitor list."""
         if app_name in self.monitored_apps:
             self.monitored_apps.remove(app_name)
             logger.debug(f"Removed '{app_name}' from monitoring list")
@@ -363,13 +363,13 @@ class AppIntercept(metaclass=SingletonMeta):
             logger.debug(f"'{app_name}' not found in monitoring list")
 
     def clear_monitorlist(self) -> None:
-        """清空监控列表"""
+        """Clear the entire monitor list."""
         self.monitored_apps.clear()
         logger.debug("Cleared monitoring list")
         self._rebuild_match_cache()
 
     def get_monitored_apps(self) -> List[str]:
-        """获取当前监控的应用列表"""
+        """Return the current list of monitored applications."""
         return list(self.monitored_apps)
 
     def scan_already_running_apps(self) -> list:
@@ -480,41 +480,41 @@ class AppIntercept(metaclass=SingletonMeta):
         return detected
 
     def check_system_resources(self, cpu_threshold: int = 70, mem_threshold: int = 80) -> bool:
-        """检查系统资源使用情况"""
+        """Check current system resource usage."""
         try:
-            # 获取CPU使用率
+            # Get CPU utilisation
             cpu_percent = psutil.cpu_percent(interval=1)
 
-            # 获取内存使用率
+            # Get memory utilisation
             mem_percent = psutil.virtual_memory().percent
 
             logger.debug(f"System status - CPU: {cpu_percent}%, Memory: {mem_percent}%")
 
-            # 检查是否低于阈值
+            # Check whether usage is below the threshold
             return cpu_percent < cpu_threshold and mem_percent < mem_threshold
 
         except Exception as e:
             logger.debug(f"Error checking system resources: {str(e)}")
-            # 出现错误时默认允许启动
+            # Default to allowing startup on error
             return True
 
 
 if __name__ == "__main__":
-    # 初始化BPF
+    # Initialise BPF
     bpf_monitor = AppIntercept()
 
-    # 添加应用到监控列表
+    # Add applications to the monitor list
     bpf_monitor.add_to_monitorlist("firefox")
     bpf_monitor.add_to_monitorlist("Calculator")
 
-    # 打开性能缓冲区
+    # Open the perf buffer
     bpf_monitor.bpf["events"].open_perf_buffer(bpf_monitor.print_event)
     logger.debug(f"Monitoring execve() for: {', '.join(bpf_monitor.get_monitored_apps())}")
     logger.debug("Ctrl+C to exit")
 
     while True:
         try:
-            # 同时处理trace打印和事件
+            # Handle both trace output and BPF events
             bpf_monitor.bpf.perf_buffer_poll(timeout=100)
         except KeyboardInterrupt:
             logger.debug("\nExiting...")

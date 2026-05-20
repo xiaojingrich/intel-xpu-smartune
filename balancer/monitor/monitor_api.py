@@ -700,12 +700,12 @@ class SystemPressureMonitor:
         self._critical_state_listeners.append(callback)
 
     def set_limited_app_dominant(self, is_dominant: bool):
-        """设置受限应用是否占主导状态"""
+        """Set whether the rate-limited app is currently dominant."""
         if self._is_limited_app_dominant != is_dominant:
             self._is_limited_app_dominant = is_dominant
 
     def _start_auto_refresh(self):
-        """启动定时更新system压力状态"""
+        """Start the background thread that periodically refreshes system pressure state."""
         def refresh_loop():
             while True:
                 time.sleep(self._CACHE_TTL * 0.9)
@@ -714,7 +714,7 @@ class SystemPressureMonitor:
         threading.Thread(target=refresh_loop, daemon=True).start()
 
     def _safe_update(self):
-        """线程安全的更新操作"""
+        """Thread-safe pressure level update."""
         if self._update_lock.acquire(blocking=False):
             try:
                 new_level, score, disk_io_stressed, disk_io_stress = self._update_pressure_level()
@@ -745,7 +745,7 @@ class SystemPressureMonitor:
                         logger.error("Critical state listener raised an error: %s", exc)
 
     def _update_pressure_level(self) -> tuple[str, float, bool, dict]:
-        """更新压力等级（使用内部状态）"""
+        """Recompute the current pressure level using internal state."""
         try:
             psi_data = self.psi.get_current_pressure()
             usage_data = self.res.get_resource_usage()
@@ -765,9 +765,7 @@ class SystemPressureMonitor:
 
 
     def get_current_pressure_level(self) -> tuple:
-        """获取当前压力等级
-        返回: (level, score, is_disk_io_stressed)
-        """
+        """Return the current pressure level as (level, score, is_disk_io_stressed)."""
         logger.debug("Current PSI level: %s (pressure: %.2f), disk io stressed: %s", self._current_level, self.score,
                      self.is_current_disk_io_stressed)
         return self._current_level, self.score, self.is_current_disk_io_stressed
@@ -802,21 +800,22 @@ class SystemPressureMonitor:
         return peak_level, self.score, peak_disk_io
 
     def get_disk_io_stress(self) -> dict:
-        """返回最近一次更新时缓存的磁盘 IO 压力详情（与 ResourceMonitor.is_disk_io_stressed 格式相同）。
-        返回:
-            {
-                "is_stressed": bool,
-                "stressed_disks": list[str],
-                "iowait": float,
-                "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
-            }
+        """Return the cached disk IO stress details from the most recent update.
+
+        The dict format matches ResourceMonitor.is_disk_io_stressed:
+        {
+            "is_stressed": bool,
+            "stressed_disks": list[str],
+            "iowait": float,
+            "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
+        }
         """
         return self._disk_io_stress
 
     def update_network_pressure_level(self, network_data):
-        """
-        单独更新网络压力等级
-        返回: (tx_level, rx_level, tx_value, rx_value)
+        """Update the network pressure level independently.
+
+        Returns: (tx_level, rx_level, tx_value, rx_value)
         """
         try:
             tx_level = self.analyzer.get_pressure_level(network_data['tx'], self.config.network_thresholds)

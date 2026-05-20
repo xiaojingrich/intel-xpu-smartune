@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from enum import Enum
 
+from utils.logger import logger
+
 class DBStatus(Enum):
     SUCCESS = "SUCCESS"
     ALREADY_EXISTING = "ALREADY_EXISTING"
@@ -40,7 +42,7 @@ class DataBaseModel(Model):
                 with db.atomic():
                     return cls.select(*query, **kwargs)
             except (IntegrityError, OperationalError) as e:
-                print(f"Error Query data: {e}")
+                logger.error(f"Error querying data: {e}")
                 return []
 
     @classmethod
@@ -62,16 +64,16 @@ class DataBaseModel(Model):
                     if created:
                         return DBStatus.SUCCESS  # True stands for success/already existing
                     else:
-                        print(f"User with ID {data['id']} already exists.")
-                        return DBStatus.ALREADY_EXISTING  # Handle as needed (e.g., return the existing instance)
-            except  (IntegrityError, OperationalError) as e:
-                print(f"Error inserting data: {e}")
+                        logger.debug(f"Record with ID {data['id']} already exists.")
+                        return DBStatus.ALREADY_EXISTING
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error inserting data: {e}")
                 return DBStatus.FAILED
 
     @classmethod
     def update_all_records(cls, **data):
         """Update all records in a thread-safe manner."""
-        with db_lock:  # 复用现有的线程锁
+        with db_lock:
             timestamp = int(time.time())
             now = datetime.now()
             data.update({
@@ -82,9 +84,9 @@ class DataBaseModel(Model):
             try:
                 with db.atomic():
                     updated_count = cls.update(**cls.normalize_data(data)).execute()
-                    return updated_count  # 返回实际更新的记录数
+                    return updated_count
             except (IntegrityError, OperationalError) as e:
-                print(f"Error batch updating data: {e}")
+                logger.error(f"Error batch updating data: {e}")
                 return 0
 
     @classmethod
@@ -102,12 +104,11 @@ class DataBaseModel(Model):
                 with db.atomic():
                     updated_count = cls.update(**cls.normalize_data(data)).where(cls.id == id).execute()
                     if updated_count == 0:
-                        # 明确检查记录是否存在
                         exists = cls.select().where(cls.id == id).exists()
                         return DBStatus.NOT_FOUND if not exists else DBStatus.SUCCESS
                     return DBStatus.SUCCESS
-            except  (IntegrityError, OperationalError) as e:
-                print(f"Error updating data: {e}")
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error updating data: {e}")
                 return None
 
     @classmethod
@@ -118,8 +119,8 @@ class DataBaseModel(Model):
                 with db.atomic():
                     deleted_count = cls.delete().where(cls.id == id).execute()
                     return deleted_count
-            except  (IntegrityError, OperationalError) as e:
-                print(f"Error deleting data: {e}")
+            except (IntegrityError, OperationalError) as e:
+                logger.error(f"Error deleting data: {e}")
                 return None
 
     @classmethod
@@ -181,7 +182,7 @@ class MonitorSnapshot(DataBaseModel):
                     )
                     return DBStatus.SUCCESS
             except (IntegrityError, OperationalError) as e:
-                print(f"Error inserting monitor snapshot: {e}")
+                logger.error(f"Error inserting monitor snapshot: {e}")
                 return DBStatus.FAILED
 
     @classmethod
@@ -205,7 +206,7 @@ class MonitorSnapshot(DataBaseModel):
                     query = query.order_by(cls.id.desc()).limit(max(1, limit))
                     return list(query)
             except (IntegrityError, OperationalError) as e:
-                print(f"Error querying monitor snapshots: {e}")
+                logger.error(f"Error querying monitor snapshots: {e}")
                 return []
 
     @classmethod
@@ -220,7 +221,7 @@ class MonitorSnapshot(DataBaseModel):
                 with db.atomic():
                     return cls.delete().where(cls.create_time < cutoff).execute()
             except (IntegrityError, OperationalError) as e:
-                print(f"Error deleting old monitor snapshots: {e}")
+                logger.error(f"Error deleting old monitor snapshots: {e}")
                 return 0
 
 
@@ -234,7 +235,7 @@ def _apply_migrations():
             db.execute_sql(sql)
         except OperationalError as e:
             if "duplicate column" not in str(e).lower():
-                print(f"Migration warning ({sql!r}): {e}")
+                logger.warning(f"Migration warning ({sql!r}): {e}")
 
 
 def init_database():
@@ -243,6 +244,5 @@ def init_database():
 
 
 if __name__ == "__main__":
-    print("test*****************")
     db.connect()
     db.create_tables([AIAppPriority, MonitorSnapshot])

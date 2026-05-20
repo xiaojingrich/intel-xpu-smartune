@@ -199,12 +199,12 @@ def _accumulate_engine_delta(out, t0_engines, t1_engines):
 
 class ResourceMonitor:
     def __init__(self):
-        """初始化资源监视器"""
+        """Initialise the resource monitor."""
         self.config = b_config
         self.cpu_cores = os.cpu_count() or 16
         self.prev_io = psutil.disk_io_counters(perdisk=True)
         self.prev_time = time.time()
-        # 桌面应用信息
+        # Desktop application metadata
         try:
             self.desktop_apps = {app["app_id"]: app for app in fetch_all_apps()}
             logger.info(f"Loaded {len(self.desktop_apps)} desktop applications")
@@ -238,25 +238,25 @@ class ResourceMonitor:
                 self._proc_name_to_app[p] = app_id
 
     def _get_top_processes(self, n=1, samples=3, interval=1.0, mode='default'):
-        """获取资源占用最高的应用（基于 cgroup 聚合）
-        :param n: 返回前 n 个进程
-        :param samples: 对top process进行采样的次数
-        :param interval: 采样间隔时间（秒）
-        :param mode: 采样模式，默认default - 按 CPU/内存综合评分; 'io' - 仅按 IO 读写量排序
+        """Return the top resource-consuming applications, aggregated per cgroup.
+        :param n: number of top processes to return
+        :param samples: number of sampling rounds for the top process
+        :param interval: sampling interval in seconds
+        :param mode: scoring mode — 'default' ranks by combined CPU+memory score; 'io' ranks by IO throughput
         """
-        # Step 1: 采样获取候选进程（考虑权重和进程组）
+        # Step 1: Sample candidate processes (weighted, per-process-group)
         psi_data = PSIMonitor().get_current_pressure()
         dynamic_weights = self._adjust_weights_by_pressure(psi_data)
 
         candidate_procs = self._get_candidate_processes(
-            num=max(n * 3, 9),  # 候选进程数，确保有足够候选以覆盖至少 n 个不同cgroup
+            num=max(n * 3, 9),  # candidate count; ensures enough candidates to cover at least n distinct cgroups
             samples=samples,
             interval=interval,
             dynamic_weights=dynamic_weights
         )
 
         # logger.debug(f"Candidate processes for cgroup aggregation: {candidate_procs}")
-        # Step 2: 收集所有不重复的cgroup_path
+        # Step 2: Collect unique cgroup paths
         # Exclude '/' (root cgroup): its pids span the entire system process tree, which
         # would create a spurious "super group" with an artificially high aggregate score.
         cgroup_paths = set()
@@ -299,15 +299,15 @@ class ResourceMonitor:
             except Exception as e:
                 logger.warning(f"Multi-process app scan failed: {e}")
 
-        # Step 3: 按 cgroup 聚合进程
+        # Step 3: Aggregate processes per cgroup
         cgroup_data = defaultdict(lambda: {
-            'cpu_total': 0,  # 所有进程 CPU 使用率总和（%）
-            'mem_percent_total': 0,  # 所有进程内存占用百分比总和（%）
-            'mem_rss_total': 0,  # 所有进程 RSS 内存总和（字节）
-            'io_read_total': 0,    # 所有进程 IO 读取字节 delta 总和
-            'io_write_total': 0,   # 所有进程 IO 写入字节 delta 总和
-            'io_read_count_total': 0,   # 所有进程 IO 读取次数 delta 总和 (for IOPS)
-            'io_write_count_total': 0,  # 所有进程 IO 写入次数 delta 总和 (for IOPS)
+            'cpu_total': 0,  # sum of CPU usage (%) for all processes
+            'mem_percent_total': 0,  # sum of memory usage (%) for all processes
+            'mem_rss_total': 0,  # sum of RSS memory (bytes) for all processes
+            'io_read_total': 0,    # cumulative IO read bytes delta for all processes
+            'io_write_total': 0,   # cumulative IO write bytes delta for all processes
+            'io_read_count_total': 0,   # cumulative IO read count delta (for IOPS)
+            'io_write_count_total': 0,  # cumulative IO write count delta (for IOPS)
             'count': 0,
             'pids': set(),
             'names': set(),
@@ -321,7 +321,7 @@ class ResourceMonitor:
             'dominant_metric': 0.0,  # highest individual contribution seen so far
         })
 
-        # 缓存每个 cgroup 的 pid 列表和 Process 对象
+        # Cache the PID list and Process objects for each cgroup
         cgroup_pids = {}
         pid_process_map = {}
         # IO rate is computed as a delta between two snapshots taken io_sample_interval apart.
@@ -331,7 +331,7 @@ class ResourceMonitor:
         # Each entry: (read_bytes, write_bytes, read_count, write_count) at t0
         pid_io_start: dict[int, tuple[int, int, int, int]] = {}
 
-        # 第一次遍历：初始化 CPU 计时器 + 记录初始 IO 计数（t0）
+        # First pass: initialise CPU timers and record initial IO counters (t0)
         for cgroup_path in cgroup_paths:
             pids_in_cgroup = get_pids_in_cgroup(cgroup_path)
             cgroup_pids[cgroup_path] = pids_in_cgroup
@@ -339,7 +339,7 @@ class ResourceMonitor:
                 try:
                     p = psutil.Process(pid)
                     if mode == 'default':
-                        p.cpu_percent(interval=None)  # 仅default模式需要初始化CPU计时器
+                        p.cpu_percent(interval=None)  # initialise CPU timer (only needed in default mode)
                     try:
                         io = p.io_counters()
                         pid_io_start[pid] = (io.read_bytes, io.write_bytes,
@@ -355,7 +355,7 @@ class ResourceMonitor:
         time.sleep(io_sample_interval)
         elapsed = time.time() - t0
 
-        # 第二次遍历：读取最终计数，计算 delta
+        # Second pass: read final counters and compute deltas
         for cgroup_path, pids_in_cgroup in cgroup_pids.items():
             for pid in pids_in_cgroup:
                 if pid not in pid_process_map:
@@ -464,7 +464,7 @@ class ResourceMonitor:
                     f"into primary='{primary}'"
                 )
 
-        # Step 4: 根据模式计算评分
+        # Step 4: Compute scores based on the selected mode
         processes = []
         for cgroup_path, data in cgroup_data.items():
             if data['count'] > 0:
@@ -475,10 +475,10 @@ class ResourceMonitor:
                 io_read_iops = data['io_read_count_total'] / elapsed
                 io_write_iops = data['io_write_count_total'] / elapsed
                 if mode == 'io':
-                    # IO模式：按实时读写速率之和排序
+                    # IO mode: rank by total read+write throughput
                     score = io_read_rate_mb + io_write_rate_mb
                 else:
-                    # Default模式：CPU+内存
+                    # Default mode: combined CPU + memory score
                     cpu_total_normalized = data['cpu_total'] / self.cpu_cores
                     score = (
                             dynamic_weights['cpu'] * min(cpu_total_normalized, 100) +
@@ -515,19 +515,20 @@ class ResourceMonitor:
                 })
 
         # logger.debug(f"Aggregated processes by cgroup: {processes}")
-        # Step 5: 返回评分最高的进程信息列表
+        # Step 5: Return the highest-scored process information
         return sorted(processes, key=lambda x: x['score'], reverse=True)[:n]
 
     def _get_candidate_processes(self, num, samples, interval, dynamic_weights):
-        """采样获取候选进程（计算score筛选top进程，但只返回pid和name）
+        """Sample candidate processes and return their PIDs and names (scores used for filtering only).
 
-        使用 per-cgroup 多样性筛选：对每个采样周期内的进程按评分排序后，限制同一
-        cgroup 贡献的候选数（max_per_cgroup），防止高并发应用（如 stress -c 8）的
-        多个同 cgroup 工作进程占满所有候选名额，从而保证候选集覆盖足够多的不同 cgroup。
+        Applies per-cgroup diversity limiting: after scoring each process in a sampling round,
+        caps the number of candidates contributed by the same cgroup (max_per_cgroup) to
+        prevent high-concurrency apps (e.g. stress -c 8) from filling all candidate slots with
+        workers from the same cgroup, ensuring the candidate set covers enough distinct cgroups.
         """
         candidates = []
-        seen_pids = set()  # 用于记录已经处理过的PID
-        max_per_cgroup = 2  # 每个 cgroup 最多贡献的候选进程数
+        seen_pids = set()  # track already-processed PIDs
+        max_per_cgroup = 2  # max candidates per cgroup
 
         for _ in range(samples):
             current_sample = []
@@ -537,15 +538,15 @@ class ResourceMonitor:
                     info = proc.info
                     pid = info['pid']
 
-                    # 跳过已处理过的PID或黑名单进程
+                    # Skip already-processed PIDs or blacklisted processes
                     if (pid in seen_pids or
                             any(b in info.get('name', '') for b in self.config.blacklist) or
                             time.time() - info['create_time'] < 2):
                         continue
 
-                    seen_pids.add(pid)  # 标记为已处理
+                    seen_pids.add(pid)  # mark as processed
 
-                    # 计算带权重的实时评分（但不需要返回这些数据）
+                    # Compute weighted real-time score (used for ranking only; not returned)
                     score = (
                             dynamic_weights['cpu'] * min(info['cpu_percent'], 100) +
                             dynamic_weights['memory'] * min(info['memory_percent'], 100)
@@ -554,7 +555,7 @@ class ResourceMonitor:
                     current_sample.append({
                         'pid': pid,
                         'name': info['name'],
-                        'score': score  # 仅用于排序
+                        'score': score  # used for ranking only
                     })
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -583,16 +584,16 @@ class ResourceMonitor:
         return [{'pid': p['pid'], 'name': p['name']} for p in candidates]
 
     def _adjust_weights_by_pressure(self, psi_data):
-        """根据PSI压力动态调整权重"""
+        """Dynamically adjust weights based on PSI pressure."""
         base_weights = self.config.weights_top
         return {
             'cpu': base_weights['cpu'] * (1 + psi_data.get('cpu', 0)),
             'memory': base_weights['memory'] * (1 + psi_data.get('memory', 0)),
-            'io': base_weights['io']  # 保留但不再用于进程评分
+            'io': base_weights['io']  # retained but no longer used for process scoring
         }
 
     def _find_systemd_unit(self, pid):
-        """通过systemd-cgls查找进程所属的scope, service"""
+        """Find the systemd scope or service for a process via systemd-cgls."""
         try:
             result = subprocess.run(
                 ['systemd-cgls', '--no-page'],
@@ -602,20 +603,20 @@ class ResourceMonitor:
                 check=True
             )
 
-            # 查找包含指定PID的行及其父unit
+            # Find the line containing the given PID and its parent unit
             lines = result.stdout.split('\n')
             for i, line in enumerate(lines):
                 if f'─{pid} ' in line or f'─{pid}\n' in line:
-                    # 向上查找最近的unit(scope或service)
+                    # Walk up to find the nearest enclosing unit (scope or service)
                     for j in range(i, -1, -1):
                         line_content = lines[j]
                         if '.scope' in line_content or '.service' in line_content:
-                            # 匹配类似 "├─session-c20.scope" 或 "├─fileManage.service"
+                            # Match lines like "├─session-c20.scope" or "├─fileManage.service"
                             unit_match = re.search(r"─(.*?\.(?:scope|service))", line_content)
                             if unit_match:
                                 return unit_match.group(1)
 
-                            # 如果没有匹配到，尝试更宽松的匹配
+                            # No match; try a looser pattern
                             unit_match = re.search(r"\b([\w-]+\.(?:scope|service))\b", line_content)
                             if unit_match:
                                 return unit_match.group(1)
@@ -651,7 +652,7 @@ class ResourceMonitor:
         return name.replace('-', ' ').replace('_', ' ').title()
 
     def try_match_app(self, process_info):
-        """尝试匹配桌面应用或systemd scope"""
+        """Try to match a desktop application or systemd scope for the given process."""
         cgroup = process_info.get('cgroup')
 
         # 0. For apps with explicit process_names configured, match before the
@@ -765,7 +766,7 @@ class ResourceMonitor:
         return None
 
     def get_top_resource_consumers(self):
-        """获取资源占用最高的1个进程及其应用信息"""
+        """Return the single highest resource-consuming process and its application metadata."""
         results = []
         reach_threshold = True
         processes = self._get_top_processes(n=1)
@@ -810,7 +811,7 @@ class ResourceMonitor:
         return results, reach_threshold
 
     def get_top_disk_io_consumers(self):
-        """获取disk io占用最高的1个进程及其应用信息"""
+        """Return the single process with the highest disk IO and its application metadata."""
         results = []
         processes = self._get_top_processes(n=1, mode="io")
         logger.debug(f"Top processes(disk io): {processes}")
@@ -922,13 +923,13 @@ class ResourceMonitor:
         }
 
     def get_app_resource_stats(self, n=10):
-        """获取App Resources页面所需的各应用CPU/内存使用数据（不含阈值过滤）
+        """Return per-application CPU and memory usage data for the App Resources view (no threshold filtering).
 
-        与 get_top_resource_consumers 不同，此方法：
-          - 返回前 n 个应用（默认10个）而非仅返回top-1
-          - 不检查系统压力阈值，始终返回当前资源使用情况
-          - 适用于Dashboard "App Resources" 页面的数据展示
-          - 为每个应用附加GPU引擎使用率和GPU显存信息（通过 fdinfo 采样）
+        Unlike get_top_resource_consumers, this method:
+          - returns the top n apps (default 10) rather than just top-1
+          - does not check system pressure thresholds; always returns current usage
+          - intended for the Dashboard "App Resources" view
+          - attaches GPU engine utilisation and GPU memory info per app (sampled via fdinfo)
         """
         results = []
         processes = self._get_top_processes(n=n)
@@ -1055,11 +1056,11 @@ class ResourceMonitor:
         return results
 
     def get_app_disk_io_stats(self, n=10):
-        """获取App Resources页面所需的各应用Disk I/O使用数据（不含阈值过滤）
+        """Return per-application Disk I/O usage data for the App Resources view (no threshold filtering).
 
-        与 get_top_disk_io_consumers 不同，此方法：
-          - 返回前 n 个应用（默认10个）而非仅返回top-1
-          - 适用于Dashboard "App Resources" 页面的磁盘I/O数据展示
+        Unlike get_top_disk_io_consumers, this method:
+          - returns the top n apps (default 10) rather than just top-1
+          - intended for the Dashboard "App Resources" Disk I/O view
         """
         results = []
         processes = self._get_top_processes(n=n, mode="io")
@@ -1088,13 +1089,13 @@ class ResourceMonitor:
         return results
 
     def get_total_memory(self):
-        """获取系统物理内存总大小（单位：MB）"""
+        """Return total physical memory in MB."""
         mem = psutil.virtual_memory()
-        total_memory_mb = round(mem.total / (1024 ** 2), 2)  # 转换为MB并保留2位小数
+        total_memory_mb = round(mem.total / (1024 ** 2), 2)
         return total_memory_mb
 
     def get_physical_disks(self):
-        """获取所有物理磁盘设备名"""
+        """Return a list of all physical disk device names."""
         cmd = ["lsblk", "-d", "-o", "NAME,TYPE", "-n"]
         try:
             output = subprocess.check_output(cmd, text=True).strip()
@@ -1104,31 +1105,31 @@ class ResourceMonitor:
                 parts = line.split()
                 if len(parts) >= 2 and parts[1] == "disk":
                     disks.append(parts[0])
-            
+
             return disks
-            
+
         except subprocess.CalledProcessError:
             return []
 
     def get_resource_usage(self) -> dict:
-        """获取系统整体资源使用率和剩余容量"""
-        # CPU：核心数、使用率（%）
+        """Return overall system resource utilisation and available capacity."""
+        # CPU: core count, utilisation (%)
         cpu_count = psutil.cpu_count(logical=True)
-        cpu_usage = psutil.cpu_percent(interval=0.5)  # 0.5秒采样
-        cpu_available = 100 - cpu_usage  # 剩余CPU百分比
+        cpu_usage = psutil.cpu_percent(interval=0.5)  # 0.5-second sample
+        cpu_available = 100 - cpu_usage  # remaining CPU (%)
 
-        # 内存：总容量（GB）、使用率（%）、剩余容量占比
+        # Memory: total capacity (GB), utilisation (%), available ratio
         mem = psutil.virtual_memory()
         mem_total_gb = round(mem.total / (1024 **3), 2)
         mem_usage = mem.percent
-        mem_available_ratio = round(mem.available / mem.total, 2)  # 剩余内存占比
+        mem_available_ratio = round(mem.available / mem.total, 2)  # available memory ratio
 
         return {
             'cpu': {
                 'count': cpu_count,
                 'usage': cpu_usage,
                 'available': cpu_available,
-                'is_busy': cpu_usage > self.config.cpu_busy_threshold  # 整体使用率多少算busy
+                'is_busy': cpu_usage > self.config.cpu_busy_threshold
             },
             'memory': {
                 'total_gb': mem_total_gb,
@@ -1140,8 +1141,8 @@ class ResourceMonitor:
 
     def _collect_disk_io_stats(self) -> dict:
         """
-        采集所有磁盘IO的原始统计数据（利用率、读写速度、IOPS）。
-        仅供内部使用, is_busy 判断由 is_disk_io_stressed 负责。
+        Collect raw disk IO statistics (utilisation, read/write speed, IOPS) for all disks.
+        For internal use only; is_busy determination is handled by is_disk_io_stressed.
         :return:
         {
             "disk_io": {
@@ -1212,20 +1213,21 @@ class ResourceMonitor:
 
     def is_disk_io_stressed(self, device: str = None, threshold: float = None) -> dict:
         """
-        判断磁盘 I/O 是否紧张
-        :param device: 指定磁盘（如 'nvme0n1'），默认检查所有磁盘
-        :param threshold: 自定义利用率阈值，否则用config中的配置
+        Determine whether disk I/O is under stress.
+        :param device: specific disk to check (e.g. 'nvme0n1'); checks all disks if None
+        :param threshold: custom utilisation threshold; falls back to the config value if None
 
-        判断逻辑：
-          - 磁盘繁忙（is_busy）：利用率超过 disk_utilization_threshold 且吞吐量超过 disk_io_throughput_threshold_kb
-          - 整体紧张（is_stressed）：有磁盘繁忙 AND CPU iowait 超过 disk_iowait_threshold
-            （两个条件须同时满足，避免误判）
+        Decision logic:
+          - disk busy (is_busy): utilisation exceeds disk_utilization_threshold AND
+            throughput exceeds disk_io_throughput_threshold_kb
+          - overall stressed (is_stressed): at least one disk is busy AND
+            CPU iowait exceeds disk_iowait_threshold (both conditions must hold to avoid false positives)
 
         :return:
             {
-                "is_stressed": bool,               # 整体是否紧张
-                "stressed_disks": list[str],       # 紧张的磁盘列表
-                "iowait": float,                   # CPU 的 I/O 等待时间（%）
+                "is_stressed": bool,
+                "stressed_disks": list[str],
+                "iowait": float,
                 "details": {disk: {utilization, read_kb_per_sec, write_kb_per_sec, read_iops, write_iops, is_busy}}
             }
         """
@@ -1241,11 +1243,11 @@ class ResourceMonitor:
         stressed_disks = []
         details = {}
         for disk, stats in disk_stats.items():
-            # 如果指定了 device，只检查该设备
+            # Only check the specified device if provided
             if device and disk != device:
                 continue
 
-            # 利用率高且吞吐量高，才认为该磁盘繁忙
+            # Both high utilisation AND high throughput required to classify a disk as busy
             is_busy = (
                 stats["utilization"] > busy_threshold and
                 (stats["read_kb_per_sec"] + stats["write_kb_per_sec"]) > speed_threshold
@@ -1254,7 +1256,7 @@ class ResourceMonitor:
             if is_busy:
                 stressed_disks.append(disk)
 
-        # 有磁盘繁忙 AND iowait 高，才认为磁盘 IO 整体紧张
+        # Both a busy disk AND high iowait are required to classify IO as stressed
         is_stressed = bool(stressed_disks) and iowait > iowait_threshold
 
         return {
@@ -1265,7 +1267,7 @@ class ResourceMonitor:
         }
 
 def main():
-    """调试用主函数"""
+    """Debug entry point."""
     logger.info("==== Starting Resource Monitor ====")
 
     monitor = ResourceMonitor()

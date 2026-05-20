@@ -21,7 +21,7 @@ from gi.repository import Gio
 _original_oom_scores: dict[str, str] = {}
 
 class ClientCallbackManager:
-    """管理客户端回调的全局状态和操作"""
+    """Manages global state and operations for client-side callbacks."""
     _instance = None
 
     def __new__(cls):
@@ -47,7 +47,7 @@ class ClientCallbackManager:
                 pass
 
     def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
-        """发送回调通知（线程安全）"""
+        """Send callback notification (thread-safe)."""
         if store:
             try:
                 result = AIAppPriority.update_record(
@@ -56,9 +56,9 @@ class ClientCallbackManager:
                     up_time=datetime.now()
                 )
                 if not result:
-                    print(f"Warning: Failed to update database record for {data['app_id']}")
+                    logger.warning(f"Failed to update database record for {data['app_id']}")
             except Exception as db_error:
-                print(f"Database update error: {db_error}")
+                logger.error(f"Database update error: {db_error}")
 
         with self._sse_lock:
             for q in list(self._sse_queues):
@@ -70,7 +70,7 @@ class ClientCallbackManager:
         return True
 
 
-# 单例实例
+# Singleton instance
 callback_manager = ClientCallbackManager()
 
 
@@ -90,7 +90,7 @@ def get_cgroup_path_by_pid(pid):
 def get_controlled_apps_config(apps_dict=None):
     if apps_dict is None:
         apps_dict = {}
-    # 配置文件 controlled_apps，补充数据库没有的项
+    # Config-file controlled_apps: supplement entries not present in the database
     if hasattr(b_config, 'testing_network_app') and b_config.testing_network_app:
         for app in b_config.testing_network_app:
             app_name = app.get("app_name")
@@ -118,7 +118,7 @@ def get_controlled_apps_config(apps_dict=None):
 def get_app_priority(app_id: str = "", app_name: str = "") -> str:
     """Get the priority of an application."""
     try:
-        # 构建 OR 查询条件
+        # Build query conditions
         query = AIAppPriority.query()
         conditions = []
         if app_id:
@@ -148,7 +148,7 @@ def get_priority_value(priority_str: str = "") -> int:
     :return: 100
     """
     priority = priority_str.lower()
-    print(f"Getting priority for: {priority}, is: {b_config.app_priority}")
+    logger.debug(f"Getting priority for: {priority}, is: {b_config.app_priority}")
     if priority not in b_config.app_priority:
         raise ValueError(f"Invalid priority: {priority_str}")
     return b_config.app_priority[priority]
@@ -157,7 +157,7 @@ def get_priority_value(priority_str: str = "") -> int:
 def get_controlled_apps_net():
     """ Get the list of all controlled apps with their network-related info (cgroup path, pid, etc.) """
     apps_dict = {}
-    # 1. 先查数据库 controlled_apps，优先使用数据库
+    # 1. Database takes priority; fetch controlled apps from DB first
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
         for app in controlled_apps:
@@ -183,7 +183,7 @@ def get_controlled_apps_net():
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
 
     get_controlled_apps_config(apps_dict)
-    # 3. 返回合并后的列表
+    # 3. Return the merged list
     return list(apps_dict.values()) if apps_dict else None
 
 
@@ -207,7 +207,7 @@ def get_controlled_apps(priority: str = None):
 
 
 def get_app_control_info(app_id: str = None, app_name: str = None):
-    """ 获取应用的管控状态和管控数据 """
+    """Return the control status and metadata for an application."""
     controlled_apps = get_controlled_apps() or []
     controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
     name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
@@ -221,9 +221,10 @@ def get_app_control_info(app_id: str = None, app_name: str = None):
 
 
 def get_app_processes(app_name):
-    """通过pgrep获取应用的所有运行中PID
+    """Return all running PIDs for an application via pgrep.
+
     :return:
-        list[int]: 如[1234, 5678]
+        list[int]: e.g. [1234, 5678]
     """
     try:
         result = subprocess.run(
@@ -241,11 +242,11 @@ def get_app_processes(app_name):
 
 def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.0) -> tuple[bool, str]:
     """
-        批量检查多PID磁盘IO是否超过阈值，仅返回是否繁忙和异常信息
-    :param running_pids: 某个app对应的PIDs
-    :param threshold_mb: 磁盘IO阈值，单位MB/s
+    Check whether the aggregate disk IO of a set of PIDs exceeds a threshold.
+    :param running_pids: PIDs belonging to a single app
+    :param threshold_mb: disk IO threshold in MB/s
     :return:
-        tuple(bool, str): (是否繁忙? 异常信息)
+        tuple(bool, str): (is_busy, error_message)
     """
     try:
         sample_times, sample_interval = 3, 0.2
@@ -264,17 +265,17 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
             errors="ignore"
         )
 
-        # 命令执行异常处理
+        # Handle command execution errors
         if result.returncode != 0:
             error_msg = result.stderr.strip()
             if "no such file or directory" in error_msg.lower():
-                raise Exception("未安装iotop，请先安装")
+                raise Exception("iotop is not installed; please install it first")
             elif "permission denied" in error_msg.lower():
-                raise Exception("缺少sudo权限")
+                raise Exception("Insufficient sudo permissions")
             else:
-                raise Exception(f"iotop执行失败：{error_msg}")
+                raise Exception(f"iotop execution failed: {error_msg}")
 
-        # 解析输出
+        # Parse iotop output
         io_pattern = re.compile(r"(?P<pid>\d+)\s+.+?(?P<read_kb>\d+\.\d+)\s+K/s\s+(?P<write_kb>\d+\.\d+)\s+K/s")
         pid_io_data = {pid: {"read": [], "write": []} for pid in running_pids}
 
@@ -289,7 +290,7 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
                     pid_io_data[pid]["read"].append(float(match.group("read_kb")))
                     pid_io_data[pid]["write"].append(float(match.group("write_kb")))
 
-        # 计算总IO速率
+        # Calculate total IO rate
         total_io_mb = 0.0
         for io_data in pid_io_data.values():
             avg_read = sum(io_data["read"]) / len(io_data["read"]) if io_data["read"] else 0.0
@@ -297,7 +298,7 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
             total_io_mb += (avg_read + avg_write) / 1024.0
 
         logger.debug(f"Total Disk IO for PIDs {running_pids}: {total_io_mb:.2f} MB/s (Threshold: {threshold_mb} MB/s)")
-        # 返回结果：无异常msg为空字符串
+        # Return result; error_msg is empty string when there are no errors
         return total_io_mb > threshold_mb, ""
     except Exception as e:
         logger.error(f"Disk IO check failed: {str(e)}", exc_info=True)
@@ -305,7 +306,7 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
 
 
 def get_pids_in_cgroup(cgroup_path):
-    """获取指定cgroup下的所有进程PID"""
+    """Return all process PIDs inside the specified cgroup."""
     try:
         result = subprocess.run(
             ["systemd-cgls", "--no-page", cgroup_path],
@@ -381,16 +382,17 @@ def adjust_oom_priority(
     restore: bool = False,
 ) -> None:
     """
-    调整或恢复应用的 OOM 优先级（oom_score_adj）, 主要目的是保活一些特殊的critical的应用
+    Adjust or restore the OOM priority (oom_score_adj) for an application.
+    Primary purpose: protect "critical" apps from being killed by the OOM killer.
     :param app_id:
     :param app_name:
-    :param priority: 仅当为 "critical" 时生效
-    :param app_cmdline: 用于 pgrep 匹配
-    :param restore: 若为 True，则恢复原始值；否则根据 priority 设置
+    :param priority: only takes effect when the value is "critical"
+    :param app_cmdline: command line string used for pgrep matching
+    :param restore: when True, restore the original oom_score_adj; otherwise set based on priority
     :return:
     """
     if not restore and priority.lower() != "critical":
-        return  # 非 critical 应用且不强制恢复时跳过
+        return  # skip non-critical apps unless restore=True is requested
 
     target_value = 0
     try:
@@ -417,14 +419,14 @@ def adjust_oom_priority(
                 target_value = _original_oom_scores.pop(pid)
                 action = "Restoring"
             else:
-                # 记录app的默认值
+                # Record the original value for this app
                 if pid not in _original_oom_scores:
                     with open(oom_file, "r") as f:
                         _original_oom_scores[pid] = f.read().strip()
                 target_value = "-1000"
                 action = "Setting"
 
-            # 修改 oom_score_adj
+            # Update oom_score_adj
             logger.debug(f"{action} OOM priority for PID {pid} to {target_value}")
             base_cmd = ["tee", oom_file]
             cmd = ["sudo", *base_cmd] if getattr(b_config, "vendor", "") == "generic" else base_cmd
@@ -506,7 +508,7 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
             pids = get_app_processes(fallback_name)
             logger.debug(f"[resource_usage] fallback app_id basename='{fallback_name}' -> pids: {pids}")
         if not pids:
-            print(f"No processes found for app {app_name} (ID: {app_id})")
+            logger.warning(f"No processes found for app {app_name} (ID: {app_id})")
             return {}
 
         representative_pid = pids[0]
@@ -517,7 +519,7 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
             f"cgroup_path='{cgroup_path}'"
         )
         if not cgroup_path:
-            print(f"No cgroup found for PID {representative_pid} of app {app_name}")
+            logger.warning(f"No cgroup found for PID {representative_pid} of app {app_name}")
             return {}
 
         # Log the process cmdline for the representative PID to confirm we found the right process
@@ -662,21 +664,21 @@ def get_app_resource_usage(app_id: str, app_name: str) -> dict:
             'io_write_iops': io_write_iops,
         }
     except Exception as e:
-        print(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
+        logger.error(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
         return {}
 
 
 def safe_notify(title, message, icon="dialog-information"):
     try:
-        # 方法1：优先尝试原生notify-send
+        # Method 1: try native notify-send first
         user = os.getenv("SUDO_USER") or getuser()
 
         user_uid = getpwnam(user).pw_uid
 
-        # 构建正确的DBus地址
+        # Build the correct DBus address
         dbus_address = f'unix:path=/run/user/{user_uid}/bus'
 
-        # 使用sudo -u切换用户身份执行
+        # Execute as the target user via sudo -u
         subprocess.run([
             'sudo', '-u', user,
             f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
@@ -689,9 +691,9 @@ def safe_notify(title, message, icon="dialog-information"):
 
     except (subprocess.CalledProcessError, FileNotFoundError):
         try:
-            # 方法2：使用zenity作为后备方案
+            # Method 2: fall back to zenity
             subprocess.run(
-                ["zenity", "--info", "--text", f"{title}\n{message}", "--title", "系统通知"],
+                ["zenity", "--info", "--text", f"{title}\n{message}", "--title", "System notification"],
                 check=True
             )
         except:
@@ -699,15 +701,15 @@ def safe_notify(title, message, icon="dialog-information"):
 
 
 def get_dbus_address():
-    """动态获取当前用户的DBus地址"""
+    """Dynamically retrieve the current user's DBus session bus address."""
     uid = os.getuid()
 
-    # 方法1：检查标准路径
+    # Method 1: check the standard socket path
     standard_path = f"/run/user/{uid}/bus"
     if os.path.exists(standard_path):
         return f"unix:path={standard_path}"
 
-    # 方法2：从进程环境获取
+    # Method 2: retrieve from process environment
     try:
         import psutil
         for proc in psutil.process_iter(['environ']):
@@ -720,7 +722,7 @@ def get_dbus_address():
     except ImportError:
         pass
 
-    # 方法3：通过loginctl获取
+    # Method 3: retrieve via loginctl
     try:
         cmd = ["loginctl", "show-user", str(uid), "--property=Display"]
         display = subprocess.check_output(cmd).decode().strip()

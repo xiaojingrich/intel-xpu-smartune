@@ -8,10 +8,10 @@ from datetime import datetime
 class Logger:
     def __init__(self, log_file=None, log_level=logging.INFO):
         """
-        初始化日志器。
+        Initialize the logger.
 
-        :param log_file: 日志文件路径，如果为 None，则输出到控制台。
-        :param log_level: 日志级别，默认为 logging.INFO。
+        :param log_file: Path to the log file. If None, output goes to the console only.
+        :param log_level: Logging level; defaults to logging.INFO.
         """
         self.log_file = log_file
         self.log_level = log_level
@@ -46,6 +46,7 @@ class Logger:
 
     def get_logger(self):
         return self.logger
+
     def info(self, message):
         self.logger.info(message)
 
@@ -74,9 +75,10 @@ try:
     os.symlink(os.path.basename(log_file_path), latest_link)
 except OSError:
     pass
-# 测试日志类
+
+
+# Test the logger
 def test_logger():
-    
     logger.info("This is an info message.")
     logger.debug("This is a debug message.")
     logger.error("This is an error message.")
