@@ -25,4 +25,15 @@ else
     fi
 fi
 
-sudo -E python3 BalanceService.py
+cleanup() {
+    echo "Clean up..."
+    sudo pkill -f "BalanceService.py" 2>/dev/null
+    wait
+    stty sane 2>/dev/null || true
+    echo "Service stopped."
+}
+
+trap cleanup INT TERM EXIT
+
+PYTHON_BIN="$(command -v python3)"
+sudo -E "$PYTHON_BIN" BalanceService.py

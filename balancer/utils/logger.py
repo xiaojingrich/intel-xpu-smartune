@@ -3,34 +3,42 @@
 
 import logging
 import os
+from datetime import datetime
 
 class Logger:
     def __init__(self, log_file=None, log_level=logging.INFO):
         """
-        初始化日志器。
+        Initialize the logger.
 
-        :param log_file: 日志文件路径，如果为 None，则输出到控制台。
-        :param log_level: 日志级别，默认为 logging.INFO。
+        :param log_file: Path to the log file. If None, output goes to the console only.
+        :param log_level: Logging level; defaults to logging.INFO.
         """
         self.log_file = log_file
         self.log_level = log_level
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(log_level)
 
-        # 创建日志格式
-        
+        # Prevent duplicate records when the module is imported through multiple
+        # paths or when Logger is instantiated more than once: wipe any handlers
+        # previously attached to this named logger, and stop propagation to the
+        # root logger so external libraries' handlers don't re-emit our records.
+        for h in list(self.logger.handlers):
+            self.logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        self.logger.propagate = False
+
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-        # 如果指定了日志文件，则输出到文件，否则输出到控制台
         if log_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             file_handler = logging.FileHandler(log_file)
             file_handler.setFormatter(formatter)
             file_handler.stream.reconfigure(encoding="utf-8")
             self.logger.addHandler(file_handler)
-            # Set UTF-8 encoding for the stream (Windows-specific fix)
 
-        
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         console_handler.stream.reconfigure(encoding="utf-8")
@@ -38,6 +46,7 @@ class Logger:
 
     def get_logger(self):
         return self.logger
+
     def info(self, message):
         self.logger.info(message)
 
@@ -50,11 +59,26 @@ class Logger:
     def critical(self, message):
         self.logger.critical(message)
 
-log_file_path = "./multi_tasks.log"
+LOG_DIR = "./logs"
+LOG_PREFIX = "multi_tasks"
+_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file_path = os.path.join(LOG_DIR, f"{LOG_PREFIX}_{_timestamp}.log")
 logger = Logger(log_file=log_file_path, log_level=logging.DEBUG).get_logger()
-# 测试日志类
+
+# Also maintain a stable "latest" symlink so log-tailing scripts don't need to
+# guess the timestamped filename.  Best-effort: ignore errors on filesystems
+# that don't support symlinks.
+try:
+    latest_link = os.path.join(LOG_DIR, f"{LOG_PREFIX}_latest.log")
+    if os.path.islink(latest_link) or os.path.exists(latest_link):
+        os.remove(latest_link)
+    os.symlink(os.path.basename(log_file_path), latest_link)
+except OSError:
+    pass
+
+
+# Test the logger
 def test_logger():
-    
     logger.info("This is an info message.")
     logger.debug("This is a debug message.")
     logger.error("This is an error message.")

@@ -4,7 +4,7 @@
 import os
 import signal
 from multiprocessing import JoinableQueue
-from threading import Timer
+from threading import Event, Timer
 from typing import Any, List, Set, Union
 
 import psutil
@@ -14,7 +14,7 @@ from utils import app_utils
 from utils.logger import logger
 
 
-# 定义与BPF代码中相同的常量
+# Constants matching those defined in the BPF C code
 COMM_LEN = 32
 PY_MAX_FILE_LEN = 64
 
@@ -33,78 +33,139 @@ class AppIntercept(metaclass=SingletonMeta):
         self.bpf = BPF(src_file=c_src_file, cflags=["-Wno-duplicate-decl-specifier"])
         self.controlManager = ControlManager()
         self.monitored_apps: Set[str] = set()
-        self.handled_processes: Set[int] = set()  # 初始化已处理进程集合
+        self.handled_processes: Set[int] = set()  # set of already-handled process IDs
         self.controlled_app_map = []
-        self._app_map_index = {}  # 把map做成索引形式，方便查找
+        self._app_map_index = {}  # index of controlled_app_map for O(1) lookup
         self.relaunch_apps = {}
         self.app_pending_queue = JoinableQueue(1000000)
-        self.monitored_app_launched = {}  # 当前已经启动的监控app
-        self.pending_exit_events = {}  # 待处理的退出事件（PID: Timer）
+        self.monitored_app_launched = {}  # currently launched monitored apps
+        self.pending_exit_events = {}  # pending exit events keyed by PID
+        # Fast-lookup structures for get_main_process (rebuilt by _rebuild_match_cache)
+        self._comm_to_app: dict = {}          # comm_lower -> app_name  (O(1) bpf_name exact match)
+        self._filename_exe_to_app: dict = {}  # exe_lower  -> app_name  (filename path match)
+        self._fuzzy_fragments: list = []      # [(fragment_lower, app_name)]  (fuzzy fallback)
+        self._quick_filter: frozenset = frozenset()  # union of all above for pre-filtering
+
+        # Event-driven critical-mode flag.  Set by _on_critical_state_changed()
+        # when the system pressure monitor transitions into "critical" state;
+        # cleared when it leaves.  Used in print_event to avoid issuing SIGSTOP
+        # unless the system is actually under critical pressure.
+        self._system_critical = Event()
+        self.controlManager.register_critical_state_listener(self._on_critical_state_changed)
+        # Seed the flag from the current (possibly already cached) pressure level
+        # so that apps detected before the first monitor callback are handled
+        # correctly at startup.  The tuple is (level, score, is_disk_io_stressed).
+        initial_level, *_ = self.controlManager.get_current_pressure_level()
+        if initial_level == "critical":
+            self._system_critical.set()
 
     def rebuild_controlled_map(self):
         self.controlled_app_map = app_utils.get_controlled_apps()
         self._rebuild_index()
+        self._rebuild_match_cache()
+
+    def _on_critical_state_changed(self, is_critical: bool) -> None:
+        """Callback invoked by SystemPressureMonitor when pressure enters or leaves critical.
+
+        Sets or clears the _system_critical event so that print_event can decide
+        whether to issue SIGSTOP without polling the pressure monitor on every
+        BPF exec event.
+        """
+        if is_critical:
+            self._system_critical.set()
+            logger.info("System pressure entered critical – low-priority app launches will be intercepted")
+        else:
+            self._system_critical.clear()
+            logger.info("System pressure left critical – low-priority app launch interception disabled")
 
     def _rebuild_index(self):
         self._app_map_index = {
-            app["app_name"].lower(): app for app in (self.controlled_app_map or [])
+            app["app_name"].lower(): app
+            for app in (self.controlled_app_map or [])
+            if app.get("app_name") and app["app_name"].strip()
         }
+
+    def _rebuild_match_cache(self) -> None:
+        """Pre-build fast-lookup structures used by get_main_process.
+
+        Called whenever monitored_apps or the app config changes so that the
+        hot-path (print_event → get_main_process) never rebuilds these dicts
+        itself.
+        """
+        # Prefer the unified controlled_apps list; fall back to the legacy monitor_apps key.
+        cnf_apps = (getattr(self.controlManager.config, 'controlled_apps', None)
+                    or getattr(self.controlManager.config, 'monitor_apps', None)
+                    or [])
+        app_executables = {
+            item['name']: item.get('bpf_name', []) for item in cnf_apps
+        }
+
+        comm_to_app: dict[str, str] = {}
+        filename_exe_to_app: dict[str, str] = {}
+        fuzzy_fragments: list[tuple[str, str]] = []
+
+        for app in self.monitored_apps:
+            for exe in app_executables.get(app, []):
+                exe_lower = exe.lower()
+                comm_to_app[exe_lower] = app
+                filename_exe_to_app[exe_lower] = app
+            app_lower = app.lower()
+            fuzzy_fragments.append((app_lower.replace(" ", "-"), app))
+            if " " in app_lower:
+                fuzzy_fragments.append((app_lower, app))
+
+        self._comm_to_app = comm_to_app
+        self._filename_exe_to_app = filename_exe_to_app
+        self._fuzzy_fragments = fuzzy_fragments
+        # Any string whose presence in comm or filename justifies a full match check
+        self._quick_filter = frozenset(
+            set(comm_to_app.keys()) |
+            set(filename_exe_to_app.keys()) |
+            {f for f, _ in fuzzy_fragments}
+        )
 
     def trace_print(self) -> None:
         self.bpf.trace_print()
 
     def get_main_process(self, comm: str, filename: str) -> tuple[bool, str]:
-        """检查是否是主进程"""
-        filename_lower = filename.lower()
+        """Check whether this execve event is the main process of a monitored app.
+
+        Uses pre-built lookup tables (_comm_to_app, _filename_exe_to_app,
+        _fuzzy_fragments) so no config access or dict construction occurs on the
+        hot path.
+        """
         comm_lower = comm.lower()
+        filename_lower = filename.lower()
 
-        # logger.debug(f"\n[DEBUG] Checking process - comm: {comm}, filename: {filename}")
-        # logger.debug(f"[DEBUG] Monitored apps: {self.monitored_apps}")
+        # O(1) comm exact match – covers process-title bpf_name entries
+        # (e.g. comm="mybench" while filename="python")
+        if comm_lower in self._comm_to_app:
+            return True, self._comm_to_app[comm_lower]
 
-        # 定义一些特殊的应用可执行文件名映射
-        cnf_appname = self.controlManager.config.monitor_apps
-        app_executables = {
-            item['name']: item['bpf_name'] for item in cnf_appname
-        }
-        # 先尝试自定义中匹配
-        app_flag = []
-        for app in self.monitored_apps:
-            # 检查是否有预定义的可执行文件名
-            executables = app_executables.get(app, [])
-            exact_match = any(
-                f"/{exe}" in filename_lower or filename_lower.endswith(f"/{exe}")
-                for exe in executables
-            )
+        # All remaining checks require the executable to live under a known
+        # /bin/ path or to be launched via bash, to avoid false positives on
+        # interpreter argv[0].
+        is_bin_path = any(x in filename_lower for x in ('/bin/', '/usr/bin/', '/snap/bin/'))
+        is_bash_launch = (comm_lower == 'bash')
+        if not is_bin_path and not is_bash_launch:
+            return False, ""
 
-            # 如果没有精确匹配，则使用原来的模糊匹配方式
-            if not exact_match:
-                exact_match = (
-                        app.lower().replace(" ", "-") in filename_lower or
-                        app.lower() in filename_lower
-                )
+        # Exact filename-path match against bpf_name entries
+        # (e.g. /usr/bin/llama-server with bpf_name=["llama-server"])
+        for exe, app in self._filename_exe_to_app.items():
+            if f"/{exe}" in filename_lower or filename_lower.endswith(f"/{exe}"):
+                return True, app
 
-            app_flag.append((app, exact_match))
+        # Fuzzy app-name match (app name appears as a substring of the path)
+        for fragment, app in self._fuzzy_fragments:
+            if fragment in filename_lower:
+                return True, app
 
-        special_flag = [x in filename_lower for x in ['/bin/', '/usr/bin/', '/snap/bin/']]
-        main_app = [app[0] for app in app_flag if app[1]]
-        is_bash_launch = (comm_lower == 'bash' and any(app[1] for app in app_flag))
-
-        # logger.debug(f"[DEBUG] app_flag results: {app_flag}")
-        # logger.debug(f"[DEBUG] special_flag: {special_flag}")
-        # logger.debug(f"[DEBUG] main_app: {main_app}")
-        # logger.debug(f"[DEBUG] is_bash_launch: {is_bash_launch}")
-
-        if (any(special_flag) and any(app[1] for app in app_flag)) or is_bash_launch:
-            result = True, main_app[0] if main_app else os.path.basename(filename)
-            # logger.debug(f"[DEBUG] Returning True: {result}")
-            return result
-
-        # logger.debug("[DEBUG] Returning False")
         return False, ""
 
     def is_process_alive(self, pid):
         try:
-            # 检查 /proc/[pid]/status 是否存在
+            # Check whether /proc/[pid]/status exists
             with open(f"/proc/{pid}/status") as f:
                 return True
         except FileNotFoundError:
@@ -112,7 +173,7 @@ class AppIntercept(metaclass=SingletonMeta):
 
 
     def handle_exit_event(self, pid, app_id, app_name, old_comm, old_filename):
-        """延迟检查进程是否真正退出"""
+        """Deferred check to confirm whether the process has truly exited."""
         if self.is_process_alive(pid):
             logger.debug(f"[Delay Check] PID={pid} still alive, not exiting normally.")
             return
@@ -126,7 +187,7 @@ class AppIntercept(metaclass=SingletonMeta):
         }, True)
         del self.monitored_app_launched[pid]
 
-        # 清理 pending_exit_events
+        # Clean up pending_exit_events
         if pid in self.pending_exit_events:
             del self.pending_exit_events[pid]
 
@@ -140,12 +201,21 @@ class AppIntercept(metaclass=SingletonMeta):
 
         # logger.debug(f"*** Event: PID={pid}, type={type} COMM={comm}, FILENAME={filename} ***")
 
-        if type == 0: # 启动事件
+        if type == 0:  # launch event
+            comm_lower = comm.lower()
+            filename_lower = filename.lower()
+            # Fast pre-filter: skip the vast majority of unrelated BPF exec events
+            # without entering get_main_process at all.
+            if not (comm_lower in self._comm_to_app or
+                    any(c in filename_lower or c in comm_lower
+                        for c in self._quick_filter)):
+                return
+
             is_main_process, app_name = self.get_main_process(comm, filename)
             # logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
             if is_main_process:
                 logger.debug(f"Is this filename main process? {is_main_process}, app_name={app_name}")
-                # 防止重复处理同一个进程树
+                # Prevent processing the same process tree more than once
                 if not self.is_process_handled(pid):
                     app_data = self._app_map_index.get(app_name.lower())
                     app_id, app_priority = app_data['app_id'], app_data.get('priority', 'low') if app_data else ("", "low")
@@ -160,29 +230,48 @@ class AppIntercept(metaclass=SingletonMeta):
                             'purpose': "app"
                         }, True)
                     else:
-                        self.handle_monitored_app(pid, comm, filename, app_name, app_id)
+                        # Only intercept (SIGSTOP) when the system is already in
+                        # critical pressure state.  If the system is idle the app
+                        # is allowed to start freely, avoiding the collateral
+                        # "Stopped" visible to the user that the previous
+                        # always-SIGSTOP pattern caused.
+                        if self._system_critical.is_set():
+                            try:
+                                os.kill(pid, signal.SIGSTOP)
+                            except OSError as e:
+                                logger.debug(f"SIGSTOP failed for PID {pid}: {e}")
+                            self.handle_monitored_app(pid, comm, filename, app_name, app_id)
+                        else:
+                            # System is not under critical pressure: let the app run.
+                            logger.debug("System not critical, allowing '%s' (PID: %s) to run freely", app_name, pid)
+                            app_utils.callback_manager.send_callback_notification({
+                                'app_id': app_id,
+                                'app_name': app_name,
+                                'status': "running",
+                                'purpose': "app"
+                            }, True)
                     self.mark_process_handled(pid)
 
-        elif type == 1:  # 退出事件
+        elif type == 1:  # exit event
             if pid not in self.monitored_app_launched:
                 return
 
-            # 如果已经有待处理的退出事件，取消旧的定时器
+            # Cancel any existing pending exit timer for this PID
             if pid in self.pending_exit_events:
                 self.pending_exit_events[pid].cancel()
 
             app_id, app_name, old_comm, old_filename = self.monitored_app_launched[pid]
             # logger.debug(f"Detected possible exit: PID={pid}, comm={comm}")
 
-            # 延迟 1.5 秒后检查进程是否真正退出
+            # Schedule a deferred check 1.5 s later to confirm the process has exited
             timer = Timer(1.5, self.handle_exit_event, args=[pid, app_id, app_name, old_comm, old_filename])
             self.pending_exit_events[pid] = timer
             timer.start()
 
 
     def is_process_handled(self, pid: int) -> bool:
-        """检查该进程是否已经被处理过"""
-        # 检查当前进程及其父进程是否已被处理
+        """Return True if this process (or a parent) has already been handled."""
+        # Check the process and its ancestors
         try:
             process = psutil.Process(pid)
             for p in [process] + process.parents():
@@ -193,18 +282,25 @@ class AppIntercept(metaclass=SingletonMeta):
         return False
 
     def mark_process_handled(self, pid: int) -> None:
-        """标记进程为已处理"""
+        """Mark a process as handled."""
         self.handled_processes.add(pid)
 
     def handle_monitored_app(self, pid: int, comm: str, filename: str, app_name: str, app_id: str) -> None:
+        """Handle a low-priority app that was launched while the system is under critical pressure.
+
+        This method is only called from print_event when _system_critical is set,
+        meaning SIGSTOP has already been issued.  It re-checks the event in case
+        the system recovered between the SIGSTOP and this point; if so, it issues
+        SIGCONT and lets the app run.  Otherwise it queues the app for deferred
+        resumption.
+        """
         logger.debug(f"Detected monitored app '{app_name}' (PID: {pid}, COMM: {comm}, FILE: {filename}, app_id: {app_id})")
 
         try:
-            os.kill(pid, signal.SIGSTOP)
-            # 检查系统资源get_current_pressure_level
-            pressure, _ = self.controlManager.get_current_pressure_level()
-            logger.debug(f"Current system pressure level: {pressure}")
-            if pressure != "critical":
+            # Re-check the critical flag: the monitor may have transitioned out
+            # of critical between the SIGSTOP in print_event and here.
+            if not self._system_critical.is_set():
+                logger.debug(f"System recovered before handling {app_name} (PID: {pid}), resuming")
                 os.kill(pid, signal.SIGCONT)
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
@@ -214,7 +310,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 }, True)
             else:
                 logger.info(f"System resources busy, skipping relaunch of {app_name}")
-                app_utils.safe_notify("System resources busy", f"已暂停应用{app_name}启动", icon='dialog-warning')
+                app_utils.safe_notify("System resources busy", f"Paused startup of app: {app_name}", icon='dialog-warning')
                 app_utils.callback_manager.send_callback_notification({
                     'app_id': app_id,
                     'app_name': app_name,
@@ -229,21 +325,24 @@ class AppIntercept(metaclass=SingletonMeta):
             logger.debug(f"Error handling {app_name} (PID: {pid}): {str(e)}")
 
     def add_to_monitorlist(self, app_names: Union[str, List[str]]) -> None:
-        """添加应用到监控列表（支持批量操作）"""
+        """Add one or more applications to the monitor list (supports batch operations)."""
         if not app_names:
             return
 
-        # 统一转为列表处理
+        # Normalise to a list
         names = [app_names] if isinstance(app_names, str) else app_names
 
-        # 转换为小写用于比较
+        # Lowercase for comparison
         existing_lower = {name.lower() for name in self.monitored_apps}
 
         added_count = 0
         for name in names:
+            if not name or not name.strip():
+                logger.debug(f"Skipping empty app name in monitor list")
+                continue
             if name.lower() not in existing_lower:
                 self.monitored_apps.add(name)
-                existing_lower.add(name.lower())  # 更新检查集
+                existing_lower.add(name.lower())
                 added_count += 1
                 logger.debug(f"Added '{name}' to monitoring list")
 
@@ -252,60 +351,170 @@ class AppIntercept(metaclass=SingletonMeta):
             logger.debug(f"All {len(names)} app(s) [{app_str}] already in monitoring list")
         elif added_count > 0:
             logger.debug(f"Successfully added {added_count}/{len(names)} new app(s)")
+            self._rebuild_match_cache()
 
     def remove_from_monitorlist(self, app_name: str) -> None:
-        """从监控列表中移除应用"""
+        """Remove one or more applications from the monitor list."""
         if app_name in self.monitored_apps:
             self.monitored_apps.remove(app_name)
             logger.debug(f"Removed '{app_name}' from monitoring list")
+            self._rebuild_match_cache()
         else:
             logger.debug(f"'{app_name}' not found in monitoring list")
 
     def clear_monitorlist(self) -> None:
-        """清空监控列表"""
+        """Clear the entire monitor list."""
         self.monitored_apps.clear()
         logger.debug("Cleared monitoring list")
+        self._rebuild_match_cache()
 
     def get_monitored_apps(self) -> List[str]:
-        """获取当前监控的应用列表"""
+        """Return the current list of monitored applications."""
         return list(self.monitored_apps)
 
-    def check_system_resources(self, cpu_threshold: int = 70, mem_threshold: int = 80) -> bool:
-        """检查系统资源使用情况"""
+    def scan_already_running_apps(self) -> list:
+        """Scan currently running processes for monitored apps that pre-date the balancer.
+
+        Called once when the UI balancer tab is first opened to detect apps that
+        started before the balancer service (and were therefore missed by BPF).
+        Any matching process is registered in monitored_app_launched and a
+        "running" callback is sent so the UI and database reflect the correct state.
+        After this one-time scan, ongoing detection is left entirely to BPF.
+
+        Two scanning strategies are used:
+
+        1. **BPF comm/exe matching** (existing logic) – iterates live processes and
+           checks whether comm or exe matches a known monitored app via
+           :meth:`get_main_process`.  This covers normal single-process desktop apps.
+
+        2. **Multi-process apps** – for apps whose ``controlled_apps`` config entry
+           contains a non-empty ``process_names`` list, the BPF comm-matching path
+           may miss them (they are recognised by process name, not by bpf_name).
+           A second pass calls :func:`app_utils.check_app_running_status` for each
+           such app that was NOT already detected in pass 1, and emits the
+           appropriate "running" or "stopped" callback.
+
+        :return: list of dicts with keys app_id, app_name, pid for each detected app.
+        """
+        detected = []
+        detected_app_ids: set[str] = set()
+
+        # --- Pass 1: BPF comm/exe matching (original logic) ---
+        if self.monitored_apps:
+            try:
+                for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                    try:
+                        pid = proc.info['pid']
+                        # Fast-path: skip PIDs already tracked by BPF or a prior scan
+                        if pid in self.monitored_app_launched or pid in self.handled_processes:
+                            continue
+                        # Full parent-chain check (handles child processes of known apps)
+                        if self.is_process_handled(pid):
+                            continue
+
+                        comm = proc.info.get('name') or ''
+                        exe = proc.info.get('exe') or ''
+
+                        is_match, app_name = self.get_main_process(comm, exe)
+                        if not is_match:
+                            continue
+
+                        registered_app = self._app_map_index.get(app_name.lower())
+                        if not registered_app:
+                            continue
+
+                        app_id = registered_app['app_id']
+                        logger.info(
+                            f"[startup scan] Detected pre-existing process: PID={pid}, "
+                            f"app={app_name}, comm={comm}, exe={exe}"
+                        )
+                        self.monitored_app_launched[pid] = (app_id, app_name, comm, exe)
+                        self.mark_process_handled(pid)
+
+                        app_utils.callback_manager.send_callback_notification({
+                            'app_id': app_id,
+                            'app_name': app_name,
+                            'status': "running",
+                            'purpose': "app"
+                        }, True)
+                        detected.append({"app_id": app_id, "app_name": app_name, "pid": pid})
+                        detected_app_ids.add(app_id)
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception as e:
+                logger.error(f"scan_already_running_apps (pass 1) failed: {e}")
+
+        # --- Pass 2: multi-process apps (process_names) ---
+        # Check apps that have process_names configured and were not found in pass 1.
         try:
-            # 获取CPU使用率
+            all_controlled = app_utils.get_controlled_apps() or []
+            for app in all_controlled:
+                app_id = app.get('app_id', '')
+                app_name = app.get('app_name', '')
+                cmdline = app.get('cmdline', '')
+                if not app_id or app_id in detected_app_ids:
+                    continue
+                process_names = app_utils._get_app_process_names(app_id=app_id, app_name=app_name)
+                if not process_names:
+                    continue  # handled by pass 1 (or not monitored at all)
+
+                status = app_utils.check_app_running_status(app_id, app_name, cmdline)
+                logger.info(
+                    f"[startup scan] Multi-process app '{app_name}' "
+                    f"(process_names={process_names}): status={status}"
+                )
+                app_utils.callback_manager.send_callback_notification({
+                    'app_id': app_id,
+                    'app_name': app_name,
+                    'status': status,
+                    'purpose': "app"
+                }, True)
+                if status == "running":
+                    detected.append({"app_id": app_id, "app_name": app_name, "pid": None})
+        except Exception as e:
+            logger.error(f"scan_already_running_apps (pass 2) failed: {e}")
+
+        logger.info(f"[startup scan] Detected {len(detected)} pre-existing monitored app(s): "
+                    f"{[d['app_name'] for d in detected]}")
+        return detected
+
+    def check_system_resources(self, cpu_threshold: int = 70, mem_threshold: int = 80) -> bool:
+        """Check current system resource usage."""
+        try:
+            # Get CPU utilisation
             cpu_percent = psutil.cpu_percent(interval=1)
 
-            # 获取内存使用率
+            # Get memory utilisation
             mem_percent = psutil.virtual_memory().percent
 
             logger.debug(f"System status - CPU: {cpu_percent}%, Memory: {mem_percent}%")
 
-            # 检查是否低于阈值
+            # Check whether usage is below the threshold
             return cpu_percent < cpu_threshold and mem_percent < mem_threshold
 
         except Exception as e:
             logger.debug(f"Error checking system resources: {str(e)}")
-            # 出现错误时默认允许启动
+            # Default to allowing startup on error
             return True
 
 
 if __name__ == "__main__":
-    # 初始化BPF
+    # Initialise BPF
     bpf_monitor = AppIntercept()
 
-    # 添加应用到监控列表
+    # Add applications to the monitor list
     bpf_monitor.add_to_monitorlist("firefox")
     bpf_monitor.add_to_monitorlist("Calculator")
 
-    # 打开性能缓冲区
+    # Open the perf buffer
     bpf_monitor.bpf["events"].open_perf_buffer(bpf_monitor.print_event)
     logger.debug(f"Monitoring execve() for: {', '.join(bpf_monitor.get_monitored_apps())}")
     logger.debug("Ctrl+C to exit")
 
     while True:
         try:
-            # 同时处理trace打印和事件
+            # Handle both trace output and BPF events
             bpf_monitor.bpf.perf_buffer_poll(timeout=100)
         except KeyboardInterrupt:
             logger.debug("\nExiting...")

@@ -1,35 +1,45 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import hashlib
+import queue as _queue
 import signal
 from datetime import datetime
 from threading import Lock
 
-from flask import Flask, request
+from flask import Flask, request, Response, stream_with_context
 
 from balancer.balancer import DynamicBalancer
 from db.DatabaseModel import AIAppPriority, DBStatus, init_database
-from utils.app_utils import adjust_oom_priority, callback_manager, fetch_all_apps, get_priority_value
+from monitor.monitor_api import monitor_bp, register_system_pressure_monitor, _start_snapshot_cleanup_task
+from monitor.system_info import preload_static_info, shutdown_gpu_usage
+from utils.app_utils import adjust_oom_priority, callback_manager, check_app_running_status, fetch_all_apps, get_priority_value
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
 
-
 app = Flask(__name__)
+app.register_blueprint(monitor_bp)
+_start_snapshot_cleanup_task()
 
 CERT_FILE = './b_server.crt'
 KEY_FILE = './b_server.key'
 
 _service_lock = Lock()
-_service = None  # 单例服务实例
+_service = None  # Singleton service instance
+_shutdown_lock = Lock()
+_shutdown_started = False
 
 
 class DynamicService:
-    """将核心逻辑封装在服务类中"""
+    """Encapsulates the core balancer logic as a managed service."""
 
     def __init__(self):
         self.balancer = DynamicBalancer()
+        # Share the controller's SystemPressureMonitor with the monitor API so that
+        # both use the same instance (including is_limited_app_dominant state).
+        register_system_pressure_monitor(self.balancer.controlManager.system_pressure_monitor)
         self.rebuild_controlled_map()
         self.secret_hash = self._generate_secret_hash()  # Generate and store the hash
         logger.info("Service secret hash generated.")
@@ -47,14 +57,17 @@ class DynamicService:
         self.balancer.start()
 
     def add_workload(self, priority, payload):
-        """直接代理到balancer"""
+        """Delegate directly to the balancer."""
         self.balancer.add_workload(priority, payload)
 
     def cancel_relaunch(self, app_id):
         return self.balancer.cancel_relaunch_by_app_id(app_id)
 
-    def resource_limit(self, app_id, app_name, priority):
-        return self.balancer.set_resource_limit(app_id, app_name, priority)
+    def resource_limit(self, app_id, app_name, priority, limit_overrides=None):
+        return self.balancer.set_resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
+
+    def resource_limit_profile(self, app_id, app_name, priority):
+        return self.balancer.get_resource_limit_profile(app_id, app_name, priority)
 
     def restore_resource(self, app_id):
         return self.balancer.set_restore_resource(app_id)
@@ -71,33 +84,58 @@ class DynamicService:
     def rebuild_controlled_map(self):
         self.balancer.bpf_monitor.rebuild_controlled_map()
 
+    def check_running_apps(self):
+        return self.balancer.bpf_monitor.scan_already_running_apps()
+
     def shutdown(self):
         self.balancer.shutdown()
+        shutdown_gpu_usage()
 
 
 def start_service():
-    """初始化服务并设置信号处理"""
+    """Initialize the service and register OS signal handlers."""
     global _service
     with _service_lock:
         if _service is None:
-            print(">>>> 第一次初始化 DynamicService <<<<")
+            logger.info("Initializing DynamicService for the first time")
             _service = DynamicService()
             signal.signal(signal.SIGINT, _handle_signal)
             signal.signal(signal.SIGTERM, _handle_signal)
             _service.start()
         else:
-            print(">>>> DynamicService 已经存在，跳过初始化 <<<<")
+            logger.debug("DynamicService already initialized, skipping")
     return _service
 
+
 def _handle_signal(signum, frame):
-    if _service:
-        _service.shutdown()
+    # Keep signal handler minimal and async-signal-safe: no logging/subprocess here.
+    # Actual shutdown is handled in main() finally block.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
+def _shutdown_service_once():
+    global _shutdown_started
+    with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
+
+    try:
+        if _service:
+            _service.shutdown()
+    except Exception as exc:
+        logger.error(f"Service shutdown failed: {exc}")
+
+    try:
         reset_app_status()
-    raise SystemExit(0)
+    except Exception as exc:
+        logger.error(f"Reset app status failed during shutdown: {exc}")
 
 
 def reset_app_status():
-    """重置所有应用状态为 NA"""
+    """Reset all application statuses to 'NA'."""
     try:
         updated_count = AIAppPriority.update_all_records(
             status="NA",
@@ -148,7 +186,7 @@ def login():
 
 @app.route('/task/add_workload', methods=['POST'])
 def add_workload():
-    """优化后的API接口"""
+    """Add a workload with the given priority."""
     try:
         data = request.json
         _service.add_workload(
@@ -170,29 +208,27 @@ def add_workload():
 
 @app.route('/app/get_apps', methods=['GET', 'POST'])
 def get_apps():
-    """获取系统所有应用列表并同步到数据库"""
+    """Retrieve all system application entries and optionally sync them to the database."""
     try:
         data = request.get_json()
         store = data.get('store', False)
         app_list = fetch_all_apps()
         for app in app_list:
             if store:
-                # 检查应用是否已存在
                 app_id = app["app_id"]
                 existing_app = None
 
                 try:
                     existing_app = AIAppPriority.query().where(AIAppPriority.app_id == app_id).get()
-                except Exception as e:
-                    print(f"App - {app_id} will be managed.")
+                except Exception:
+                    pass
 
                 if not existing_app:
-                    # 仅当应用不存在时才插入
                     AIAppPriority.insert_record(
                         id=app_id,
                         app_id=app_id,
                         name=app["name"],
-                        priority=0,  # 默认优先级
+                        priority=0,
                         controlled=False,
                         remark="",
                         cmdline=app["commandline"],
@@ -214,7 +250,7 @@ def get_apps():
 
 @app.route('/app/set_priority', methods=['POST'])
 def set_priority():
-    """设置应用优先级（使用新的数据库操作方法）"""
+    """Set the priority of an application and update the database."""
     try:
         data = request.get_json()
         app_id = data.get('app_id')
@@ -263,14 +299,14 @@ def set_priority():
 
 @app.route('/app/get_priority_data', methods=['POST'])
 def get_priority_data():
-    """根据 app_id 或 name 获取应用的优先级设置（支持同时查询）"""
+    """Retrieve the priority settings for an app by app_id or name."""
 
     try:
         data = request.get_json()
         app_id = data.get('app_id', "")
         name = data.get('app_name', "")
 
-        # 构建 OR 查询条件
+
         query = AIAppPriority.query()
         conditions = []
         if app_id:
@@ -282,14 +318,13 @@ def get_priority_data():
         record = query.first()
 
         if not record:
-            # 生成更友好的错误提示
-            not_found_msg = "未找到匹配的应用"
+            not_found_msg = "No matching application found"
             if app_id and name:
-                not_found_msg = f"未找到 app_id={app_id} 或 name={name} 的应用"
+                not_found_msg = f"No application found with app_id={app_id} or name={name}"
             elif app_id:
-                not_found_msg = f"未找到 app_id={app_id} 的应用"
+                not_found_msg = f"No application found with app_id={app_id}"
             elif name:
-                not_found_msg = f"未找到 name={name} 的应用"
+                not_found_msg = f"No application found with name={name}"
 
             return construct_response(
                 data={},
@@ -297,7 +332,7 @@ def get_priority_data():
                 retmsg=not_found_msg
             )
 
-        # 返回标准化数据结构
+
         priority_data = {
             "id": record.id,
             "app_id": record.app_id,
@@ -324,12 +359,12 @@ def get_priority_data():
 
 @app.route('/app/set_to_control', methods=['POST'])
 def set_to_control():
-    """设置应用管控状态并添加到监控列表"""
+    """Enable or disable control for an application and register it with the monitor."""
     try:
         data = request.get_json()
         app_name = data.get('app_name', "")
         app_id = data.get('app_id', "")
-        controlled = data.get('controlled', True)  # 默认为True（启用管控）
+        controlled = data.get('controlled', True)
         cgroup = data.get('cgroup', '')
         priority = data.get('priority', 0)
         remark = data.get('remark', '')
@@ -337,21 +372,24 @@ def set_to_control():
 
         _service.add_control(app_name)
 
-        # 更新或创建数据库记录
-        result = AIAppPriority.update_record(
-            id=app_id,
+
+        update_fields = dict(
             controlled=controlled,
             priority=priority,
             cgroup=cgroup,
             remark=remark,
         )
+        # Only persist name when a valid value was provided; never overwrite with an empty string
+        if app_name and app_name.strip():
+            update_fields["name"] = app_name
+        result = AIAppPriority.update_record(id=app_id, **update_fields)
 
         if result == DBStatus.NOT_FOUND:
             AIAppPriority.insert_record(
                 id=app_id,
                 app_id=app_id,
                 name=app_name,
-                priority=priority,  # 默认优先级
+                priority=priority,
                 controlled=controlled,
                 cgroup=cgroup,
                 remark=remark,
@@ -362,6 +400,19 @@ def set_to_control():
 
         _service.rebuild_controlled_map()
         adjust_oom_priority(app_id, app_name, priority, cmdline)
+
+        # After registering the app, probe whether it is already running so the
+        # UI reflects the correct status immediately (without waiting for the next
+        # BPF exec event).
+        if controlled and app_id:
+            status = check_app_running_status(app_id, app_name, cmdline)
+            logger.info(f"set_to_control: initial status check for '{app_name}' → {status}")
+            callback_manager.send_callback_notification({
+                'app_id': app_id,
+                'app_name': app_name,
+                'status': status,
+                'purpose': "app"
+            }, store=True)
 
         return construct_response(
             data={
@@ -381,13 +432,12 @@ def set_to_control():
 
 @app.route('/app/remove_from_control', methods=['POST'])
 def remove_from_control():
-    """从管控列表中移除应用"""
+    """Remove an application from the control list."""
     try:
         data = request.get_json()
         app_id = data.get('app_id', "")
         app_name = data.get('app_name', "")
 
-        # 验证必要参数
         if not app_id and not app_name:
             return construct_response(
                 data={},
@@ -395,7 +445,6 @@ def remove_from_control():
                 retmsg="Either app_id or app_name must be provided"
             )
 
-        # 从监控服务中移除
         _service.remove_control(app_name if app_name else "")
 
         app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
@@ -404,7 +453,6 @@ def remove_from_control():
         # restore oom score
         adjust_oom_priority(app_id, app_name, app_info.priority, app_info.cmdline, restore=True)
 
-        # 更新数据库记录（将controlled设为False）
         AIAppPriority.update_record(
             id=app_id if app_id else "",
             controlled=False
@@ -430,7 +478,7 @@ def remove_from_control():
 
 @app.route('/app/get_controlled_app', methods=['POST'])
 def get_controlled_app():
-    """获取所有受管控应用并添加到服务监控列表"""
+    """Return all controlled applications along with their current metadata."""
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
 
@@ -441,17 +489,23 @@ def get_controlled_app():
                 data=[]
             )
 
-        # 处理结果并添加到服务监控
+        # Build a lookup map from config/system apps so we can fill in metadata
+        config_app_map = {a["app_id"]: a for a in fetch_all_apps()}
+
         result_data = []
         for app in controlled_apps:
+            # Prefer the DB name, or fall back to the config-derived human-readable name
+            cfg_app = config_app_map.get(app.app_id, {})
+            app_name = app.name if app.name and app.name.strip() else (cfg_app.get("app_name") or cfg_app.get("name") or "")
             result_data.append({
                 "app_id": app.app_id,
-                "app_name": app.name,
+                "app_name": app_name,
                 "controlled": app.controlled,
                 "priority": app.priority,
                 "oom_score": app.oom_score,
                 "cmdline": app.cmdline,
                 "cgroup": app.cgroup,
+                "process_names": cfg_app.get("process_names", []) or [],
                 "remark": app.remark,
                 "status": app.status
             })
@@ -469,10 +523,33 @@ def get_controlled_app():
         )
 
 
+@app.route('/app/check_running_apps', methods=['POST'])
+def check_running_apps():
+    """Scan currently running processes to find managed apps that started before the balancer.
+
+    This endpoint is called once when the UI balancer tab is first opened.  It
+    uses psutil to inspect live processes and registers any monitored app that is
+    already running so its status is reflected correctly in the UI.  Ongoing
+    detection after this initial scan is handled by BPF as usual.
+    """
+    try:
+        detected = _service.check_running_apps()
+        return construct_response(
+            data=detected,
+            retmsg=f"Startup scan complete, detected {len(detected)} pre-existing monitored app(s)"
+        )
+    except Exception as e:
+        logger.error(f"check_running_apps failed: {str(e)}")
+        return construct_response(
+            data=[],
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
 @app.route('/app/get_pending_app', methods=['POST'])
 def get_pending_app():
-    """获取所有待启动应用并添加到服务监控列表"""
-    print(">>>> get_pending_app called <<<<")  # 调试日志
+    """Return all applications currently in pending state, ordered by priority."""
     try:
         pending_apps = AIAppPriority.query().filter(AIAppPriority.status == "pending")
 
@@ -484,7 +561,7 @@ def get_pending_app():
             )
 
         logger.debug(f"Found {len(pending_apps)} pending apps in database, pending_apps: {pending_apps}")
-        # 处理结果并返回全部data
+
         result_data = []
         for app in pending_apps:
             result_data.append({
@@ -499,7 +576,7 @@ def get_pending_app():
                 "status": app.status
             })
 
-        # 按priority_value降序排序（数值越大优先级越高）
+
         sorted_data = sorted(result_data, key=lambda x: -x["priority_value"])
         logger.debug(f"Sorted pending apps: {sorted_data}")
 
@@ -518,12 +595,11 @@ def get_pending_app():
 
 @app.route('/app/set_oom_score', methods=['POST'])
 def set_oom_score():
-    """设置应用的 OOM 分数，用于保活该应用"""
+    """Set the OOM score for an application to protect it from the OOM killer."""
     try:
         data = request.get_json()
         app_id = data.get('app_id', "")
 
-        # 验证必要参数
         if not app_id:
             return construct_response(
                 data={},
@@ -534,7 +610,6 @@ def set_oom_score():
         app_info = AIAppPriority.query().filter(AIAppPriority.app_id == app_id).first()
 
         logger.debug(f"set_oom_score: app_info: {app_info}")
-        # set oom score
         adjust_oom_priority(app_id, app_info.name, app_info.priority, app_info.cmdline)
 
         return construct_response(
@@ -557,7 +632,6 @@ def cancel_relaunch_app():
         data = request.get_json()
         app_id = data.get('app_id', "")
 
-        # 验证必要参数
         if not app_id:
             return construct_response(
                 data={},
@@ -605,8 +679,8 @@ def app_resource_limit():
         app_id = data.get('app_id', "")
         app_name = data.get('app_name', "")
         priority = data.get('priority', "")
+        limit_overrides = data.get('limit_overrides')
 
-        # 验证必要参数
         if not app_id and not app_name and not priority:
             return construct_response(
                 data={},
@@ -614,7 +688,7 @@ def app_resource_limit():
                 retmsg="app_id, app_name and priority must be provided"
             )
 
-        result = _service.resource_limit(app_id, app_name, priority)
+        result = _service.resource_limit(app_id, app_name, priority, limit_overrides=limit_overrides)
 
         if result:
             return construct_response(
@@ -636,6 +710,36 @@ def app_resource_limit():
         )
 
 
+@app.route('/app/resource_limit_profile', methods=['POST'])
+def app_resource_limit_profile():
+    """Get editable resource-limit profile (defaults + bounds) for UI."""
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id', "")
+        app_name = data.get('app_name', "")
+        priority = data.get('priority', "")
+
+        if not app_id and not app_name:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="app_id or app_name must be provided"
+            )
+
+        profile = _service.resource_limit_profile(app_id, app_name, priority or "undefined")
+        return construct_response(
+            data=profile,
+            retmsg="Successfully fetched resource limit profile"
+        )
+    except Exception as e:
+        logger.error(f"Get resource limit profile failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
 @app.route('/app/resource_restore', methods=['POST'])
 def app_resource_restore():
     """ Restore resource for a specific app by app_id. """
@@ -643,7 +747,6 @@ def app_resource_restore():
         data = request.get_json()
         app_id = data.get('app_id', "")
 
-        # 验证必要参数
         if not app_id:
             return construct_response(
                 data={},
@@ -665,8 +768,6 @@ def app_resource_restore():
                 retmsg="No matching app found or failed to restore resource"
             )
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         logger.error(f"Restore resource failed: {str(e)}")
         return construct_response(
             data={},
@@ -675,47 +776,66 @@ def app_resource_restore():
         )
 
 
-@app.route('/app/register_callback', methods=['POST'])
-def register_callback():
-    """注册全局回调地址"""
-    try:
-        data = request.get_json()
-        callback_url = data.get('callback_url')
+_SSE_HEARTBEAT_TIMEOUT = 30  # seconds between keep-alive comments when no events arrive
 
-        if not callback_url:
-            return construct_response(
-                retcode=RetCode.ARGUMENT_ERROR,
-                retmsg="callback_url is required"
-            )
 
-        callback_manager.register_callback_url(callback_url)
-        return construct_response(
-            data={"callback_url": callback_url},
-            retmsg="Global callback URL registered"
-        )
+@app.route('/app/events', methods=['GET'])
+def app_events():
+    """Server-Sent Events stream for app status changes."""
+    q = _queue.Queue()
+    callback_manager.add_sse_client(q)
 
-    except Exception as e:
-        return construct_response(
-            retcode=RetCode.EXCEPTION_ERROR,
-            retmsg=str(e)
-        )
+    def generate():
+        try:
+            yield "data: {\"type\": \"connected\"}\n\n"
+            while True:
+                try:
+                    data = q.get(timeout=_SSE_HEARTBEAT_TIMEOUT)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except _queue.Empty:
+                    # Keep-alive comment
+                    yield ": heartbeat\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            callback_manager.remove_sse_client(q)
+
+    response = Response(
+        stream_with_context(generate()),
+        content_type='text/event-stream',
+    )
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection'] = 'keep-alive'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 
 def main():
     logger.info("Starting Balance Service...")
-    # 检查证书文件是否存在
     if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
         logger.error(f"Certificate files not found: {CERT_FILE}, {KEY_FILE}, "
                      f"please check 'start_balancer.sh' to generate them.")
         return
 
     init_database()
+    try:
+        preload_static_info()
+    except Exception as exc:
+        logger.warning(f"Preload static info failed, will retry on first static request: {exc}")
+
     if not hasattr(app, "_service_initialized"):  # Make sure the service is only initialized once
         start_service()
         app._service_initialized = True
 
     ssl_context = (CERT_FILE, KEY_FILE)
-    app.run(host="127.0.0.1", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
+    try:
+        app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _shutdown_service_once()
+
 
 if __name__ == "__main__":
     main()

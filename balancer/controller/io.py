@@ -31,8 +31,8 @@ class IOController:
             logger.error(f"Failed to get active user slices: {e}")
         return "0"
 
-    def _run_cmd(self, cmd: List[str], check: bool = True) -> bool:
-        """执行 shell 命令并返回是否成功"""
+    def _run_cmd(self, cmd, check: bool = True) -> bool:
+        """Execute a shell command and return True on success."""
         try:
             subprocess.run(cmd, shell=False, check=check, capture_output=True)
             return True
@@ -42,13 +42,13 @@ class IOController:
             return False
 
     def _check_file_exists(self, path: str) -> bool:
-        """检查文件是否存在"""
+        """Return True if the given path exists."""
         return os.path.exists(path)
 
     def enable_io_controller(self) -> bool:
         """
-        启用IO控制器，逐级设置 cgroup.subtree_control
-        返回是否全部设置成功
+        Enable the IO controller by setting cgroup.subtree_control at each cgroup level.
+        Returns True only if all levels were configured successfully.
         """
         paths = [
             f"{self.cgroup_mount}/cgroup.subtree_control",
@@ -73,9 +73,9 @@ class IOController:
 
     def get_disk_id(self, disk_filter: Optional[Union[str, List[str]]] = None) -> Dict[str, str]:
         """
-        获取系统磁盘名称到ID的映射 (排除非物理磁盘)
-        :param disk_filter: 可选的磁盘名称过滤器 (如 "nvme"、"sda" 或 ["nvme", "sda"])
-        :return: 格式如 {"nvme0n1": "259:0", "sda": "8:0"} 的字典
+        Return a mapping of disk name to maj:min device ID (physical disks only).
+        :param disk_filter: Optional name filter, e.g. "nvme" or ["nvme", "sda"]
+        :return: dict like {"nvme0n1": "259:0", "sda": "8:0"}
         """
         try:
             cmd = ["lsblk", "-d", "-o", "NAME,TYPE,MAJ:MIN,SIZE,ROTA"]
@@ -90,12 +90,12 @@ class IOController:
             lines = result.stdout.strip().split('\n')
             header = lines[0].split()
 
-            # 解析列索引
+            # Parse column indices from header
             name_idx = header.index("NAME")
             type_idx = header.index("TYPE")
             majmin_idx = header.index("MAJ:MIN")
 
-            # 处理过滤器
+            # Build the filter list
             filter_list = []
             if disk_filter:
                 filter_list = [disk_filter] if isinstance(disk_filter, str) else disk_filter
@@ -110,11 +110,11 @@ class IOController:
                 disk_type = parts[type_idx]
                 maj_min = parts[majmin_idx]
 
-                # 精确筛选物理磁盘
+                # Only include physical disks
                 if disk_type != "disk":
                     continue
 
-                # 可选名称过滤
+                # Optional name filter
                 if filter_list and not any(f in name.lower() for f in filter_list):
                     continue
 
@@ -132,20 +132,20 @@ class IOController:
 
     def _ensure_io_enabled(self, cgroup_path: str) -> bool:
         """
-        确保指定cgroup路径已启用IO控制器
+        Ensure the IO controller is enabled for the cgroup at the given path.
 
-        :param cgroup_path: 例如/sys/fs/cgroup/.../vte-spawn-xxx.scope/io.max
-        :return :cgroup_path最终是否可用
+        :param cgroup_path: e.g. /sys/fs/cgroup/.../vte-spawn-xxx.scope/io.max
+        :return: True if cgroup_path is usable after enabling
         """
-        # 如果cgroup_path已经存在，则直接可用
+        # Path already exists; nothing to do
         if os.path.exists(cgroup_path):
             return True
 
         try:
-            # 叶子节点不需要
+            # Leaf node does not need a subtree_control entry
             target_dir = os.path.dirname(os.path.dirname(cgroup_path))
 
-            # 从cgroup挂载点开始构建路径组件
+            # Build path components starting from the cgroup mount point
             components = []
             path = target_dir
             while path != self.cgroup_mount:
@@ -178,9 +178,7 @@ class IOController:
             return False
 
     def _get_full_cgroup_path(self, cgroup_id: str, file: str) -> Optional[str]:
-        """
-        查找 cgroup 路径
-        """
+        """Locate the full cgroup directory path for cgroup_id and return the path to file."""
         try:
             result = subprocess.run(
                 ["find", self.cgroup_mount, "-name", cgroup_id, "-type", "d"],
@@ -211,17 +209,17 @@ class IOController:
             is_restore: bool = False,
     ) -> bool:
         """
-        综合IO限制设置方法
-        :param: cgroup_id: cgroup id
-        :param: limits:
+        General-purpose disk IO throttle setter.
+        :param cgroup_id: cgroup identifier
+        :param limits: per-disk limit map, e.g.:
                 {
-                    "default": {"rbps": 1000000, "wbps": 500000, "riops": 1000, "wiops": 500},  # 没有专门设置的disk会用到
-                    "nvme0n1": {"wbps": 2000000, "wiops": 800},  # 使用设备名称或者id都可以
+                    "default": {"rbps": 1000000, "wbps": 500000, "riops": 1000, "wiops": 500},
+                    "nvme0n1": {"wbps": 2000000, "wiops": 800},  # device name or maj:min both work
                     "8:0": {"rbps": 3000000, "riops": 1500}
                 }
-        :param: disk_filter: 可选磁盘名称过滤 (如 "nvme" 或 ["nvme", "sda"])
-        :param: is_restore: 是否恢复默认值
-        :return: success/not
+        :param disk_filter: optional disk name filter (e.g. "nvme" or ["nvme", "sda"])
+        :param is_restore: when True, reset all limits to max
+        :return: True if all operations succeeded
         """
         success = True
         disk_map = self.get_disk_id(disk_filter)  # {"nvme0n1": "259:0", "sda": "8:0"}
@@ -236,28 +234,28 @@ class IOController:
             return False
 
         for disk_name, disk_id in disk_map.items():
-            # 如果是恢复模式，直接设置所有限制为 max
+            # In restore mode, reset all limits to max
             if is_restore:
                 limit_str = "rbps=max wbps=max riops=max wiops=max"
             else:
                 disk_limits = {}
 
-                # 1. 默认先赋值default的value，下面匹配具体的disk在做特殊设置
+                # 1. Start with the "default" limits, then apply per-disk overrides
                 if "default" in limits:
                     disk_limits.update(limits["default"])
 
-                # 1. ID:"8:0"
+                # Match by maj:min device ID
                 if disk_id in limits:
                     disk_limits.update(limits[disk_id])
 
-                # 2. 匹配设备名称:"nvme0n1"
+                # Match by device name
                 if disk_name in limits:
                     disk_limits.update(limits[disk_name])
 
                 if not disk_limits:
                     continue
 
-                # 构建限制字符串
+                # Build the limit string
                 limit_parts = []
                 for key in ["rbps", "wbps", "riops", "wiops"]:
                     if key in disk_limits:
@@ -265,40 +263,71 @@ class IOController:
                 # logger.info(f"disk_limits: {disk_limits}, limit_parts: {limit_parts}")
                 limit_str = " ".join(limit_parts)
 
-            if limit_str:  # 确保命令非空
-                cmd = ["sudo", "sh", "-c", f"echo '{disk_id} {limit_str}' > {io_max_path}"]
+            if limit_str:  # skip if nothing to apply
+                # io.max may have vanished if the IO controller was disabled in a parent cgroup
+                # (e.g. after systemd reload/session rebuild).  During restore this is benign:
+                # disabling the controller already clears all limits, so there is nothing to do.
+                if not os.path.exists(io_max_path):
+                    if is_restore:
+                        logger.warning(
+                            f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), "
+                            f"IO controller appears disabled — limits already cleared, skipping restore"
+                        )
+                        continue
+                    else:
+                        logger.error(
+                            f"io.max not found for cgroup {cgroup_id} (disk {disk_name}), cannot apply limits"
+                        )
+                        success = False
+                        continue
+
+                cmd = f"sudo sh -c 'echo \"{disk_id} {limit_str}\" > {io_max_path}'"
                 logger.info(f"Setting IO limits for cgroup: {cgroup_id} in disk {disk_name}({disk_id}): {limit_str}")
-                if not self._run_cmd(cmd):
-                    success = False
+
+                if is_restore:
+                    # For restore, run the command directly so we can distinguish a benign
+                    # "io.max disappeared between the existence check and the write" (TOCTOU)
+                    # from a genuine permission failure, without emitting a misleading ERROR.
+                    try:
+                        result = subprocess.run(cmd, shell=True, check=False, capture_output=True)
+                        if result.returncode != 0:
+                            if not os.path.exists(io_max_path):
+                                logger.warning(
+                                    f"io.max disappeared for cgroup {cgroup_id} (disk {disk_name}) "
+                                    f"mid-restore — IO controller was disabled, limits already cleared (benign)"
+                                )
+                            else:
+                                logger.error(
+                                    f"Command failed: {cmd}\nError: {result.stderr.decode().strip()}"
+                                )
+                                success = False
+                    except Exception as e:
+                        logger.error(f"Restore command raised an exception: {str(e)}")
+                        success = False
+                else:
+                    if not self._run_cmd(cmd):
+                        success = False
 
         return success
 
     def set_write_io_throughput_throttle_app(self, cgroup_id: str, wbps: int,
                                              disk_filter: Optional[str] = None) -> bool:
-        """
-        设置写入IO吞吐量限制 (单位: B/s)
-        """
+        """Set write IO throughput limit in bytes per second."""
         return self.set_disk_io_throttle(cgroup_id, {"default": {"wbps": wbps}}, disk_filter)
 
     def set_read_io_throughput_throttle_app(self, cgroup_id: str, rbps: int,
                                             disk_filter: Optional[str] = None) -> bool:
-        """
-        设置读取IO吞吐量限制 (单位: B/s)
-        """
+        """Set read IO throughput limit in bytes per second."""
         return self.set_disk_io_throttle(cgroup_id, {"default": {"rbps": rbps}}, disk_filter)
 
     def set_write_iops_throttle_app(self, cgroup_id: str, wiops: int,
                                     disk_filter: Optional[str] = None) -> bool:
-        """
-        设置写入IOPS限制 (单位: 次/秒)
-        """
+        """Set write IOPS limit (operations per second)."""
         return self.set_disk_io_throttle(cgroup_id, {"default": {"wiops": wiops}}, disk_filter)
 
     def set_read_iops_throttle_app(self, cgroup_id: str, riops: int,
                                    disk_filter: Optional[str] = None) -> bool:
-        """
-        设置读取IOPS限制 (单位: 次/秒)
-        """
+        """Set read IOPS limit (operations per second)."""
         return self.set_disk_io_throttle(cgroup_id, {"default": {"riops": riops}}, disk_filter)
 
     def restore_disk_io_throttle(
@@ -306,9 +335,7 @@ class IOController:
         cgroup_id: str,
         disk_filter: Optional[Union[str, List[str]]] = None,
     ) -> bool:
-        """
-        恢复磁盘 IO 限制
-        """
+        """Restore disk IO limits to unrestricted (max) values."""
         return self.set_disk_io_throttle(
             cgroup_id=cgroup_id,
             limits={},
@@ -317,16 +344,14 @@ class IOController:
         )
 
     def set_weight(self, cgroup_id: str, weight: int) -> bool:
-        """
-        设置IO权重 (1-10000),需证明是否有效
-        """
+        """Set IO weight (1–10000) for the given cgroup."""
         if weight < 1 or weight > 10000:
-            logger.info("Weight must be between 1 and 10000")
+            logger.warning("IO weight must be between 1 and 10000")
             return False
 
         io_weight_path = self._get_full_cgroup_path(cgroup_id, "io.weight")
 
-        # 确保IO控制器已启用
+        # Ensure the IO controller is enabled
         if not self._ensure_io_enabled(io_weight_path):
             return False
 
@@ -336,8 +361,7 @@ class IOController:
 
     def get_current_io_limits(self, cgroup_id: str) -> Optional[tuple[int, int, int, int]]:
         """
-        获取当前的IO限制 (rbps, wbps, riops, wiops)
-        返回 (read_bps_limit, write_bps_limit, read_iops_limit, write_iops_limit) 或 None
+        Return the current IO limits as (rbps, wbps, riops, wiops), or None on error.
         """
         io_max_path = self._get_full_cgroup_path(cgroup_id, "io.max")
         if not os.path.exists(io_max_path):
@@ -349,13 +373,13 @@ class IOController:
                 if not content:
                     return (0, 0, 0, 0)
 
-                # 解析格式如 "259:0 rbps=20971520 wbps=10485760 riops=20000 wiops=2200"
+                # Parse format: "259:0 rbps=20971520 wbps=10485760 riops=20000 wiops=2200"
                 parts = content.split()
                 rbps = 0
                 wbps = 0
                 riops = 0
                 wiops = 0
-                for part in parts[1:]:  # 跳过磁盘ID
+                for part in parts[1:]:  # skip device ID field
                     if part.startswith('rbps='):
                         rbps = int(part.split('=')[1])
                     elif part.startswith('wbps='):
@@ -370,27 +394,27 @@ class IOController:
             return None
 
 if __name__ == "__main__":
-    # 示例用法
+    # Example usage
     io_ctl = IOController()
-    # 测试设置
+    # Test setup
     cgroup_id = "vte-spawn-d689ffa6-5446-4dfb-99f3-c4e702c44ebb.scope"
 
-    # 测试用例1：所有磁盘相同限制
-    # io_ctl.set_write_io_throughput_throttle_app(cgroup_id, 60 * 1024 * 1024)  # 所有磁盘写限制10MB/s
-    # io_ctl.set_read_io_throughput_throttle_app(cgroup_id, 70 * 1024 * 1024)  # 所有磁盘读限制20MB/s
-    # io_ctl.set_write_iops_throttle_app(cgroup_id, 3200)  # 所有磁盘写IOPS限制2200
-    # io_ctl.set_read_iops_throttle_app(cgroup_id, 21000)  # 所有磁盘读IOPS限制20000
+    # Test case 1: same limit for all disks
+    # io_ctl.set_write_io_throughput_throttle_app(cgroup_id, 60 * 1024 * 1024)  # write limit 60MB/s
+    # io_ctl.set_read_io_throughput_throttle_app(cgroup_id, 70 * 1024 * 1024)  # read limit 70MB/s
+    # io_ctl.set_write_iops_throttle_app(cgroup_id, 3200)  # write IOPS limit 3200
+    # io_ctl.set_read_iops_throttle_app(cgroup_id, 21000)  # read IOPS limit 21000
 
-    # 测试用例2：封装设置的参数
+    # Test case 2: compound limit config
     limits = {
-        "default": {  # 如果只测试default的设置，需要把其他设置注释掉
+        "default": {
             "rbps": 30 * 1024 * 1024,
             "wbps": 15 * 1024 * 1024,
             "wiops": 2201,
             "riops": 20001
-        },  # 默认写吞吐量限制15MB/s...
-        "8:0": {"wbps": 10 * 1024 * 1024},  # sda单独设置写10MB/s
-        "nvme0n1": {"rbps": 33 * 1024 * 1024, "wbps": 27 * 1024 * 1024}  # nvme单独设置读32MB/s, 写20MB/s
+        },
+        "8:0": {"wbps": 10 * 1024 * 1024},  # sda write limit 10MB/s
+        "nvme0n1": {"rbps": 33 * 1024 * 1024, "wbps": 27 * 1024 * 1024}  # nvme read 33MB/s, write 27MB/s
     }
     # # io_ctl.set_disk_io_throttle(cgroup_id, limits)
     io_ctl.set_disk_io_throttle(
@@ -399,15 +423,15 @@ if __name__ == "__main__":
         disk_filter=["nvme", "sda"],
     )
     #
-    # # 测试用例3：只对NVMe磁盘设置限制
+    # # Test case 3: NVMe-only limits
     # io_ctl.set_write_io_throughput_throttle_app(cgroup_id, 35 * 1024 * 1024, disk_filter="sda")
     # io_ctl.set_read_io_throughput_throttle_app(cgroup_id, 55 * 1024 * 1024, disk_filter="nvme")
     # io_ctl.set_write_iops_throttle_app(cgroup_id, 2300, disk_filter="sda")
     # io_ctl.set_read_iops_throttle_app(cgroup_id, 22000, disk_filter="nvme")
 
-    # 设置权重
+    # Set weight
     io_ctl.set_weight(cgroup_id, 300)
-    # 检查设置
+    # Check current settings
     limits = io_ctl.get_current_io_limits(cgroup_id)
     if limits:
         print(

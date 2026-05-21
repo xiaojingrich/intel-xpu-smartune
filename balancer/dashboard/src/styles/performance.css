@@ -1,0 +1,982 @@
+.perf-root {
+  position: relative;
+  padding: 20px 0 32px;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(76, 201, 240, 0.08), transparent 45%),
+    radial-gradient(circle at 90% 20%, rgba(255, 159, 28, 0.08), transparent 40%),
+    linear-gradient(180deg, rgba(9, 12, 20, 0.92), rgba(9, 12, 20, 0.98));
+}
+
+.perf-root::before,
+.perf-root::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.perf-root::before {
+  background:
+    repeating-linear-gradient(
+      90deg,
+      rgba(120, 176, 255, 0.08) 0,
+      rgba(120, 176, 255, 0.08) 1px,
+      transparent 1px,
+      transparent 48px
+    ),
+    repeating-linear-gradient(
+      0deg,
+      rgba(120, 176, 255, 0.08) 0,
+      rgba(120, 176, 255, 0.08) 1px,
+      transparent 1px,
+      transparent 48px
+    );
+  opacity: 0.4;
+  z-index: 0;
+}
+
+.perf-root::after {
+  background: linear-gradient(180deg, rgba(6, 10, 18, 0.3), transparent 30%, rgba(6, 10, 18, 0.4));
+  z-index: 0;
+}
+
+.perf-ambient {
+  position: absolute;
+  width: 320px;
+  height: 320px;
+  border-radius: 50%;
+  filter: blur(60px);
+  opacity: 0.35;
+  z-index: 0;
+}
+
+.perf-ambient--blue {
+  top: -120px;
+  left: -80px;
+  background: radial-gradient(circle, rgba(76, 201, 240, 0.8) 0%, rgba(15, 23, 42, 0) 70%);
+}
+
+.perf-ambient--orange {
+  top: 120px;
+  right: -60px;
+  background: radial-gradient(circle, rgba(255, 159, 28, 0.8) 0%, rgba(15, 23, 42, 0) 70%);
+}
+
+.perf-ambient--teal {
+  bottom: -140px;
+  left: 20%;
+  background: radial-gradient(circle, rgba(45, 212, 191, 0.8) 0%, rgba(15, 23, 42, 0) 70%);
+}
+
+.perf-header {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 4px 14px;
+  z-index: 1;
+}
+
+.perf-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 22px 0 14px;
+  padding: 0 4px 10px;
+  position: relative;
+  z-index: 1;
+  border-bottom: 1px solid rgba(120, 176, 255, 0.12);
+}
+
+.perf-section-eyebrow {
+  color: #c3d1f5;
+  font-size: 12px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.perf-section-subtitle {
+  color: #8e9ab3 !important;
+  font-size: 11px;
+  display: block;
+  margin-top: 3px;
+}
+
+.perf-toggle-btn {
+  color: #b6c7f7 !important;
+  font-size: 11px !important;
+  letter-spacing: 0.04em;
+  border: 1px solid rgba(120, 176, 255, 0.2) !important;
+  border-radius: 6px !important;
+  padding: 2px 10px !important;
+  height: auto !important;
+}
+
+.perf-toggle-btn:hover {
+  color: #e4ecff !important;
+  background: rgba(90, 169, 255, 0.12) !important;
+  border-color: rgba(120, 176, 255, 0.36) !important;
+}
+
+.perf-env-strip {
+  margin-bottom: 14px;
+}
+
+.perf-static-cards .ant-col {
+  display: flex;
+}
+
+.perf-static-card {
+  width: 100%;
+}
+
+.perf-static-card .ant-card-body {
+  padding: 10px !important;
+}
+
+.perf-env-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.perf-env-title {
+  color: #ffd59a !important;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.perf-env-core-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.perf-env-item {
+  border: 1px solid rgba(120, 176, 255, 0.22);
+  background: rgba(12, 20, 34, 0.58);
+  border-radius: 10px;
+  padding: 7px 8px;
+  min-height: 54px;
+}
+
+.perf-env-item-label {
+  color: rgba(195, 209, 245, 0.72) !important;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: block;
+}
+
+.perf-env-item-value {
+  color: #e4ecff !important;
+  font-size: 12px;
+  display: block;
+  margin-top: 3px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.perf-env-driver-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(120, 176, 255, 0.2);
+}
+
+.perf-env-driver-title {
+  color: rgba(195, 209, 245, 0.82) !important;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  display: block;
+  margin-bottom: 6px;
+}
+
+.perf-env-driver-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.perf-env-freq-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.perf-env-driver-item {
+  border: 1px solid rgba(120, 176, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(10, 18, 30, 0.45);
+  padding: 6px 7px;
+}
+
+.perf-env-driver-label {
+  color: rgba(174, 191, 223, 0.74) !important;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: block;
+}
+
+.perf-env-driver-value {
+  color: #d9e3ff !important;
+  font-size: 11px;
+  margin-top: 2px;
+  line-height: 1.2;
+  display: block;
+  word-break: break-word;
+}
+
+.perf-env-chip {
+  border-color: rgba(120, 176, 255, 0.28) !important;
+  background: rgba(12, 20, 34, 0.62) !important;
+  color: #d9e3ff !important;
+  border-radius: 999px !important;
+  margin-inline-end: 0 !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.perf-env-chip--label {
+  border-color: rgba(255, 159, 28, 0.42) !important;
+  background: rgba(255, 159, 28, 0.14) !important;
+  color: #ffd59a !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.perf-env-chip-key {
+  color: rgba(195, 209, 245, 0.72);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.perf-env-chip-value {
+  color: #e4ecff;
+  font-size: 11px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.perf-env-chip--wide {
+  max-width: 100%;
+  align-items: flex-start;
+}
+
+.perf-env-chip--wide .perf-env-chip-value {
+  max-width: none;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.perf-card {
+  background: linear-gradient(160deg, rgba(15, 24, 40, 0.92), rgba(10, 15, 26, 0.86)) !important;
+  border: 1px solid rgba(120, 176, 255, 0.24) !important;
+  border-radius: 16px !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(76, 201, 240, 0.08),
+    0 16px 40px rgba(5, 10, 20, 0.7),
+    0 0 28px rgba(76, 201, 240, 0.12) !important;
+  backdrop-filter: blur(14px);
+  position: relative;
+  z-index: 1;
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.perf-card::before,
+.perf-card::after {
+  content: '';
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgba(90, 169, 255, 0.5);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.perf-card::before {
+  top: 12px;
+  left: 12px;
+  border-right: none;
+  border-bottom: none;
+}
+
+.perf-card::after {
+  bottom: 12px;
+  right: 12px;
+  border-left: none;
+  border-top: none;
+}
+
+.perf-card:hover {
+  transform: translateY(-3px);
+  box-shadow:
+    inset 0 0 0 1px rgba(76, 201, 240, 0.12),
+    0 18px 44px rgba(5, 10, 20, 0.76),
+    0 0 36px rgba(76, 201, 240, 0.2);
+}
+
+.perf-rise {
+  animation: perf-rise 0.5s ease both;
+}
+
+.perf-insight-metric {
+  min-height: 132px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 6px 4px;
+}
+
+.perf-insight-value-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.perf-insight-value {
+  font-size: 30px;
+  font-weight: 700;
+  color: #e4ecff !important;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  text-shadow: 0 0 10px rgba(90, 169, 255, 0.35);
+}
+
+.perf-insight-bar-track {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(120, 176, 255, 0.12), rgba(120, 176, 255, 0.2));
+  overflow: hidden;
+  border: 1px solid rgba(120, 176, 255, 0.2);
+}
+
+.perf-insight-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  transition: width 0.35s ease;
+}
+
+.perf-insight-scale {
+  display: flex;
+  justify-content: space-between;
+  color: rgba(174, 191, 223, 0.72);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.perf-trend-card {
+  min-height: 260px;
+}
+
+.perf-trend-card--compact {
+  min-height: 232px;
+}
+
+.perf-trend-card--compact .perf-trend-head {
+  margin-bottom: 8px;
+}
+
+.perf-trend-card--compact .perf-trend-body {
+  gap: 12px;
+}
+
+.perf-trend-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.perf-trend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: 0 0 10px rgba(76, 201, 240, 0.6);
+  display: inline-block;
+}
+
+.perf-trend-body {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+
+.perf-trend-body--split {
+  align-items: flex-start;
+}
+
+.perf-trend-body--center {
+  align-items: center;
+}
+
+.perf-trend-subtitle {
+  color: #b6c7ea !important;
+  font-size: 11px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  line-height: 1.35;
+  max-height: calc(1.35em * 2);
+  margin-bottom: 8px;
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+  cursor: help;
+}
+
+.perf-trend-main {
+  flex: 1;
+  min-width: 160px;
+}
+
+.perf-trend-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: #e4ecff;
+  letter-spacing: 0.02em;
+}
+
+.perf-trend-unit {
+  font-size: 12px;
+  color: #8e9ab3;
+  margin-left: 6px;
+}
+
+.perf-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(120, 176, 255, 0.08);
+}
+
+.perf-detail-grid--compact {
+  gap: 6px 10px;
+}
+
+.perf-detail-grid--compact .perf-detail-label {
+  font-size: 9px;
+}
+
+.perf-detail-grid--compact .perf-detail-value {
+  font-size: 11px;
+}
+
+.perf-detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.perf-detail-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.perf-detail-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: rgba(195, 209, 245, 0.7);
+}
+
+.perf-detail-source {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 1px 6px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.perf-detail-source--static {
+  color: #ffd59a;
+  border-color: rgba(255, 159, 28, 0.42);
+  background: rgba(255, 159, 28, 0.14);
+}
+
+.perf-detail-source--dynamic {
+  color: #9be2ff;
+  border-color: rgba(90, 169, 255, 0.42);
+  background: rgba(90, 169, 255, 0.14);
+}
+
+.perf-detail-value {
+  font-size: 12px;
+  color: #d9e3ff;
+  word-break: break-word;
+}
+
+.perf-trend-chart {
+  flex: 1;
+  min-width: 180px;
+}
+
+.perf-insights-grid .ant-col {
+  display: flex;
+}
+
+.perf-insights-grid .perf-trend-card {
+  width: 100%;
+  height: 100%;
+}
+
+.perf-insights-grid .perf-trend-card .ant-card-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.perf-insights-grid .perf-trend-body {
+  flex: 1;
+}
+
+.perf-insights-grid .perf-detail-value {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: normal;
+}
+
+.perf-core-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+@media (min-width: 1600px) {
+  .perf-core-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 2200px) {
+  .perf-core-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.perf-core-item {
+  padding: 8px;
+  border: 1px solid rgba(120, 176, 255, 0.2);
+  border-radius: 10px;
+  background: rgba(10, 18, 30, 0.55);
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.perf-core-item:hover {
+  border-color: rgba(120, 176, 255, 0.38);
+  background: rgba(14, 24, 42, 0.7);
+}
+
+.perf-core-head,
+.perf-core-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.perf-core-meta {
+  margin-top: 4px;
+}
+
+.perf-core-trend-legend {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.perf-core-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(195, 209, 245, 0.76);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.perf-core-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 8px rgba(120, 176, 255, 0.45);
+}
+
+.perf-core-trend-row {
+  margin-top: 4px;
+}
+
+.perf-core-trend-title {
+  color: rgba(195, 209, 245, 0.68) !important;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: block;
+  margin-bottom: 1px;
+}
+
+.perf-core-bar-track {
+  margin-top: 4px;
+  height: 5px;
+  border-radius: 4px;
+  background: rgba(120, 176, 255, 0.18);
+  overflow: hidden;
+}
+
+.perf-core-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.35s ease;
+}
+
+/* Chart legend (NPU/GPU detail sections) */
+.perf-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 0;
+  margin-bottom: 6px;
+}
+
+.perf-chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  margin-right: 12px;
+  user-select: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 0.15s ease;
+}
+
+.perf-chart-legend-item:hover {
+  background: rgba(120, 176, 255, 0.1);
+}
+
+.perf-chart-legend-item--hidden {
+  opacity: 0.35;
+}
+
+.perf-chart-legend-label {
+  color: #8e9ab3;
+  font-size: 10px;
+}
+
+.perf-chart-legend-item--hidden .perf-chart-legend-label {
+  color: rgba(174, 191, 223, 0.3);
+  text-decoration: line-through;
+}
+
+/* Metrics chip row (NPU/GPU detail sections) */
+.perf-metrics-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed rgba(120, 176, 255, 0.16);
+  margin-bottom: 10px;
+}
+
+.perf-metrics-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(120, 176, 255, 0.06);
+  border: 1px solid rgba(120, 176, 255, 0.1);
+  transition: background 0.15s ease;
+}
+
+.perf-metrics-chip:hover {
+  background: rgba(120, 176, 255, 0.12);
+}
+
+.perf-gpu-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.perf-gpu-util {
+  text-align: right;
+  min-width: 96px;
+}
+
+.perf-gpu-chart {
+  margin-top: 12px;
+}
+
+.perf-gpu-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  align-items: stretch;
+}
+
+.perf-gpu-block {
+  padding: 10px;
+  border: 1px solid rgba(120, 176, 255, 0.18);
+  border-radius: 10px;
+  background: rgba(12, 20, 34, 0.45);
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.perf-gpu-devices-row .ant-col {
+  display: flex;
+}
+
+.perf-gpu-devices-row .perf-card {
+  width: 100%;
+}
+
+.perf-gpu-mini-trend {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(120, 176, 255, 0.16);
+}
+
+.perf-series-legend {
+  margin: 4px 0 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+
+.perf-series-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(195, 209, 245, 0.78);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.perf-series-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 8px rgba(120, 176, 255, 0.42);
+}
+
+.perf-engine-current-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
+  margin-top: 8px;
+}
+
+.perf-engine-current-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.perf-engine-current-bar-track {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.perf-engine-current-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.35s ease;
+}
+
+.perf-engine-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.perf-engine-item {
+  padding: 8px;
+  border: 1px solid rgba(90, 169, 255, 0.22);
+  border-radius: 10px;
+  background: rgba(9, 16, 28, 0.5);
+}
+
+.perf-engine-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.perf-sparkline {
+  filter: drop-shadow(0 0 10px rgba(76, 201, 240, 0.3));
+}
+
+.perf-spark-axis {
+  fill: rgba(190, 204, 240, 0.78);
+  font-size: 8px;
+  letter-spacing: 0.04em;
+}
+
+.perf-spark-point-label {
+  fill: rgba(221, 232, 255, 0.88);
+  font-size: 7px;
+}
+
+.perf-pressure-pointer-card {
+  border: 1px solid rgba(120, 176, 255, 0.2);
+  border-radius: 12px;
+  background: rgba(10, 18, 30, 0.45);
+  padding: 12px;
+  text-align: center;
+  height: 100%;
+}
+
+.perf-pressure-pointer-title {
+  color: rgba(195, 209, 245, 0.88) !important;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.perf-pressure-pointer-wrap {
+  position: relative;
+  height: 184px;
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.perf-pressure-needle {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  filter: drop-shadow(0 0 4px rgba(90, 169, 255, 0.2));
+  z-index: 1;
+}
+
+.perf-pressure-pointer-value {
+  position: absolute;
+  bottom: 10%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1;
+  font-family: monospace;
+  z-index: 2;
+}
+
+.perf-pressure-pointer-subtitle {
+  color: #9fb1d8 !important;
+  font-size: 11px;
+  display: block;
+  margin-top: 8px;
+}
+
+.perf-pressure-pointer-description {
+  color: rgba(174, 191, 223, 0.82) !important;
+  font-size: 10px;
+  display: block;
+  margin-top: 4px;
+}
+
+@keyframes perf-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 768px) {
+  .perf-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .perf-root::before {
+    opacity: 0.2;
+  }
+
+  .perf-trend-body {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .perf-insight-value {
+    font-size: 24px;
+  }
+
+  .perf-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .perf-core-grid,
+  .perf-gpu-grid,
+  .perf-engine-grid,
+  .perf-engine-current-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .perf-gpu-head {
+    flex-direction: column;
+  }
+
+  .perf-gpu-util {
+    text-align: left;
+  }
+
+  .perf-env-chip {
+    max-width: 100%;
+  }
+
+  .perf-env-chip-value {
+    max-width: 180px;
+  }
+
+  .perf-env-chip--wide .perf-env-chip-value {
+    max-width: 100%;
+  }
+
+  .perf-env-core-grid,
+  .perf-env-driver-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .perf-env-freq-grid {
+    grid-template-columns: 1fr;
+  }
+}

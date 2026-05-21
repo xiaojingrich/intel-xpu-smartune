@@ -1,0 +1,7 @@
+# Ignore all of .idea folder by default for pycharm
+.idea/*
+
+*.pyc
+__pycache__/
+*.log
+*.db

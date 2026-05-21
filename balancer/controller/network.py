@@ -9,7 +9,7 @@ import subprocess # nosec
 import time
 from utils.logger import logger
 from config.config import b_config
-from monitor.network import NetworkMonitor
+from monitor import NetworkMonitor
 from utils import app_utils
 
 
@@ -171,7 +171,7 @@ class NetworkController:
 
     def setup_tc_classes_and_filters(self):
         if not self.enable_network_control:
-            logger.info("NetworkControl 被禁用，跳过 tc classes 和 filters 的设置")
+            logger.info("NetworkControl is disabled, skipping tc classes and filters setup")
             return
         dev = self.dev
         IFB_DEV = self.IFB_DEV
@@ -220,10 +220,10 @@ class NetworkController:
         IFB_DEV = self.IFB_DEV
         new_app_ids = set(app.get("app_id") for app in controlled_apps)
         old_app_ids = set(self.app_filter_info.keys())
-        # 1. 移除已不存在的 app
+        # 1. Remove apps that no longer exist
         for app_id in old_app_ids - new_app_ids:
             self._remove_app_network_rules(app_id)
-        # 2. 检查 priority 变化，或新 app
+        # 2. Handle priority changes or newly added apps
         for idx, app in enumerate(controlled_apps):
             app_id = app.get("app_id")
             new_priority = app.get("priority", "low")
@@ -235,7 +235,7 @@ class NetworkController:
                     self._add_app_network_rules(app, idx)
             else:
                 self._add_app_network_rules(app, idx)
-            # 保证 OUTPUT 链只存在一个 CONNMARK --save-mark 规则，并且在所有 MARK 规则之后
+            # Ensure only one CONNMARK --save-mark rule exists in OUTPUT, placed after all MARK rules
             subprocess.run(["iptables", "-t", "mangle", "-D", "OUTPUT", "-j", "CONNMARK", "--save-mark"], stderr=subprocess.DEVNULL, check=False)
             subprocess.run(["iptables", "-t", "mangle", "-A", "OUTPUT", "-j", "CONNMARK", "--save-mark"], check=False)
 
@@ -299,7 +299,7 @@ class NetworkController:
         current_class_bw = rates.get(classid, 0)
         half_bw = int((max_bw - min_bw) / 2 + min_bw)
         critical_threshold = self.config.network_thresholds["critical"] * config_total_rate
-        # 从哪个阶段开始恢复
+        # Determine the stage from which to begin restoring bandwidth
         stage_table = {
             1: (half_bw, 0, 0),
             2: (min_bw, 0, 1),
@@ -307,12 +307,12 @@ class NetworkController:
             4: (min_bw, 2, 3),
         }
         stage_transition_point, stage_full, stage_half = stage_table.get(limit_stage, (min_bw, 0, 0))
-        # 分级进行恢复，从高到低，每次一个类别 (half -> max)
+        # Restore bandwidth tier by tier, from highest to lowest (half -> max)
         if limit_stage > 0:
             if current_class_bw < stage_transition_point * 0.9:
                 self._limit_network_class(dev, classid, min_bw, max_bw, burst, direction=direction, level=key)
                 setattr(self, limit_stage_attr, stage_full)
-                logger.info(f"{direction.upper()} 恢复 {key} app class流量，完全放开到 {max_bw} kbit/s")
+                logger.info(f"{direction.upper()} fully restoring {key} app class bandwidth to {max_bw} kbit/s")
             else:
                 if limit_stage in (4, 2):
                     expected_total_bw = half_bw + actual_total_bw - min_bw
@@ -321,13 +321,13 @@ class NetworkController:
                 if expected_total_bw < critical_threshold:
                     if limit_stage in (4, 2):
                         self._limit_network_class(dev, classid, min_bw, half_bw, burst, direction=direction, level=key)
-                        logger.info(f"{direction.upper()} 恢复 {key} app class 放开一半流量到 {half_bw} kbit/s")
+                        logger.info(f"{direction.upper()} partially restoring {key} app class bandwidth to {half_bw} kbit/s")
                     else:
                         self._limit_network_class(dev, classid, min_bw, max_bw, burst, direction=direction, level=key)
-                        logger.info(f"{direction.upper()} 恢复 {key} app class流量，完全放开到 {max_bw} kbit/s")
+                        logger.info(f"{direction.upper()} fully restoring {key} app class bandwidth to {max_bw} kbit/s")
                     setattr(self, limit_stage_attr, stage_half)
                 else:
-                    logger.info(f"{direction.upper()} {key} app class保持限速 {stage_transition_point} kbit/s，恢复会导致总流量超出临界阈值")
+                    logger.info(f"{direction.upper()} {key} app class kept at {stage_transition_point} kbit/s; full restore would exceed bandwidth threshold")
 
     def _apply_bandwidth_limit(self, stage, direction, handle_id, config_network_bw, rates, limit_stage_attr):
         handle = handle_id if direction == "egress" else handle_id + 1
@@ -345,7 +345,7 @@ class NetworkController:
         burst = self.network_burst_map.get(key, "16k")
         current_stage_bw = rates.get(classid, 0)
         half_bw = int((max_bw - min_bw) / 2 + min_bw)
-        # 限速到哪个阶段
+        # Determine the throttle stage target
         stage_table = {
             0: (half_bw, 2, 1),
             1: (min_bw, 2, 2),
@@ -353,20 +353,20 @@ class NetworkController:
             3: (min_bw, 4, 4),
         }
         stage_transition_point, stage_full, stage_half = stage_table.get(stage, (min_bw, 0, 0))
-        # 分级进行限速，从低到高，每次一个类别
+        # Apply throttle tier by tier, from lowest priority to highest
         if stage in (0, 2):
             if current_stage_bw < stage_transition_point:
                 self._limit_network_class(dev, classid, min_bw, min_bw, burst, direction=direction, level=key)
                 setattr(self, limit_stage_attr, stage_full)
-                logger.info(f"{direction.upper()} 限速 {key} class app 流量到 {min_bw}")
+                logger.info(f"{direction.upper()} throttling {key} class app bandwidth to {min_bw}")
             else:
                 self._limit_network_class(dev, classid, min_bw, half_bw, burst, direction=direction, level=key)
                 setattr(self, limit_stage_attr, stage_half if half_bw != min_bw else stage_full)
-                logger.info(f"{direction.upper()} 限速 {key} class app 流量到 {half_bw}")
+                logger.info(f"{direction.upper()} throttling {key} class app bandwidth to {half_bw}")
         elif stage in (1, 3):
             self._limit_network_class(dev, classid, min_bw, min_bw, burst, direction=direction, level=key)
             setattr(self, limit_stage_attr, stage_full)
-            logger.info(f"{direction.upper()} 再次限速 {key} class app 流量到 {min_bw}")
+            logger.info(f"{direction.upper()} re-throttling {key} class app bandwidth to {min_bw}")
 
     def _can_switch(self, cooldown, last_limit_time, last_recover_time):
         time_since_limit = time.time() - last_limit_time
@@ -379,15 +379,15 @@ class NetworkController:
         config_total_rate = self.config.network_bandwidth_kbit
         tx_total_bw = self.total_bw * network_data['tx']
         rx_total_bw = self.total_bw * network_data['rx']
-        # TX 限速
+        # TX throttle
         if tx_pressure == "critical" and self._can_switch(self.limit_cooldown, self.tx_last_limit_time, self.tx_last_recover_time):
             self._apply_bandwidth_limit(self.tx_network_limit_stage, "egress", handle_id, config_network_bw, egress_rates, "tx_network_limit_stage")
             self.tx_last_limit_time = time.time()
-        # RX 限速
+        # RX throttle
         if rx_pressure == "critical" and self._can_switch(self.limit_cooldown, self.rx_last_limit_time, self.rx_last_recover_time):
             self._apply_bandwidth_limit(self.rx_network_limit_stage, "ingress", handle_id, config_network_bw, ingress_rates, "rx_network_limit_stage")
             self.rx_last_limit_time = time.time()
-        # TX 压力恢复
+        # TX pressure restore
         if tx_pressure != "critical" and self.tx_network_limit_stage > 0 and self._can_switch(self.recover_cooldown, self.tx_last_limit_time, self.tx_last_recover_time):
             self._recover_network_pressure(
                 self.tx_network_limit_stage,
@@ -401,7 +401,7 @@ class NetworkController:
                 "tx_network_limit_stage"
             )
             self.tx_last_recover_time = time.time()
-        # RX 压力恢复
+        # RX pressure restore
         if rx_pressure != "critical" and self.rx_network_limit_stage > 0 and self._can_switch(self.recover_cooldown, self.rx_last_limit_time, self.rx_last_recover_time):
             self._recover_network_pressure(
                 self.rx_network_limit_stage,
@@ -418,7 +418,7 @@ class NetworkController:
 
     def clear_network_rules_on_exit(self):
         if not self.enable_network_control:
-            logger.info("NetworkControl 被禁用，跳过清理 tc 队列和 iptables 规则")
+            logger.info("NetworkControl is disabled, skipping tc queue and iptables rule cleanup")
             return
         dev = self.dev
         IFB_DEV = self.IFB_DEV
@@ -432,4 +432,4 @@ class NetworkController:
             if cgroup_path and mark:
                 mark_value = str(int(mark, 16))
                 subprocess.run(["iptables", "-t", "mangle", "-D", "OUTPUT", "-m", "cgroup", "--path", cgroup_path, "-j", "MARK", "--set-mark", mark_value], check=False)
-        logger.info("已清理所有由 balancer 创建的 tc 队列和 iptables mark 规则")
+        logger.info("Cleaned up all tc queues and iptables mark rules created by the balancer")

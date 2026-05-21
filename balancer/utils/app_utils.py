@@ -2,86 +2,52 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import queue as _queue
 import re
-import requests
-# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
-# with shell=False (default). No untrusted shell execution or string 
-# concatenation is performed. All inputs are internally validated.
-import subprocess # nosec
+import subprocess
+import time
 import psutil
+import threading
 from getpass import getuser
 from pwd import getpwnam
 from datetime import datetime
 
 from utils.logger import logger
 from db.DatabaseModel import AIAppPriority
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 from config.config import b_config
 from gi.repository import Gio
 
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import urllib3
-
 _original_oom_scores: dict[str, str] = {}
 
-B_CERT_FILE = os.getenv('CERT_FILE')
-
 class ClientCallbackManager:
-    """管理客户端回调的全局状态和操作"""
+    """Manages global state and operations for client-side callbacks."""
     _instance = None
-    _registered_url: Optional[str] = None
-    _session = False
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            instance = super().__new__(cls)
+            # Initialize SSE state once inside __new__ to avoid races
+            instance._sse_queues: List[_queue.Queue] = []
+            instance._sse_lock = threading.Lock()
+            cls._instance = instance
         return cls._instance
 
-    @property
-    def callback_url(self) -> Optional[str]:
-        return self._registered_url
+    def add_sse_client(self, q: _queue.Queue) -> None:
+        """Register an SSE client queue."""
+        with self._sse_lock:
+            self._sse_queues.append(q)
 
-    def register_callback_url(self, url: str) -> None:
-        """注册全局回调地址"""
-        self._registered_url = url
-        self._session = self._create_session()
-
-    def _create_session(self):
-        """Create a requests session with retry strategy and SSL configuration."""
-        session = requests.Session()
-
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["POST", "GET"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-
-        if not B_CERT_FILE:
-            raise EnvironmentError(
-                "CERT_FILE environment variable is not set. "
-                "TLS certificate verification cannot be enabled."
-            )
-        if not os.path.exists(B_CERT_FILE):
-            raise FileNotFoundError(
-                f"Certificate file '{B_CERT_FILE}' not found. "
-                "TLS certificate verification cannot be enabled. "
-                "Please check 'start_balancer.sh' to generate and export the certificate."
-            )
-        session.verify = B_CERT_FILE
-        logger.info(f"TLS certificate verification enabled using: {B_CERT_FILE}")
-
-        return session
+    def remove_sse_client(self, q: _queue.Queue) -> None:
+        """Unregister an SSE client queue."""
+        with self._sse_lock:
+            try:
+                self._sse_queues.remove(q)
+            except ValueError:
+                pass
 
     def send_callback_notification(self, data: Dict[str, Any], store=False) -> bool:
-        """发送回调通知（线程安全）"""
-        if not self._registered_url:
-            print("No callback URL registered.")
-            return False
-
+        """Send callback notification (thread-safe)."""
         if store:
             try:
                 result = AIAppPriority.update_record(
@@ -90,26 +56,21 @@ class ClientCallbackManager:
                     up_time=datetime.now()
                 )
                 if not result:
-                    print(f"Warning: Failed to update database record for {data['app_id']}")
+                    logger.warning(f"Failed to update database record for {data['app_id']}")
             except Exception as db_error:
-                print(f"Database update error: {db_error}")
+                logger.error(f"Database update error: {db_error}")
 
-        try:
-            logger.info("Send a notification to client.")
-            response = self._session.post(
-                self._registered_url,
-                json=data,
-                timeout=5
-            )
-            response.raise_for_status()
+        with self._sse_lock:
+            for q in list(self._sse_queues):
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    pass
 
-            return response.status_code == 200 and response.json().get("status") == "ok"
-        except Exception as e:
-            print(f"Callback notification failed: {str(e)}")
-            return False
+        return True
 
 
-# 单例实例
+# Singleton instance
 callback_manager = ClientCallbackManager()
 
 
@@ -129,7 +90,7 @@ def get_cgroup_path_by_pid(pid):
 def get_controlled_apps_config(apps_dict=None):
     if apps_dict is None:
         apps_dict = {}
-    # 配置文件 controlled_apps，补充数据库没有的项
+    # Config-file controlled_apps: supplement entries not present in the database
     if hasattr(b_config, 'testing_network_app') and b_config.testing_network_app:
         for app in b_config.testing_network_app:
             app_name = app.get("app_name")
@@ -157,7 +118,7 @@ def get_controlled_apps_config(apps_dict=None):
 def get_app_priority(app_id: str = "", app_name: str = "") -> str:
     """Get the priority of an application."""
     try:
-        # 构建 OR 查询条件
+        # Build query conditions
         query = AIAppPriority.query()
         conditions = []
         if app_id:
@@ -187,7 +148,7 @@ def get_priority_value(priority_str: str = "") -> int:
     :return: 100
     """
     priority = priority_str.lower()
-    print(f"Getting priority for: {priority}, is: {b_config.app_priority}")
+    logger.debug(f"Getting priority for: {priority}, is: {b_config.app_priority}")
     if priority not in b_config.app_priority:
         raise ValueError(f"Invalid priority: {priority_str}")
     return b_config.app_priority[priority]
@@ -196,7 +157,7 @@ def get_priority_value(priority_str: str = "") -> int:
 def get_controlled_apps_net():
     """ Get the list of all controlled apps with their network-related info (cgroup path, pid, etc.) """
     apps_dict = {}
-    # 1. 先查数据库 controlled_apps，优先使用数据库
+    # 1. Database takes priority; fetch controlled apps from DB first
     try:
         controlled_apps = AIAppPriority.query().filter(AIAppPriority.controlled == True)
         for app in controlled_apps:
@@ -222,7 +183,7 @@ def get_controlled_apps_net():
         logger.error(f"Database query failed: {str(e)}", exc_info=True)
 
     get_controlled_apps_config(apps_dict)
-    # 3. 返回合并后的列表
+    # 3. Return the merged list
     return list(apps_dict.values()) if apps_dict else None
 
 
@@ -246,7 +207,7 @@ def get_controlled_apps(priority: str = None):
 
 
 def get_app_control_info(app_id: str = None, app_name: str = None):
-    """ 获取应用的管控状态和管控数据 """
+    """Return the control status and metadata for an application."""
     controlled_apps = get_controlled_apps() or []
     controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
     name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
@@ -260,13 +221,14 @@ def get_app_control_info(app_id: str = None, app_name: str = None):
 
 
 def get_app_processes(app_name):
-    """通过pgrep获取应用的所有运行中PID
+    """Return all running PIDs for an application via pgrep.
+
     :return:
-        list[int]: 如[1234, 5678]
+        list[int]: e.g. [1234, 5678]
     """
     try:
         result = subprocess.run(
-            ['pgrep', '-f', app_name.lower()],
+            ['pgrep', '-fi', app_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
@@ -280,11 +242,11 @@ def get_app_processes(app_name):
 
 def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.0) -> tuple[bool, str]:
     """
-        批量检查多PID磁盘IO是否超过阈值，仅返回是否繁忙和异常信息
-    :param running_pids: 某个app对应的PIDs
-    :param threshold_mb: 磁盘IO阈值，单位MB/s
+    Check whether the aggregate disk IO of a set of PIDs exceeds a threshold.
+    :param running_pids: PIDs belonging to a single app
+    :param threshold_mb: disk IO threshold in MB/s
     :return:
-        tuple(bool, str): (是否繁忙? 异常信息)
+        tuple(bool, str): (is_busy, error_message)
     """
     try:
         sample_times, sample_interval = 3, 0.2
@@ -303,17 +265,17 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
             errors="ignore"
         )
 
-        # 命令执行异常处理
+        # Handle command execution errors
         if result.returncode != 0:
             error_msg = result.stderr.strip()
             if "no such file or directory" in error_msg.lower():
-                raise Exception("未安装iotop，请先安装")
+                raise Exception("iotop is not installed; please install it first")
             elif "permission denied" in error_msg.lower():
-                raise Exception("缺少sudo权限")
+                raise Exception("Insufficient sudo permissions")
             else:
-                raise Exception(f"iotop执行失败：{error_msg}")
+                raise Exception(f"iotop execution failed: {error_msg}")
 
-        # 解析输出
+        # Parse iotop output
         io_pattern = re.compile(r"(?P<pid>\d+)\s+.+?(?P<read_kb>\d+\.\d+)\s+K/s\s+(?P<write_kb>\d+\.\d+)\s+K/s")
         pid_io_data = {pid: {"read": [], "write": []} for pid in running_pids}
 
@@ -328,7 +290,7 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
                     pid_io_data[pid]["read"].append(float(match.group("read_kb")))
                     pid_io_data[pid]["write"].append(float(match.group("write_kb")))
 
-        # 计算总IO速率
+        # Calculate total IO rate
         total_io_mb = 0.0
         for io_data in pid_io_data.values():
             avg_read = sum(io_data["read"]) / len(io_data["read"]) if io_data["read"] else 0.0
@@ -336,7 +298,7 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
             total_io_mb += (avg_read + avg_write) / 1024.0
 
         logger.debug(f"Total Disk IO for PIDs {running_pids}: {total_io_mb:.2f} MB/s (Threshold: {threshold_mb} MB/s)")
-        # 返回结果：无异常msg为空字符串
+        # Return result; error_msg is empty string when there are no errors
         return total_io_mb > threshold_mb, ""
     except Exception as e:
         logger.error(f"Disk IO check failed: {str(e)}", exc_info=True)
@@ -344,7 +306,7 @@ def check_pids_disk_io_usage(running_pids: List[int], threshold_mb: float = 100.
 
 
 def get_pids_in_cgroup(cgroup_path):
-    """获取指定cgroup下的所有进程PID"""
+    """Return all process PIDs inside the specified cgroup."""
     try:
         result = subprocess.run(
             ["systemd-cgls", "--no-page", cgroup_path],
@@ -420,16 +382,17 @@ def adjust_oom_priority(
     restore: bool = False,
 ) -> None:
     """
-    调整或恢复应用的 OOM 优先级（oom_score_adj）, 主要目的是保活一些特殊的critical的应用
+    Adjust or restore the OOM priority (oom_score_adj) for an application.
+    Primary purpose: protect "critical" apps from being killed by the OOM killer.
     :param app_id:
     :param app_name:
-    :param priority: 仅当为 "critical" 时生效
-    :param app_cmdline: 用于 pgrep 匹配
-    :param restore: 若为 True，则恢复原始值；否则根据 priority 设置
+    :param priority: only takes effect when the value is "critical"
+    :param app_cmdline: command line string used for pgrep matching
+    :param restore: when True, restore the original oom_score_adj; otherwise set based on priority
     :return:
     """
     if not restore and priority.lower() != "critical":
-        return  # 非 critical 应用且不强制恢复时跳过
+        return  # skip non-critical apps unless restore=True is requested
 
     target_value = 0
     try:
@@ -456,14 +419,14 @@ def adjust_oom_priority(
                 target_value = _original_oom_scores.pop(pid)
                 action = "Restoring"
             else:
-                # 记录app的默认值
+                # Record the original value for this app
                 if pid not in _original_oom_scores:
                     with open(oom_file, "r") as f:
                         _original_oom_scores[pid] = f.read().strip()
                 target_value = "-1000"
                 action = "Setting"
 
-            # 修改 oom_score_adj
+            # Update oom_score_adj
             logger.debug(f"{action} OOM priority for PID {pid} to {target_value}")
             base_cmd = ["tee", oom_file]
             cmd = ["sudo", *base_cmd] if getattr(b_config, "vendor", "") == "generic" else base_cmd
@@ -518,98 +481,204 @@ def update_app_status(app_id: str, status: str) -> bool:
 
 
 def get_app_resource_usage(app_id: str, app_name: str) -> dict:
-    """Query the actual CPU, memory, and IO usage of a specific application"""
+    """Query the actual CPU, memory, and IO usage of a specific application via cgroup.
+
+    If the app has ``process_names`` configured in ``controlled_apps``, the
+    usage is aggregated across all cgroups those processes reside in via
+    :func:`_get_multi_process_app_resource_usage`.  Otherwise the standard
+    single-cgroup path is used.
+    """
     try:
+        # For multi-process apps with explicit process_names, aggregate across cgroups.
+        process_names = _get_app_process_names(app_id=app_id, app_name=app_name)
+        if process_names:
+            return _get_multi_process_app_resource_usage(app_id, app_name, process_names)
+
         base_cgroup = "/sys/fs/cgroup"
         if hasattr(b_config, 'cgroup_mount') and b_config.cgroup_mount:
             base_cgroup = b_config.cgroup_mount
 
-        # Get all PIDs associated with the app name
+        # Find a representative PID to locate the cgroup.
+        # Try app_name first; if that yields nothing, fall back to app_id (e.g. "benchmark.py")
+        # so that processes whose argv[0] was renamed (e.g. via perl $0=) are still found.
         pids = get_app_processes(app_name)
+        logger.debug(f"[resource_usage] app_name='{app_name}' -> pids from pgrep: {pids}")
+        if not pids and app_id:
+            fallback_name = os.path.basename(app_id)
+            pids = get_app_processes(fallback_name)
+            logger.debug(f"[resource_usage] fallback app_id basename='{fallback_name}' -> pids: {pids}")
         if not pids:
-            print(f"No processes found for app {app_name} (ID: {app_id})")
+            logger.warning(f"No processes found for app {app_name} (ID: {app_id})")
             return {}
 
-        # Since application should be in the same cgroup, we can take the first PID to find the cgroup path
-        cgroup_path = get_cgroup_path_by_pid(pids[0])
+        representative_pid = pids[0]
+        # Locate the cgroup from the first PID
+        cgroup_path = get_cgroup_path_by_pid(representative_pid)
+        logger.debug(
+            f"[resource_usage] representative_pid={representative_pid}, "
+            f"cgroup_path='{cgroup_path}'"
+        )
         if not cgroup_path:
-            print(f"No cgroup found for PID {pids[0]} of app {app_name}")
+            logger.warning(f"No cgroup found for PID {representative_pid} of app {app_name}")
             return {}
+
+        # Log the process cmdline for the representative PID to confirm we found the right process
+        try:
+            proc_cmdline = psutil.Process(representative_pid).cmdline()
+            logger.debug(f"[resource_usage] pid={representative_pid} cmdline={proc_cmdline}")
+        except Exception:
+            pass
+
+        cgroup_dir = os.path.join(base_cgroup, cgroup_path.lstrip('/'))
+        logger.debug(f"[resource_usage] cgroup_dir='{cgroup_dir}'")
+        num_cpus = os.cpu_count() or 1
+
+        # --- Instantaneous memory from cgroup memory.current ---
+        cgroup_mem_bytes = 0
+        mem_current_path = os.path.join(cgroup_dir, "memory.current")
+        try:
+            with open(mem_current_path, 'r') as f:
+                raw = f.read().strip()
+            cgroup_mem_bytes = int(raw)
+            logger.debug(
+                f"[resource_usage] memory.current raw='{raw}' "
+                f"({cgroup_mem_bytes / (1024**2):.2f} MB) from '{mem_current_path}'"
+            )
+        except FileNotFoundError:
+            logger.debug(f"[resource_usage] memory.current NOT FOUND at '{mem_current_path}'")
+        except (IOError, ValueError) as e:
+            logger.debug(f"[resource_usage] memory.current read error: {e}")
+
+        # Also read memory.swap.current (cgroup v2) to see if memory was pushed to swap
+        swap_bytes = 0
+        swap_current_path = os.path.join(cgroup_dir, "memory.swap.current")
+        try:
+            with open(swap_current_path, 'r') as f:
+                swap_raw = f.read().strip()
+            swap_bytes = int(swap_raw)
+            logger.debug(
+                f"[resource_usage] memory.swap.current raw='{swap_raw}' "
+                f"({swap_bytes / (1024**2):.2f} MB) — memory reclaimed to swap"
+            )
+        except FileNotFoundError:
+            logger.debug(f"[resource_usage] memory.swap.current NOT FOUND at '{swap_current_path}'")
+        except (IOError, ValueError) as e:
+            logger.debug(f"[resource_usage] memory.swap.current read error: {e}")
+
+        # Also read memory.high to confirm what limit is currently in effect
+        mem_high_path = os.path.join(cgroup_dir, "memory.high")
+        try:
+            with open(mem_high_path, 'r') as f:
+                mem_high_raw = f.read().strip()
+            logger.debug(f"[resource_usage] memory.high='{mem_high_raw}' (current effective limit)")
+        except Exception:
+            pass
+
+        # --- Helpers to sample cumulative cgroup counters ---
+        def read_cpu_usage_usec():
+            try:
+                with open(os.path.join(cgroup_dir, "cpu.stat"), 'r') as f:
+                    for line in f:
+                        if line.startswith('usage_usec'):
+                            return int(line.split()[1])
+            except (FileNotFoundError, IOError, ValueError):
+                pass
+            return 0
+
+        def read_io_stats(label=""):
+            rbytes, wbytes, rios, wios = 0, 0, 0, 0
+            io_stat_path = os.path.join(cgroup_dir, "io.stat")
+            try:
+                with open(io_stat_path, 'r') as f:
+                    raw_lines = f.readlines()
+                if label:
+                    logger.debug(
+                        f"[resource_usage] io.stat ({label}) raw content "
+                        f"(path='{io_stat_path}'): {[l.rstrip() for l in raw_lines]}"
+                    )
+                for line in raw_lines:
+                    parts = dict(p.split('=') for p in line.split() if '=' in p)
+                    rbytes += int(parts.get('rbytes', 0))
+                    wbytes += int(parts.get('wbytes', 0))
+                    rios += int(parts.get('rios', 0))
+                    wios += int(parts.get('wios', 0))
+            except FileNotFoundError:
+                if label:
+                    logger.debug(f"[resource_usage] io.stat NOT FOUND at '{io_stat_path}'")
+            except (IOError, ValueError) as e:
+                if label:
+                    logger.debug(f"[resource_usage] io.stat read error: {e}")
+            return rbytes, wbytes, rios, wios
+
+        # Sample CPU and IO over a short window so we get accurate rates
+        t1 = time.monotonic()
+        cpu_usec1 = read_cpu_usage_usec()
+        io_rbytes1, io_wbytes1, io_rios1, io_wios1 = read_io_stats(label="sample1")
+        time.sleep(0.5)
+        t2 = time.monotonic()
+        cpu_usec2 = read_cpu_usage_usec()
+        io_rbytes2, io_wbytes2, io_rios2, io_wios2 = read_io_stats(label="sample2")
+
+        elapsed = t2 - t1
+        elapsed_usec = elapsed * 1_000_000
+
+        logger.debug(
+            f"[resource_usage] CPU sample: usec1={cpu_usec1}, usec2={cpu_usec2}, "
+            f"delta={cpu_usec2 - cpu_usec1}, elapsed={elapsed:.3f}s, num_cpus={num_cpus}"
+        )
+        logger.debug(
+            f"[resource_usage] IO sample: rbytes1={io_rbytes1}, rbytes2={io_rbytes2}, "
+            f"wbytes1={io_wbytes1}, wbytes2={io_wbytes2}, "
+            f"delta_r={io_rbytes2 - io_rbytes1}, delta_w={io_wbytes2 - io_wbytes1}, "
+            f"delta_rios={io_rios2 - io_rios1}, delta_wios={io_wios2 - io_wios1}"
+        )
+
+        cpu_percent = (
+            round(max(0.0, cpu_usec2 - cpu_usec1) / (elapsed_usec * num_cpus) * 100, 1)
+            if elapsed_usec > 0 else 0.0
+        )
+        io_read_mb_s = round(max(0.0, (io_rbytes2 - io_rbytes1) / elapsed / (1024 ** 2)), 2) if elapsed > 0 else 0.0
+        io_write_mb_s = round(max(0.0, (io_wbytes2 - io_wbytes1) / elapsed / (1024 ** 2)), 2) if elapsed > 0 else 0.0
+        io_read_iops = round(max(0.0, (io_rios2 - io_rios1) / elapsed), 1) if elapsed > 0 else 0.0
+        io_write_iops = round(max(0.0, (io_wios2 - io_wios1) / elapsed), 1) if elapsed > 0 else 0.0
+        mem_current_mb = round(cgroup_mem_bytes / (1024 ** 2), 2)
+        mem_swap_mb = round(swap_bytes / (1024 ** 2), 2)
 
         all_pids = get_pids_in_cgroup(cgroup_path)
-
-        cgroup_mem_current_file = os.path.join(base_cgroup, cgroup_path.lstrip('/'), "memory.current")
-        with open(cgroup_mem_current_file, 'r') as f:
-            cgroup_mem_total = int(f.read().strip())
-
-        logger.debug(f"App {app_name} (ID: {app_id}) - Found PIDs in cgroup: {all_pids}")
-
-        cpu_total = 0.0
-        mem_rss_total = 0
-        io_read_total = 0
-        io_write_total = 0
-        process_names = set()
-
-        # Acquire resource usage for all PIDs
-        for pid in all_pids:
-            try:
-                with psutil.Process(pid).oneshot():
-                    proc = psutil.Process(pid)
-                    cpu_total += proc.cpu_percent(interval=None)
-                    mem_info = proc.memory_info()
-                    mem_rss_total += mem_info.rss
-
-                    try:
-                        io_counters = proc.io_counters()
-                        if io_counters:
-                            io_read_total += io_counters.read_bytes
-                            io_write_total += io_counters.write_bytes
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-
-                    process_names.add(proc.name())
-
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        if not process_names:
-            print(f"No valid processes found for app {app_name} (ID: {app_id})")
-            return {}
-
-        mem_current_mb = cgroup_mem_total / (1024 ** 2)  # MB
-        mem_rss_mb = mem_rss_total / (1024 ** 2)  # MB
-        io_read_mb = io_read_total / (1024 ** 2)  # MB
-        io_write_mb = io_write_total / (1024 ** 2)  # MB
-
-        logger.debug(f"Resource usage for {app_name} (ID: {app_id}): CPU={cpu_total:.1f}%, Memory_current={mem_current_mb:.2f}"
-                     f"MB (RSS={mem_rss_mb:.2f}MB), IO Read={io_read_mb:.2f}MB, IO Write={io_write_mb:.2f}MB")
+        logger.debug(
+            f"Resource usage for {app_name} (ID: {app_id}): CPU={cpu_percent:.1f}%, "
+            f"Memory_current={mem_current_mb:.2f}MB (swap={mem_swap_mb:.2f}MB), "
+            f"IO Read={io_read_mb_s:.2f}MB/s ({io_read_iops:.1f} IOPS), "
+            f"IO Write={io_write_mb_s:.2f}MB/s ({io_write_iops:.1f} IOPS)"
+        )
         return {
             'pids': list(all_pids),
             'name': app_name,
             'cgroup_path': cgroup_path,
-            'cpu_percent': round(cpu_total, 1),
-            'mem_current': round(mem_current_mb, 2),
-            'mem_rss_mb': round(mem_rss_mb, 2),
-            'io_read_mb': round(io_read_mb, 2),
-            'io_write_mb': round(io_write_mb, 2),
-            'process_names': list(process_names)
+            'cpu_percent': cpu_percent,
+            'mem_current': mem_current_mb,
+            'mem_swap_current': mem_swap_mb,
+            'io_read_mb': io_read_mb_s,
+            'io_write_mb': io_write_mb_s,
+            'io_read_iops': io_read_iops,
+            'io_write_iops': io_write_iops,
         }
     except Exception as e:
-        print(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
+        logger.error(f"Error getting resource usage for {app_name} (ID: {app_id}): {e}")
         return {}
 
 
 def safe_notify(title, message, icon="dialog-information"):
     try:
-        # 方法1：优先尝试原生notify-send
+        # Method 1: try native notify-send first
         user = os.getenv("SUDO_USER") or getuser()
 
         user_uid = getpwnam(user).pw_uid
 
-        # 构建正确的DBus地址
+        # Build the correct DBus address
         dbus_address = f'unix:path=/run/user/{user_uid}/bus'
 
-        # 使用sudo -u切换用户身份执行
+        # Execute as the target user via sudo -u
         subprocess.run([
             'sudo', '-u', user,
             f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
@@ -622,9 +691,9 @@ def safe_notify(title, message, icon="dialog-information"):
 
     except (subprocess.CalledProcessError, FileNotFoundError):
         try:
-            # 方法2：使用zenity作为后备方案
+            # Method 2: fall back to zenity
             subprocess.run(
-                ["zenity", "--info", "--text", f"{title}\n{message}", "--title", "系统通知"],
+                ["zenity", "--info", "--text", f"{title}\n{message}", "--title", "System notification"],
                 check=True
             )
         except:
@@ -632,15 +701,15 @@ def safe_notify(title, message, icon="dialog-information"):
 
 
 def get_dbus_address():
-    """动态获取当前用户的DBus地址"""
+    """Dynamically retrieve the current user's DBus session bus address."""
     uid = os.getuid()
 
-    # 方法1：检查标准路径
+    # Method 1: check the standard socket path
     standard_path = f"/run/user/{uid}/bus"
     if os.path.exists(standard_path):
         return f"unix:path={standard_path}"
 
-    # 方法2：从进程环境获取
+    # Method 2: retrieve from process environment
     try:
         import psutil
         for proc in psutil.process_iter(['environ']):
@@ -653,7 +722,7 @@ def get_dbus_address():
     except ImportError:
         pass
 
-    # 方法3：通过loginctl获取
+    # Method 3: retrieve via loginctl
     try:
         cmd = ["loginctl", "show-user", str(uid), "--property=Display"]
         display = subprocess.check_output(cmd).decode().strip()
@@ -665,26 +734,266 @@ def get_dbus_address():
     return None
 
 
+def _get_app_process_names(app_id: str = None, app_name: str = None) -> list:
+    """Return the configured ``process_names`` list for an app, or [] if not set.
+
+    Looks up the app in ``controlled_apps`` by ``id`` (exact) or ``name``
+    (case-insensitive) and returns the ``process_names`` field.
+    Returns an empty list when no match is found or the config is absent.
+    """
+    apps = getattr(b_config, 'controlled_apps', None) or []
+    app_name_lower = app_name.lower() if app_name else None
+    for app in apps:
+        if (app_id and app.get('id') == app_id) or \
+                (app_name_lower and app.get('name', '').lower() == app_name_lower):
+            return app.get('process_names', []) or []
+    return []
+
+
+def check_app_running_status(app_id: str, app_name: str, cmdline: str = "") -> str:
+    """Determine whether an app is currently running.
+
+    Two modes depending on configuration:
+
+    **Multi-process mode** (``process_names`` is non-empty in ``controlled_apps``):
+        ALL configured process names must be found among running processes.
+        Returns ``"running"`` only when every name is matched; otherwise
+        ``"stopped"``.
+
+    **Standard mode** (``process_names`` is empty / not configured):
+        Any single match is sufficient.  The function tries, in order:
+
+        1. ``app_name``  – searched with ``pgrep -f``
+        2. ``app_id`` basename (e.g. ``"benchmark.py"`` from ``"/path/to/benchmark.py"``)
+        3. ``cmdline`` first token (the executable basename, e.g. ``"gnome-calculator"``)
+
+        Returns ``"running"`` if any lookup finds at least one live PID;
+        otherwise ``"stopped"``.
+
+    :param app_id:   Unique app identifier (DB primary key).
+    :param app_name: Human-readable display name.
+    :param cmdline:  Command-line string from config / DB (optional).
+    :return:         ``"running"`` or ``"stopped"``
+    """
+    # --- Multi-process mode ---
+    process_names = _get_app_process_names(app_id=app_id, app_name=app_name)
+    if process_names:
+        # ALL named processes must be running
+        for proc_name in process_names:
+            if not get_app_processes(proc_name):
+                logger.debug(
+                    f"[running_status] '{app_name}': required process '{proc_name}' not found → stopped"
+                )
+                return "stopped"
+        logger.debug(
+            f"[running_status] '{app_name}': all process_names {process_names} found → running"
+        )
+        return "running"
+
+    # --- Standard mode: any one match is enough ---
+    # 1. Try app_name
+    if app_name and get_app_processes(app_name):
+        logger.debug(f"[running_status] '{app_name}' matched by app_name → running")
+        return "running"
+
+    # 2. Try app_id basename (e.g. "benchmark.py")
+    if app_id:
+        id_basename = os.path.basename(app_id)
+        if id_basename and id_basename != app_name and get_app_processes(id_basename):
+            logger.debug(f"[running_status] '{app_name}' matched by app_id basename '{id_basename}' → running")
+            return "running"
+
+    # 3. Try the executable from the configured commandline
+    if cmdline:
+        exe = _get_executable_name(app_name, cmdline)
+        if exe and exe != app_name.lower() and get_app_processes(exe):
+            logger.debug(f"[running_status] '{app_name}' matched by cmdline exe '{exe}' → running")
+            return "running"
+
+    logger.debug(f"[running_status] '{app_name}' (id='{app_id}'): no running process found → stopped")
+    return "stopped"
+
+
 def fetch_all_apps():
     app_list = []
-    if hasattr(b_config, 'all_apps'):
-        apps = b_config.all_apps
-        for app in apps:
+    # Prefer the unified controlled_apps list; fall back to the legacy all_apps
+    # key for backward compatibility; finally enumerate system desktop apps via Gio.
+    apps_config = getattr(b_config, 'controlled_apps', None) or getattr(b_config, 'all_apps', None)
+    if apps_config:
+        for app in apps_config:
+            name = app.get("name", "")
+            app_id = app.get("id")
+            if not app_id:
+                logger.warning(
+                    f"fetch_all_apps: controlled_apps entry '{name}' is missing 'id'; "
+                    "skipping to avoid duplicate/ambiguous records."
+                )
+                continue
             app_data = {
-                "name": app["name"],
-                "app_id": app["id"],
-                "cmdline": app["commandline"],
-                "display_name": app["name"]
+                "name": name,              # legacy key used by other callers
+                "app_name": name,          # normalized key expected by the React dashboard
+                "app_id": app_id,
+                "cmdline": app.get("commandline", ""),
+                "process_names": app.get("process_names", []) or [],
+                "display_name": name,
             }
             app_list.append(app_data)
     else:
         apps = Gio.AppInfo.get_all()
         for app in apps:
             app_data = {
-                "name": app.get_name(),  # Calculator
+                "name": app.get_name(),    # legacy key used by other callers
+                "app_name": app.get_name(),  # normalized key expected by the React dashboard
                 "app_id": app.get_id(),  # org.gnome.Calculator.desktop
                 "cmdline": app.get_commandline() or "",  # gnome-calculator
+                "process_names": [],
                 "display_name": app.get_display_name()
             }
             app_list.append(app_data)
     return app_list
+
+
+def _get_multi_process_app_resource_usage(app_id: str, app_name: str, process_names: list) -> dict:
+    """Aggregate cgroup resource usage across all processes of a multi-process app.
+
+    Unlike the single-cgroup :func:`get_app_resource_usage`, this function:
+
+    1. Finds all running PIDs whose process name is in *process_names*.
+    2. Collects the unique set of cgroups those PIDs live in.
+    3. Samples CPU / IO stats from every cgroup simultaneously (single 0.5 s
+       sleep), then sums the deltas for a combined usage figure.
+
+    This handles apps that span multiple systemd units / cgroups (e.g. a
+    service that spawns a helper worker in a different slice).
+
+    :param app_id:        Unique app identifier (DB primary key).
+    :param app_name:      Human-readable name, used only for log messages.
+    :param process_names: List of process names to look for (from config).
+    :return:              Usage dict (same schema as :func:`get_app_resource_usage`)
+                          with an extra ``cgroup_paths`` key listing every cgroup
+                          found, so callers can apply limits to all of them.
+    """
+    base_cgroup = "/sys/fs/cgroup"
+    if hasattr(b_config, 'cgroup_mount') and b_config.cgroup_mount:
+        base_cgroup = b_config.cgroup_mount
+    num_cpus = os.cpu_count() or 1
+
+    # --- Discover PIDs and cgroups ---
+    all_pids: list[int] = []
+    cgroup_paths: set[str] = set()
+    for proc_name in process_names:
+        pids = get_app_processes(proc_name)
+        logger.debug(f"[multi_process_resource] app='{app_name}' proc_name='{proc_name}' -> pids: {pids}")
+        all_pids.extend(pids)
+        for pid in pids:
+            cg = get_cgroup_path_by_pid(pid)
+            if cg:
+                cgroup_paths.add(cg)
+
+    if not cgroup_paths:
+        logger.debug(f"[multi_process_resource] No processes found for '{app_name}' (process_names={process_names})")
+        return {}
+
+    cgroup_dirs = {cg: os.path.join(base_cgroup, cg.lstrip('/')) for cg in cgroup_paths}
+
+    # --- Per-cgroup reader helpers ---
+    def _read_cpu_usec(cg_dir: str) -> int:
+        try:
+            with open(os.path.join(cg_dir, "cpu.stat"), 'r') as f:
+                for line in f:
+                    if line.startswith('usage_usec'):
+                        return int(line.split()[1])
+        except (FileNotFoundError, IOError, ValueError):
+            pass
+        return 0
+
+    def _read_io(cg_dir: str) -> tuple:
+        rbytes = wbytes = rios = wios = 0
+        try:
+            with open(os.path.join(cg_dir, "io.stat"), 'r') as f:
+                for line in f:
+                    parts = dict(p.split('=') for p in line.split() if '=' in p)
+                    rbytes += int(parts.get('rbytes', 0))
+                    wbytes += int(parts.get('wbytes', 0))
+                    rios += int(parts.get('rios', 0))
+                    wios += int(parts.get('wios', 0))
+        except (FileNotFoundError, IOError, ValueError):
+            pass
+        return rbytes, wbytes, rios, wios
+
+    def _read_mem(cg_dir: str) -> int:
+        try:
+            with open(os.path.join(cg_dir, "memory.current"), 'r') as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, IOError, ValueError):
+            pass
+        return 0
+
+    def _read_swap(cg_dir: str) -> int:
+        try:
+            with open(os.path.join(cg_dir, "memory.swap.current"), 'r') as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, IOError, ValueError):
+            pass
+        return 0
+
+    # --- First snapshot ---
+    t1 = time.monotonic()
+    cpu1 = {cg: _read_cpu_usec(d) for cg, d in cgroup_dirs.items()}
+    io1 = {cg: _read_io(d) for cg, d in cgroup_dirs.items()}
+    # Per-cgroup memory snapshot (bytes) – needed for proportional limit distribution
+    mem_per_cgroup = {cg: _read_mem(d) for cg, d in cgroup_dirs.items()}
+    swap_per_cgroup = {cg: _read_swap(d) for cg, d in cgroup_dirs.items()}
+    mem_bytes = sum(mem_per_cgroup.values())
+    swap_bytes = sum(swap_per_cgroup.values())
+
+    time.sleep(0.5)
+
+    # --- Second snapshot ---
+    t2 = time.monotonic()
+    cpu2 = {cg: _read_cpu_usec(d) for cg, d in cgroup_dirs.items()}
+    io2 = {cg: _read_io(d) for cg, d in cgroup_dirs.items()}
+
+    elapsed = t2 - t1
+    elapsed_usec = elapsed * 1_000_000
+
+    # --- Aggregate deltas ---
+    cpu_delta_per_cgroup = {cg: max(0, cpu2[cg] - cpu1[cg]) for cg in cgroup_paths}
+    total_cpu_delta = sum(cpu_delta_per_cgroup.values())
+    total_r = sum(max(0, io2[cg][0] - io1[cg][0]) for cg in cgroup_paths)
+    total_w = sum(max(0, io2[cg][1] - io1[cg][1]) for cg in cgroup_paths)
+    total_rios = sum(max(0, io2[cg][2] - io1[cg][2]) for cg in cgroup_paths)
+    total_wios = sum(max(0, io2[cg][3] - io1[cg][3]) for cg in cgroup_paths)
+
+    cpu_percent = round(total_cpu_delta / (elapsed_usec * num_cpus) * 100, 1) if elapsed_usec > 0 else 0.0
+    io_read_mb_s = round(total_r / elapsed / (1024 ** 2), 2) if elapsed > 0 else 0.0
+    io_write_mb_s = round(total_w / elapsed / (1024 ** 2), 2) if elapsed > 0 else 0.0
+    io_read_iops = round(total_rios / elapsed, 1) if elapsed > 0 else 0.0
+    io_write_iops = round(total_wios / elapsed, 1) if elapsed > 0 else 0.0
+
+    # Use the first cgroup as the representative path for backward-compatible
+    # single-cgroup callers; provide the full list in cgroup_paths.
+    primary_cgroup = min(cgroup_paths)  # deterministic ordering
+
+    logger.debug(
+        f"[multi_process_resource] '{app_name}': cgroups={list(cgroup_paths)} "
+        f"cpu={cpu_percent:.1f}% mem={mem_bytes/(1024**2):.1f}MB "
+        f"io_r={io_read_mb_s:.2f}MB/s io_w={io_write_mb_s:.2f}MB/s"
+    )
+    return {
+        'pids': all_pids,
+        'name': app_name,
+        'cgroup_path': primary_cgroup,
+        'cgroup_paths': sorted(cgroup_paths),  # all cgroups – used by balancer for multi-cgroup limiting
+        'cpu_percent': cpu_percent,
+        'mem_current': round(mem_bytes / (1024 ** 2), 2),
+        'mem_swap_current': round(swap_bytes / (1024 ** 2), 2),
+        'io_read_mb': io_read_mb_s,
+        'io_write_mb': io_write_mb_s,
+        'io_read_iops': io_read_iops,
+        'io_write_iops': io_write_iops,
+        # Per-cgroup breakdown keyed by cgroup basename, used by the balancer to
+        # distribute limits proportionally across cgroups of a multi-process app.
+        'per_cgroup_mem': {os.path.basename(cg): mem_per_cgroup[cg] for cg in cgroup_paths},
+        'per_cgroup_cpu_delta': {os.path.basename(cg): cpu_delta_per_cgroup[cg] for cg in cgroup_paths},
+    }

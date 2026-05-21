@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
-# with shell=False (default). No untrusted shell execution or string 
-# concatenation is performed. All inputs are internally validated.
-import subprocess # nosec
-from subprocess import check_output # nosec
+import subprocess
+import time
+from subprocess import check_output
 from typing import Optional
 
 from utils.logger import logger
@@ -66,10 +64,10 @@ class Controller:
             return scopes
 
         except subprocess.CalledProcessError as e:
-            print(f"Error running get_user_scopes(): {e.stderr}")
+            logger.error(f"Error running get_user_scopes(): {e.stderr}")
             return []
         except Exception as e:
-            print(f"An error occurred: {str(e)}")
+            logger.error(f"An unexpected error occurred: {str(e)}")
             return []
 
     def get_app_services1(self):
@@ -87,10 +85,10 @@ class Controller:
             return apps
 
         except subprocess.CalledProcessError as e:
-            print(f"Error running get_app_services(): {e.stderr}")
+            logger.error(f"Error running get_app_services(): {e.stderr}")
             return []
         except Exception as e:
-            print(f"An error occurred: {str(e)}")
+            logger.error(f"An unexpected error occurred: {str(e)}")
             return []
 
     def get_app_services(self):
@@ -127,13 +125,13 @@ class Controller:
                     # This path didn't work, try the next one
                     continue
                 except Exception as e:
-                    print(f"Unexpected error processing path {path}: {str(e)}")
+                    logger.error(f"Unexpected error processing path {path}: {str(e)}")
                     continue
 
             return list(set(apps))  # Remove duplicates while preserving order
 
         except Exception as e:
-            print(f"An error occurred in get_app_services(): {str(e)}")
+            logger.error(f"An error occurred in get_app_services(): {str(e)}")
             return []
 
     def restore_cpu_throttle(self):
@@ -141,7 +139,7 @@ class Controller:
         services = self.get_app_services()
         cmd_prefix = ['sudo'] if getattr(self.config, "vendor", "") == "generic" else []
 
-        print(f"restore_cpu_throttle scopes = {scopes}, services = {services}")
+        logger.debug(f"restore_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
             cmd = [*cmd_prefix, 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=100%']
             result = subprocess.run(cmd,
@@ -157,7 +155,7 @@ class Controller:
         services = self.get_app_services()
         cmd_prefix = ['sudo'] if getattr(self.config, "vendor", "") == "generic" else []
 
-        print(f"high_cpu_throttle scopes = {scopes}, services = {services}")
+        logger.debug(f"high_cpu_throttle scopes = {scopes}, services = {services}")
         for scope in scopes:
             result = subprocess.run([*cmd_prefix, 'systemctl', 'set-property', '--runtime', '%s' % scope, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
@@ -165,6 +163,16 @@ class Controller:
         for service in services:
             result = subprocess.run(['systemctl', '--user', 'set-property', '--runtime', '%s' % service, 'CPUQuota=60%'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+
+    def _is_system_service(self, unit_name: str) -> bool:
+        """Return True if *unit_name* lives under /sys/fs/cgroup/system.slice.
+
+        System services (e.g. ``hs_agent.service``) must be controlled via
+        ``sudo systemctl set-property --runtime`` without ``--user``.  User
+        services (under user.slice) use ``systemctl --user set-property``.
+        """
+        system_cg = os.path.join(self.cgroup_mount, 'system.slice', unit_name)
+        return os.path.isdir(system_cg)
 
     def _set_resource_quota(
             self,
@@ -175,14 +183,14 @@ class Controller:
             is_restore: bool = False
     ) -> bool:
         """
-        安全设置资源限制（CPU/内存/IO）
-        :param cpu_quota: CPU百分比（None表示不修改，1-100之间）
-        :param mem_high: 内存软限制（如"500M"，必须大于0）
-        :param io_weight: IO权重（1-10000，默认100）
-        :param is_restore: 是否恢复默认值
+        Set resource limits safely (CPU / memory / IO).
+        :param cpu_quota: CPU percentage (None = no change, valid range 1-100)
+        :param mem_high: Memory soft limit in MB (None = no change, must be > 0)
+        :param io_weight: IO weight (None = no change, valid range 1-10000, default 100)
+        :param is_restore: When True, clear all limits and restore defaults
         """
         unit_type = "scope"
-        # 参数范围检查
+        # Validate parameter ranges
         if cpu_quota is not None and not (1 <= cpu_quota <= 100):
             logger.warning(f"Invalid cpu_quota {cpu_quota}, must be 1-100. no limit for cpu.")
             cpu_quota = None
@@ -195,19 +203,27 @@ class Controller:
             logger.warning(f"Invalid io_weight {io_weight}, no limit for io.")
             io_weight = None
 
+        # If there is nothing to apply (and this is not a restore), skip the systemctl call entirely.
+        if not is_restore and cpu_quota is None and mem_high is None and io_weight is None:
+            return True
+
         scopes = self.get_user_scopes()
         services = self.get_app_services()
 
-        # logger.debug(f"scopes----------: {scopes}")
-        # logger.debug(f"services--------: {services}")
-
-        # 铁威马系统上service与scope一样的执行cmd，不需要unit_type
+        # On TOS systems, service units use the same command as scopes (no unit_type distinction needed)
         if app_id.endswith('.scope'):
             matching_app = app_id
-            unit_type = 'scope' if matching_app in scopes else 'service'
+            if matching_app in scopes:
+                unit_type = 'scope'
+            elif self._is_system_service(app_id):
+                unit_type = 'system_service'
+            else:
+                unit_type = 'service'
         elif app_id.endswith('.service'):
             matching_app = app_id
-            unit_type = 'service'
+            # System services (under /sys/fs/cgroup/system.slice/) must use
+            # "sudo systemctl" without "--user"; user services use "--user".
+            unit_type = 'system_service' if self._is_system_service(app_id) else 'service'
         elif app_id.endswith('.desktop'):
             app_base_name = app_id.replace('.desktop', '').split('.')[-1].lower()
             matching_app = next(
@@ -224,7 +240,7 @@ class Controller:
             logger.warning(f"No matching unit for {app_id}")
             return False
 
-        # 构建限制参数
+        # Build systemctl property arguments
         properties = []
         if not is_restore:
             if cpu_quota is not None:
@@ -240,26 +256,26 @@ class Controller:
             else:
                 properties.append("IOWeight=")
         else:
-            # 恢复时清除所有限制
+            # Restore: clear all limits
             properties.extend([
                 "CPUQuota=",
                 "MemoryHigh=",
                 "IOWeight="
             ])
 
-        # 执行命令
+        # Execute command with up to _MAX_RETRIES retries to handle transient dbus timeout issues
+        _MAX_RETRIES = 3
         try:
             dbus_address = app_utils.get_dbus_address()
             if not dbus_address:
-                raise Exception("无法获取DBus会话地址")
-
-            # TOS的系统上默认user由管理员权限，如果用sudo需要，sudo -u @user python BalancerService.py运行，不然把sudo去掉运行
-            # ['sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(), 'systemctl', 'set-property', '--runtime', matching_app]
+                raise Exception("Failed to retrieve DBus session address")
 
             if getattr(self.config, "vendor", "") == "generic":
+                # scope and system_service both use "sudo systemctl" (no --user);
+                # user-space .service units go through the D-Bus session bus.
                 cmd_base = (
                     ['sudo', 'systemctl', 'set-property', '--runtime', matching_app]
-                    if unit_type == 'scope' else
+                    if unit_type in ('scope', 'system_service') else
                     [
                         'sudo', '-u', os.getenv('SUDO_USER') or os.getlogin(),
                         f'DBUS_SESSION_BUS_ADDRESS={dbus_address}',
@@ -272,22 +288,30 @@ class Controller:
                 )
 
             cmd = cmd_base + properties
-            # logger.debug(f"Executing command: {' '.join(cmd)}")
 
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True,
-                env={"DBUS_SESSION_BUS_ADDRESS": dbus_address}
-            )
-            logger.debug(f"Executed result: {result}")
-            if result.returncode == 0:
-                return True
-            else:
-                logger.error(f"Failed to set resource for {matching_app}")
-                return False
+            logger.debug(f"Executing command: {' '.join(cmd)}")
+            for attempt in range(1, _MAX_RETRIES + 1):
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=True,
+                        env={"DBUS_SESSION_BUS_ADDRESS": dbus_address} if dbus_address else None
+                    )
+                    logger.debug(f"Executed result: {result}")
+                    return True
+                except subprocess.CalledProcessError as e:
+                    logger.warning(
+                        f"Attempt {attempt}/{_MAX_RETRIES} failed for {matching_app}: "
+                        f"returncode={e.returncode}, stderr={e.stderr.strip()}"
+                    )
+                    if attempt < _MAX_RETRIES:
+                        time.sleep(0.5)
+
+            logger.error(f"Failed to set resource for {matching_app} after {_MAX_RETRIES} attempts")
+            return False
         except Exception as e:
             logger.error(f"Set resource failed: {str(e)}")
             return False
@@ -339,7 +363,7 @@ class Controller:
     # all
     def set_all_resources(self, app_id: str, cpu_quota: Optional[int] = None, mem_high: Optional[int] = None,
                           io_weight: Optional[int] = None, is_restore: bool = False):
-        """限制应用资源"""
+        """Set resource limits for an application (CPU, memory, and IO)."""
         if is_restore:
             logger.info(f"Restoring ALL resources for {app_id}")
             cpu_quota = mem_high = io_weight = None
