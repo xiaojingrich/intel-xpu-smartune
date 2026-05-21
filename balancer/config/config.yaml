@@ -75,8 +75,7 @@ controlled_apps:
 weights_top:
   cpu: 2
   memory: 7
-  io: 1  # reserved; IO is ranked separately via mode='io' and does not contribute to the default score
-  gpu: 5  # added to the default score as a secondary factor after GPU data is collected
+  gpu: 5  #added to the default score as a secondary factor after GPU data is collected
 blacklist:
   - systemd
   - kworker
@@ -133,7 +132,7 @@ network_thresholds:
   medium: 0.5
   high: 0.7
   critical: 0.9
-network_interface: "enp9s0" # 请根据实际情况修改为你的网络接口名称
+network_interface: "enp2s0" # 请根据实际情况修改为你的网络接口名称
 network_bandwidth_kbit: 100000  # 当前设置为100Mbps（小了10倍）便于测试，请根据实际带宽调整，单位为kbit/s
 config_network_bw:  # kbit/s, 不同优先级对应的带宽范围设置, 为了便于测试都缩小了10倍
   system:

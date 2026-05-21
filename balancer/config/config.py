@@ -209,6 +209,72 @@ class Config:
                         disk_cfg["rate"][p] = disk_rate_cfg
 
             if modified:
+                logger.info(f"Configuration updated: {section} - {list(yaml_updates.keys())}")
+                self._patch_limit_policy_yaml(yaml_updates, self._config_path)
+
+        return modified
+
+
+    def update_config_section(self, section: str, updates: dict[str, Any]) -> bool:
+        """Generic method to update a config section (e.g., weights_top, thresholds, etc.).
+
+        Args:
+            section: The top-level config section name (e.g., 'weights_top', 'thresholds')
+            updates: Dictionary with key-value pairs to update within that section
+
+        Returns:
+            True if config was updated successfully, False otherwise
+        """
+        from utils.logger import logger
+
+        if not isinstance(updates, dict) or not section:
+            return False
+
+        modified = False
+        yaml_updates = {}
+
+        with self._persist_lock:
+            # Get or create the section
+            section_data = getattr(self, section, None)
+            if section_data is None:
+                setattr(self, section, {})
+                section_data = {}
+            elif not isinstance(section_data, dict):
+                # Section exists but is not a dict, create new dict
+                setattr(self, section, {})
+                section_data = {}
+
+            # Update each key-value pair
+            for key, value in updates.items():
+                try:
+                    # Type conversion based on existing type or default to int for weights
+                    if section_data and key in section_data:
+                        # Match existing type
+                        existing_type = type(section_data[key])
+                        if existing_type in (int, float, bool, str):
+                            new_value = existing_type(value)
+                        else:
+                            new_value = value
+                    else:
+                        # Default conversion for common types
+                        if isinstance(value, (int, float, bool, str)):
+                            new_value = value
+                        else:
+                            new_value = value
+
+                    if section_data.get(key) != new_value:
+                        section_data[key] = new_value
+                        yaml_updates[(section, key)] = new_value
+                        modified = True
+                except (TypeError, ValueError) as e:
+                    logger.warning(f"Could not update {section}.{key}: {e}")
+                    pass
+
+            # Update the section attribute
+            setattr(self, section, section_data)
+
+            if modified:
+                logger.info(f"Configuration updated: {section} - {list(yaml_updates.keys())}")
                 self._patch_limit_policy_yaml(yaml_updates, self._config_path)
 
         return modified

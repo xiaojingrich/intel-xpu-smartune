@@ -93,4 +93,7 @@ export const api = {
     post<ResourceLimitProfileData>('/app/resource_limit_profile', payload),
   resourceRestore: (payload: Pick<AppIdPayload, 'app_id'>) =>
     post<void>('/app/resource_restore', payload),
+  getWeightsTop: () => get<{ cpu: number; memory: number; gpu: number }>('/monitor/config/weights_top'),
+  updateWeightsTop: (weights: { cpu?: number; memory?: number; gpu?: number }) =>
+    post<{ success: boolean; updated_weights: { cpu: number; memory: number; gpu: number } }>('/monitor/config/weights_top', weights),
 }
