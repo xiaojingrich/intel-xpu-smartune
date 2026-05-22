@@ -824,3 +824,119 @@ class SystemPressureMonitor:
         except Exception as e:
             logger.error("Failed to update network pressure level: %s", str(e))
             return "unknown", "unknown", 0.0, 0.0
+
+
+@monitor_bp.route('/config/weights_top', methods=['GET'])
+def get_weights_top():
+    """Get current weights_top configuration.
+
+    Response:
+        {
+            "cpu": int,
+            "memory": int,
+            "io": int,
+            "gpu": int
+        }
+    """
+    try:
+        from config.config import b_config
+        weights = b_config.weights_top or {}
+        return construct_response(
+            data=weights,
+            retmsg="Successfully retrieved weights_top configuration"
+        )
+    except Exception as e:
+        logger.error(f"get_weights_top failed: {str(e)}")
+        return construct_response(
+            data={},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )
+
+
+@monitor_bp.route('/config/weights_top', methods=['POST'])
+def update_weights_top():
+    """Update weights_top configuration.
+
+    Request body:
+        {
+            "cpu": int (optional),
+            "memory": int (optional),
+            "gpu": int (optional)
+        }
+
+    Note: I/O weight is not configurable via this API as Disk I/O ranking
+    uses pure throughput (MB/s) without weight adjustment.
+
+    Response:
+        {
+            "success": bool,
+            "updated_weights": dict
+        }
+    """
+    try:
+        from config.config import b_config
+
+        data = request.get_json()
+        if not isinstance(data, dict):
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.PARAM_ERROR,
+                retmsg="Request body must be a JSON object"
+            )
+
+        # Validate input
+        valid_keys = ['cpu', 'memory', 'gpu']
+        updates = {}
+        for key in valid_keys:
+            if key in data:
+                try:
+                    updates[key] = int(data[key])
+                    if updates[key] < 0:
+                        return construct_response(
+                            data={"success": False},
+                            retcode=RetCode.PARAM_ERROR,
+                            retmsg=f"Weight for {key} must be non-negative"
+                        )
+                except (TypeError, ValueError):
+                    return construct_response(
+                        data={"success": False},
+                        retcode=RetCode.PARAM_ERROR,
+                        retmsg=f"Invalid value for {key}, must be an integer"
+                    )
+
+        if not updates:
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.PARAM_ERROR,
+                retmsg="No valid weight updates provided"
+            )
+
+        # Update the configuration
+        logger.info(f"Updating weights_top configuration: {updates}")
+        success = b_config.update_config_section('weights_top', updates)
+
+        if success:
+            logger.info(f"Successfully updated weights_top to: {b_config.weights_top}")
+            return construct_response(
+                data={
+                    "success": True,
+                    "updated_weights": b_config.weights_top
+                },
+                retmsg="Successfully updated weights_top configuration"
+            )
+        else:
+            logger.error("Failed to update weights_top configuration")
+            return construct_response(
+                data={"success": False},
+                retcode=RetCode.EXCEPTION_ERROR,
+                retmsg="Failed to update configuration"
+            )
+
+    except Exception as e:
+        logger.error(f"update_weights_top failed: {str(e)}")
+        return construct_response(
+            data={"success": False},
+            retcode=RetCode.EXCEPTION_ERROR,
+            retmsg=str(e)
+        )

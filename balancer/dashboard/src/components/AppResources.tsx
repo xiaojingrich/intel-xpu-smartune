@@ -10,12 +10,14 @@ import {
   Space,
   Row,
   Col,
+  Button,
 } from 'antd'
-import { ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { ReloadOutlined, ThunderboltOutlined, SettingOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { COLORS } from '../styles/theme'
 import { api } from '../api/client'
 import type { AppResourceEntry, AppDiskIoEntry } from '../api/types'
+import SettingsModal from './SettingsModal'
 import { usePolling } from '../hooks/usePolling'
 
 const { Text, Title } = Typography
@@ -61,6 +63,7 @@ export default function AppResources({ active }: Props) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [settingsVisible, setSettingsVisible] = useState(false)
 
   const fetchData = useCallback(async () => {
     try {
@@ -304,6 +307,13 @@ export default function AppResources({ active }: Props) {
       )}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', marginBottom: 8, gap: 12 }}>
+        <Button
+          type="text"
+          icon={<SettingOutlined style={{ fontSize: 16, color: COLORS.accent }} />}
+          onClick={() => setSettingsVisible(true)}
+          style={{ padding: '4px 8px' }}
+          title="Configure Score Weights"
+        />
         {lastUpdated && (
           <Text style={{ color: COLORS.textMuted, fontSize: 11 }}>
             <ReloadOutlined style={{ marginRight: 4 }} />
@@ -390,6 +400,11 @@ export default function AppResources({ active }: Props) {
           </div>
         </Col>
       </Row>
+
+      <SettingsModal
+        visible={settingsVisible}
+        onClose={() => setSettingsVisible(false)}
+      />
     </div>
   )
 }

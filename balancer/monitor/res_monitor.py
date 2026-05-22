@@ -3,8 +3,8 @@
 
 import os
 import re
-# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments 
-# with shell=False (default). No untrusted shell execution or string 
+# [SECURITY REVIEW]: All subprocess calls in this module use list-based arguments
+# with shell=False (default). No untrusted shell execution or string
 # concatenation is performed. All inputs are internally validated.
 import subprocess # nosec
 import time
@@ -475,8 +475,11 @@ class ResourceMonitor:
                 io_read_iops = data['io_read_count_total'] / elapsed
                 io_write_iops = data['io_write_count_total'] / elapsed
                 if mode == 'io':
-                    # IO mode: rank by total read+write throughput
-                    score = io_read_rate_mb + io_write_rate_mb
+                    # IO mode: rank by total read+write throughput and IOPS
+                    # IOPS is scaled down (divided by 1000) to balance with MB/s
+                    # Example: 100 MB/s + 5000 IOPS = 100 + 5 = 105
+                    score = (io_read_rate_mb + io_write_rate_mb +
+                             (io_read_iops + io_write_iops) / 1000)
                 else:
                     # Default mode: combined CPU + memory score
                     cpu_total_normalized = data['cpu_total'] / self.cpu_cores
@@ -589,7 +592,6 @@ class ResourceMonitor:
         return {
             'cpu': base_weights['cpu'] * (1 + psi_data.get('cpu', 0)),
             'memory': base_weights['memory'] * (1 + psi_data.get('memory', 0)),
-            'io': base_weights['io']  # retained but no longer used for process scoring
         }
 
     def _find_systemd_unit(self, pid):
@@ -650,6 +652,58 @@ class ResourceMonitor:
             parts = [p for p in name.split('.') if p]
             name = ' '.join(parts[-2:]) if len(parts) >= 2 else parts[-1]
         return name.replace('-', ' ').replace('_', ' ').title()
+
+    def _get_docker_container_name(self, scope_name: str):
+        """Extract Docker container name from Docker scope ID.
+
+        Docker containers in cgroups have names like:
+          docker-<64-char-container-id>.scope
+          or just: Docker Def9C0F808Bbc200C4353D8963Cea606B1B327A48957D467D96Cbb5E4F
+
+        Try to resolve the container ID to a human-readable container name using docker inspect.
+        """
+        import subprocess
+
+        # Try to extract container ID from scope_name
+        # Pattern 1: docker-<container_id>.scope
+        match = re.match(r'^docker-([a-f0-9]{64})(?:\.scope)?$', scope_name, re.IGNORECASE)
+        if match:
+            container_id = match.group(1)
+        else:
+            # Pattern 2: Docker <container_id> (space separated, case insensitive)
+            match = re.match(r'^Docker\s+([a-f0-9]+)', scope_name, re.IGNORECASE)
+            if match:
+                container_id = match.group(1)
+            else:
+                return None
+
+        try:
+            # Try to get container name using docker inspect
+            # Using short container ID (first 12 chars) is usually sufficient
+            short_id = container_id[:12]
+            result = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.Name}}', short_id],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                container_name = result.stdout.strip()
+                # Docker names start with /, remove it
+                if container_name.startswith('/'):
+                    container_name = container_name[1:]
+                if container_name:
+                    logger.debug(f"Resolved Docker container {short_id} -> {container_name}")
+                    return f"Docker: {container_name}"
+        except Exception as e:
+            # Only log warning if docker command failed (not just timeout)
+            if "docker" in str(e).lower() or "command not found" in str(e).lower():
+                logger.warning(f"Docker not available or not installed: {e}")
+            else:
+                logger.debug(f"Failed to resolve Docker container name for {container_id[:12]}: {e}")
+
+        # Fallback: show shortened container ID
+        return f"Docker {container_id[:12]}"
 
     def try_match_app(self, process_info):
         """Try to match a desktop application or systemd scope for the given process."""
@@ -720,6 +774,16 @@ class ResourceMonitor:
         if cgroup:
             path_parts = cgroup.rstrip('/').split('/')
             scope_name = path_parts[-1]
+
+            # Check if this is a Docker container
+            docker_name = self._get_docker_container_name(scope_name)
+            if docker_name:
+                logger.debug(f"Detected Docker container: {scope_name} -> {docker_name}")
+                return {
+                    'type': 'docker',
+                    'id': scope_name,
+                    'name': docker_name,
+                }
 
             # vte-spawn-*.scope is the scope created by GNOME Terminal (via VTE) for child
             # processes.  The scope itself has no useful name; look one level up to the parent
@@ -933,7 +997,7 @@ class ResourceMonitor:
         """
         results = []
         processes = self._get_top_processes(n=n)
-        logger.debug(f"App resource stats processes: {processes}")
+        # logger.debug(f"App resource stats processes: {processes}")
 
         # Collect all PIDs grouped by cgroup for a single GPU sampling pass.
         # This avoids N separate sleep intervals for N apps.
@@ -981,15 +1045,15 @@ class ResourceMonitor:
                 util = 0.0
                 if data["total_cycles"] > 0:
                     util = (data["cycles"] / data["total_cycles"]) * 100
-                    logger.debug(
-                        f"  [GPU][{cgroup}] Xe engine={engine} delta_cy={data['cycles']} "
-                        f"total_cy={data['total_cycles']} util={util:.1f}%"
-                    )
+                    # logger.debug(
+                        # f"  [GPU][{cgroup}] Xe engine={engine} delta_cy={data['cycles']} "
+                        # f"total_cy={data['total_cycles']} util={util:.1f}%"
+                    # )
                 elif elapsed_ns > 0 and data["time_ns"] > 0:
                     util = (data["time_ns"] / elapsed_ns) * 100
-                    logger.debug(
-                        f"  [GPU][{cgroup}] i915 engine={engine} delta_ns={data['time_ns']} util={util:.1f}%"
-                    )
+                    # logger.debug(
+                        # f"  [GPU][{cgroup}] i915 engine={engine} delta_ns={data['time_ns']} util={util:.1f}%"
+                    # )
                 if util > gpu_util:
                     gpu_util = util
                     winning_engine = engine
@@ -1064,7 +1128,7 @@ class ResourceMonitor:
         """
         results = []
         processes = self._get_top_processes(n=n, mode="io")
-        logger.debug(f"App disk I/O stats processes: {processes}")
+        # logger.debug(f"App disk I/O stats processes: {processes}")
 
         for process in processes:
             process_name = process.get('dominant_name') or next(iter(process['names']), 'unknown')
