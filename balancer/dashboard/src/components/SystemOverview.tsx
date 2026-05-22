@@ -2415,7 +2415,6 @@ export default function SystemOverview({ active }: Props) {
   }, [active])
 
   const fetchDynamic = useCallback(async () => {
-    if (!active) return
     setLoadingDynamic(true)
     try {
       const data = await api.getDynamicInfo()
@@ -2532,13 +2531,13 @@ export default function SystemOverview({ active }: Props) {
     } finally {
       setLoadingDynamic(false)
     }
-  }, [active, pushTrendPoints, staticInfo])
+  }, [pushTrendPoints, staticInfo])
 
   useEffect(() => {
     fetchStatic()
   }, [fetchStatic])
 
-  usePolling(fetchDynamic, refreshIntervalMs, active)
+  usePolling(fetchDynamic, refreshIntervalMs, true)
 
   const gpuDevices = useMemo(() => buildGpuDevices(staticInfo, dynamicInfo), [staticInfo, dynamicInfo])
 
