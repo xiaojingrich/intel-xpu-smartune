@@ -91,6 +91,10 @@ Supports manual operations on controlled apps, including priority adjustment, ca
 - Support for manual resource limit adjustment and restoration
 
 
+## API Documentation
+
+For a complete reference of all backend REST API endpoints, see the [Backend API Guide](docs/API_ENDPOINTS.md).
+
 ## Directory Structure:
 ```
     multi-task-resource-balancer/
