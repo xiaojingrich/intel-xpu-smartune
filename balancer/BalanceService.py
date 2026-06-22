@@ -317,6 +317,13 @@ def get_priority_data():
         if name:
             conditions.append(AIAppPriority.name == name)
 
+        if not conditions:
+            return construct_response(
+                data={},
+                retcode=RetCode.ARGUMENT_ERROR,
+                retmsg="Either app_id or app_name is required"
+            )
+
         query = query.where(conditions[0])
         record = query.first()
 

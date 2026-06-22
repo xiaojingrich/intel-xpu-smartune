@@ -13,7 +13,7 @@ from pwd import getpwnam
 from datetime import datetime
 
 from utils.logger import logger
-from db.DatabaseModel import AIAppPriority
+from db.DatabaseModel import AIAppPriority, DBStatus
 from typing import List, Dict, Any
 from config.config import b_config
 from gi.repository import Gio
@@ -81,7 +81,7 @@ class ClientCallbackManager:
                     status=data['status'],
                     up_time=datetime.now()
                 )
-                if not result:
+                if result != DBStatus.SUCCESS:
                     logger.warning(f"Failed to update database record for {data['app_id']}")
             except Exception as db_error:
                 logger.error(f"Database update error: {db_error}")
@@ -238,10 +238,10 @@ def get_app_control_info(app_id: str = None, app_name: str = None):
     controlled_map = {app['app_id']: app for app in controlled_apps if app.get('app_id')}
     name_map = {app['app_name'].lower(): app for app in controlled_apps if app.get('app_name')}
 
-    is_controlled = app_id in controlled_map or app_name in name_map
+    is_controlled = app_id in controlled_map or (app_name and app_name.lower() in name_map)
     controlled_data = None
     if is_controlled:
-        controlled_data = controlled_map.get(app_id) or name_map.get(app_name)
+        controlled_data = controlled_map.get(app_id) or name_map.get(app_name.lower() if app_name else None)
 
     return is_controlled, controlled_data
 
@@ -389,8 +389,10 @@ def _get_executable_name(app_name, app_cmdline):
 
     # 3. Generic cases (e.g., "/usr/bin/foo")
     for part in app_cmdline.split():
-        # Skip flags, env vars, and placeholders
+        # Skip flags, env vars, placeholders, and KEY=VALUE assignments
         if part.startswith(("-", "%", "env")):
+            continue
+        if "=" in part and not part.startswith("/"):
             continue
 
         if "/" in part:
@@ -486,7 +488,7 @@ def _update_app_oom_score_adj(app_id: str, score: int) -> bool:
             id=app_id,
             oom_score=score
         )
-        if not result:
+        if result != DBStatus.SUCCESS:
             logger.warning(f"No record updated for app_id: {app_id}")
             return False
 
@@ -504,7 +506,7 @@ def update_app_status(app_id: str, status: str) -> bool:
             id=app_id,
             status=status
         )
-        if not result:
+        if result != DBStatus.SUCCESS:
             logger.warning(f"No record updated for app_id: {app_id}")
             return False
 
