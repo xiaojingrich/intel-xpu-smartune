@@ -457,7 +457,6 @@ def discover_search():
     """
     try:
         from monitor import app_discovery
-        from config.config import b_config
 
         data = request.get_json(silent=True) or {}
         keywords = data.get('keywords') or []
@@ -471,11 +470,7 @@ def discover_search():
                 retmsg="At least one keyword is required"
             )
 
-        extra_blacklist = list(getattr(b_config, "blacklist", None) or [])
-        candidates = app_discovery.search_processes(
-            keywords,
-            extra_blacklist=extra_blacklist,
-        )
+        candidates = app_discovery.search_processes(keywords)
         return construct_response(
             data={
                 "count": len(candidates),
