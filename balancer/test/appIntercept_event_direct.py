@@ -13,10 +13,9 @@ from typing import List, Set, Dict, Any
 from gi.repository import Gio
 import psutil
 
-# 定义与BPF代码中相同的常量
+# BPF constants (must match C definitions)
 COMM_LEN = 32
 PY_MAX_FILE_LEN = 64
-
 
 class SingletonMeta(type):
     _instances = {}
@@ -26,18 +25,17 @@ class SingletonMeta(type):
             cls._instances[cls] = super().__call__(*args, **kwargs)
         return cls._instances[cls]
 
-
 class AppIntercept(metaclass=SingletonMeta):
     def __init__(self, c_src_file: str = "bpf_event.c"):
         self.bpf = BPF(src_file=c_src_file)
         self.monitored_apps: Set[str] = set()
-        self.processes_to_relaunch: Dict[int, Dict[str, Any]] = {}  # 存储需要重启的进程信息
-        self.handled_processes: Set[int] = set()  # 初始化已处理进程集合
+        self.processes_to_relaunch: Dict[int, Dict[str, Any]] = {}
+        self.handled_processes: Set[int] = set()
         self.app_db = self.build_app_database()
         self.relaunch_apps = {}
 
     def build_app_database(self) -> Dict[str, Dict[str, str]]:
-        """构建桌面应用数据库"""
+        """Build desktop application database."""
         db = {}
         for app in Gio.AppInfo.get_all():
             desktop_id = app.get_id()
@@ -52,7 +50,7 @@ class AppIntercept(metaclass=SingletonMeta):
         self.bpf.trace_print()
 
     def get_main_process(self, filename: str) -> (bool, str):
-        """检查是否是主进程"""
+        """Check if this is a main process launch."""
         filename_lower = filename.lower()
         app_flag = [(app, app.lower() in filename_lower) for app in self.monitored_apps]
         special_flag = [x in filename_lower for x in ['/bin/', '/usr/bin/', '/snap/bin/']]
@@ -68,10 +66,8 @@ class AppIntercept(metaclass=SingletonMeta):
         comm = event.comm.decode('utf-8', 'ignore')
         pid = event.pid
 
-        # 调试信息
         print(f"*** Event: PID={pid}, COMM={comm}, FILENAME={filename} ***")
 
-        # 检测是否是有效的应用启动事件
         for app_name in self.monitored_apps:
             app_name_lower = app_name.lower()
             is_main_process = (
@@ -82,7 +78,6 @@ class AppIntercept(metaclass=SingletonMeta):
             print(f"app_name_lower: {app_name_lower}, is_main_process: {is_main_process}")
 
             if is_main_process:
-                # 防止重复处理同一个进程树
                 if not self.is_process_handled(pid):
                     desktop_id = self.app_db.get(app_name_lower, {}).get('desktop_id', '')
                     self.handle_monitored_app(pid, comm, filename, app_name, desktop_id)
@@ -90,8 +85,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 break
 
     def is_process_handled(self, pid: int) -> bool:
-        """检查该进程是否已经被处理过"""
-        # 检查当前进程及其父进程是否已被处理
+        """Check if this process or any ancestor was already handled."""
         try:
             process = psutil.Process(pid)
             for p in [process] + process.parents():
@@ -102,7 +96,7 @@ class AppIntercept(metaclass=SingletonMeta):
         return False
 
     def mark_process_handled(self, pid: int) -> None:
-        """标记进程为已处理"""
+        """Mark process as handled."""
         self.handled_processes.add(pid)
 
     def is_self_relaunched_process(self, app_name: str, desktop_id: str) -> bool:
@@ -117,17 +111,14 @@ class AppIntercept(metaclass=SingletonMeta):
         print(f"Detected monitored app '{app_name}' (PID: {pid}, COMM: {comm}, FILE: {filename}, desktop_id: {desktop_id})")
 
         try:
-            # 检查是否是我们自己relaunch触发的进程
             if self.is_self_relaunched_process(app_name, desktop_id):
                 print(f"Ignoring self-relaunched process: {app_name}: {desktop_id}")
-                del self.relaunch_apps[desktop_id or app_name]  # 清理已处理的重启记录
+                del self.relaunch_apps[desktop_id or app_name]
                 return
 
             os.kill(pid, signal.SIGSTOP)
 
-            # 检查系统资源
             if self.check_system_resources():
-                # 存储进程信息以便重启
                 self.processes_to_relaunch[pid] = {
                     'desktop_id': desktop_id,
                     'comm': comm,
@@ -135,7 +126,7 @@ class AppIntercept(metaclass=SingletonMeta):
                     'detection_time': time.time(),
                     'app_name': app_name
                 }
-                # 延迟重启，避免频繁操作
+
                 # time.sleep(1)
                 os.kill(pid, signal.SIGCONT)
             else:
@@ -145,7 +136,7 @@ class AppIntercept(metaclass=SingletonMeta):
             print(f"Error handling {app_name} (PID: {pid}): {str(e)}")
 
     def add_to_monitorlist(self, app_name: str) -> None:
-        """添加应用到监控列表"""
+        """Add app to monitoring list."""
         if app_name.lower() not in (name.lower() for name in self.monitored_apps):
             self.monitored_apps.add(app_name)
             print(f"Added '{app_name}' to monitoring list")
@@ -153,7 +144,7 @@ class AppIntercept(metaclass=SingletonMeta):
             print(f"'{app_name}' is already in monitoring list")
 
     def remove_from_monitorlist(self, app_name: str) -> None:
-        """从监控列表中移除应用"""
+        """Remove app from monitoring list."""
         if app_name in self.monitored_apps:
             self.monitored_apps.remove(app_name)
             print(f"Removed '{app_name}' from monitoring list")
@@ -161,26 +152,24 @@ class AppIntercept(metaclass=SingletonMeta):
             print(f"'{app_name}' not found in monitoring list")
 
     def clear_monitorlist(self) -> None:
-        """清空监控列表"""
+        """Clear monitoring list."""
         self.monitored_apps.clear()
         print("Cleared monitoring list")
 
     def get_monitored_apps(self) -> List[str]:
-        """获取当前监控的应用列表"""
+        """Get current monitored apps list."""
         return list(self.monitored_apps)
 
     def graceful_terminate(self, pid: int, timeout: int = 3) -> None:
-        """更温和的进程终止方式"""
+        """Gracefully terminate a process (SIGTERM, then SIGKILL on timeout)."""
         try:
             process = psutil.Process(pid)
-            # 先尝试发送SIGTERM
+
             process.terminate()
 
-            # 等待进程结束
             try:
                 process.wait(timeout=timeout)
             except psutil.TimeoutExpired:
-                # 如果进程未响应，则发送SIGKILL
                 process.kill()
                 print(f"Force killed PID {pid} after timeout")
 
@@ -190,27 +179,18 @@ class AppIntercept(metaclass=SingletonMeta):
             print(f"Error terminating process {pid}: {str(e)}")
 
     def check_system_resources(self, cpu_threshold: int = 70, mem_threshold: int = 80) -> bool:
-        """检查系统资源使用情况"""
+        """Check if system resources are below threshold."""
         try:
-            # 获取CPU使用率
             cpu_percent = psutil.cpu_percent(interval=1)
-
-            # 获取内存使用率
             mem_percent = psutil.virtual_memory().percent
-
             print(f"System status - CPU: {cpu_percent}%, Memory: {mem_percent}%")
-
-            # 检查是否低于阈值
             return cpu_percent < cpu_threshold and mem_percent < mem_threshold
-
         except Exception as e:
             print(f"Error checking system resources: {str(e)}")
-            # 出现错误时默认允许启动
             return True
 
-
     def relaunch(self, app_name: str) -> bool:
-        """通用的应用程序启动方式"""
+        """Relaunch an application using available methods."""
         print(f"Attempting to relaunch: {app_name}")
 
         def try_launch(command, method_name):
@@ -223,7 +203,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 )
                 pid = proc.pid
                 print(f"Attempted launch via {method_name} (PID: {pid})")
-                self.relaunch_apps[app_name] = pid  # 记录重启的进程ID
+                self.relaunch_apps[app_name] = pid
                 print(f"relaunch done: {self.relaunch_apps}")
                 return True
             except FileNotFoundError:
@@ -238,7 +218,7 @@ class AppIntercept(metaclass=SingletonMeta):
                 os.system(command)
                 pid = os.getpid()
                 print(f"Attempted launch via {method_name} (PID: {pid})")
-                self.relaunch_apps[app_name] = pid  # 记录重启的进程ID
+                self.relaunch_apps[app_name] = pid
                 print(f"relaunch done: {self.relaunch_apps}")
                 return True
             except FileNotFoundError:
@@ -248,18 +228,18 @@ class AppIntercept(metaclass=SingletonMeta):
                 return False
 
         try:
-            # 1. 优先尝试gtk-launch (适用于.desktop文件)
+            # 1. Try gtk-launch for .desktop files
             if app_name.endswith('.desktop'):
                 if try_launch(["gtk-launch", app_name], "gtk-launch"):
                     print("gtk-launch successful")
                     return True
 
-            # 2. 尝试直接执行
+            # 2. Try direct execution
             if try_launch_by_system(app_name, "direct execution"):
                 print("Direct execution successful")
                 return True
 
-            # 3. 尝试xdg-open
+            # 3. Try xdg-open
             if try_launch(["xdg-open", app_name], "xdg-open"):
                 print("xdg-open successful")
                 return True

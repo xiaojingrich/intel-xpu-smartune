@@ -4,7 +4,7 @@
 from bcc import BPF
 import ctypes
 
-# 定义与BPF代码中相同的常量
+# BPF constants (must match C definitions)
 COMM_LEN = 32
 PY_MAX_TARGET_LEN = 32
 
@@ -13,15 +13,14 @@ bpf_code = """
 
 #define COMM_LEN 32
 #define MAX_TARGET_LEN 32
-// 使用结构体定义应用名
+
 struct appname_t {
     char name[MAX_TARGET_LEN];
 };
 
-// 定义BPF map来存储动态黑名单
 BPF_HASH(blocked_apps, u32, struct appname_t);
 
-// 初始静态黑名单
+// Static blocklist
 static const char INITIAL_TARGETS[][MAX_TARGET_LEN] = {
     "firefox", "chrome", "chromium", "edge", "brave",
     "gedit", "notepad", "kate", "pluma", "gnome-text-editor",
@@ -58,7 +57,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
         return 0;
     }
 
-    // 1. 检查静态黑名单
+    // 1. Check static blocklist
     #pragma unroll
     for (int i = 0; i < sizeof(INITIAL_TARGETS)/sizeof(INITIAL_TARGETS[0]); i++) {
         if (is_substring(comm, INITIAL_TARGETS[i]) || is_substring(fname, INITIAL_TARGETS[i])) {
@@ -69,7 +68,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
         }
     }
 
-    // 2. 检查动态黑名单
+    // 2. Check dynamic blocklist
     u32 key = 0;
     struct appname_t *target = blocked_apps.lookup(&key);
     if (target) {
@@ -89,19 +88,16 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
 }
 """
 
-# 初始化BPF
+# Initialize BPF
 bpf = BPF(text=bpf_code)
 
-
 def add_to_blacklist(app_name):
-    # 定义结构体类型
     class AppName(ctypes.Structure):
         _fields_ = [("name", ctypes.c_char * PY_MAX_TARGET_LEN)]
 
-    # 创建结构体实例
     value = AppName()
 
-    # 准备要写入的字符串（确保以null结尾）
+    # Null-terminate the name
     app_name_bytes = app_name.encode('utf-8')[:PY_MAX_TARGET_LEN - 1]
     value.name = app_name_bytes + b'\0'
 
@@ -109,23 +105,17 @@ def add_to_blacklist(app_name):
     # buffer = ctypes.create_string_buffer(null_terminated, PY_MAX_FILE_LEN)
     # ctypes.memmove(value.name, buffer, len(buffer))
 
-    # 使用固定键0
     key = ctypes.c_uint32(0)
 
-    # 打印调试信息
     print(f"Setting key={key.value}, value.name={value.name} (len={len(app_name_bytes)})")
 
-    # 更新map
     bpf["blocked_apps"][key] = value
 
-    # 验证是否设置成功
     val = bpf["blocked_apps"][key]
     print(f"Verification: stored value={val.name.decode('utf-8', errors='replace')}")
 
     print(f"Added '{app_name}' to dynamic blacklist")
 
-
-# 示例：添加"ls"到黑名单
 add_to_blacklist("ls")
 
 print("Monitoring execve()... Ctrl+C to exit")

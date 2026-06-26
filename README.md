@@ -97,14 +97,21 @@ For a complete reference of all backend REST API endpoints, see the [Backend API
 
 ## Directory Structure:
 ```
-    multi-task-resource-balancer/
+intel-xpu-smartune/
+├── docs/                        # API documentation (API_ENDPOINTS.md)
+└── balancer/
     ├── BalanceService.py        # Flask REST API server; resource-balancing entry point
     ├── start_balancer.sh        # Convenience script to start the balancer service
     ├── balancer/                # Core balancing logic: DynamicBalancer, MaxPriorityQueue,
     │                            #   app-intercept loop, network controller integration
     ├── config/                  # config.yaml (thresholds, weights, app list) and config loader
-    ├── controller/              # Resource controllers: CPU quota, memory, Disk I/O,
-    │                            #   network (tc/HTB), CPU governor, PSI reader
+    ├── controller/              # Resource controllers:
+    │   ├── cpu.py               #   CPU quota (cgroups v2 cpu.max)
+    │   ├── memory.py            #   Memory limits (memory.high / memory.max)
+    │   ├── io.py                #   Disk I/O throttling (io.max rbps/wbps/riops/wiops)
+    │   ├── network.py           #   Network traffic shaping (tc/HTB + iptables + cgroup)
+    │   ├── governor.py          #   CPU frequency governor switching
+    │   └── psi.py               #   PSI trigger-based resource reader
     ├── db/                      # Peewee ORM database model for controlled app records
     ├── monitor/                 # System monitoring components:
     │   ├── psi.py               #   Linux PSI reader
@@ -113,16 +120,17 @@ For a complete reference of all backend REST API endpoints, see the [Backend API
     │   ├── network.py           #   Network traffic sampling and pressure calculation
     │   ├── cgroup.py            #   cgroup path resolution and monitoring
     │   ├── appIntercept.py      #   eBPF-based app launch/exit detection (BCC)
-    │   ├── bpf_event.c          #   eBPF C program for execve syscall interception
+    │   ├── app_discovery.py     #   "Add App" wizard: process search and field extraction
+    │   ├── bpf_event.c          #   eBPF C program for execve/exit tracepoints
+    │   ├── gpu_monitor.py       #   Intel GPU monitoring (i915/Xe PMU, RAPL, fdinfo)
+    │   ├── npu_monitor.py       #   Intel NPU monitoring via PMT telemetry and fdinfo
     │   ├── system_info.py       #   Static/dynamic hardware & software info collection
-    │   │                        #   (CPU, GPU, NPU, memory, disk, network, driver versions)
-    │   ├── intel_npu_smi.py     #   Intel NPU monitoring via PMT telemetry and fdinfo
+    │   ├── metrics/             #   Per-subsystem metric collectors (cpu, gpu_perf, npu, history)
     │   └── monitor_api.py       #   Flask Blueprint exposing /monitor/* REST endpoints
-    ├── tools/                   # External tools and utilities
-    ├── test/                    # Unit / integration tests and feature test scripts
+    ├── test/                    # Feature test scripts (BPF, PSI, disk I/O, notifications)
     ├── utils/                   # Shared utilities: logger, app_utils, http_utils
-    ├── dashboard/               # React/TypeScript dashboard (6-tab UI: Performance,
-    │                            #   App Resources, Process Resources, Balancer, History, About)
+    └── dashboard/               # React/TypeScript dashboard (6-tab UI: Performance,
+                                 #   App Resources, Process Resources, Balancer, History, About)
 ```
 
 

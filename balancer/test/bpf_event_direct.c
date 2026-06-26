@@ -12,7 +12,7 @@
 #define MAX_FILE_LEN 64
 
 
-// 定义事件结构
+// Event structure
 struct event_t {
     u32 pid;
     char comm[COMM_LEN];

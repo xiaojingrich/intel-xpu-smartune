@@ -593,7 +593,6 @@ if __name__ == "__main__":
     # Open the perf buffer
     bpf_monitor.bpf["events"].open_perf_buffer(bpf_monitor.print_event)
     logger.debug(f"Monitoring execve() for: {', '.join(bpf_monitor.get_monitored_apps())}")
-    logger.debug("Ctrl+C to exit")
 
     while True:
         try:

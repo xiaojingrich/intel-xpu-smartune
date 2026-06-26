@@ -42,10 +42,8 @@ def print_event(cpu, data, size):
     filename = event.filename.decode('utf-8', 'ignore')
     comm = event.comm.decode('utf-8', 'ignore')
 
-    # 打印所有事件进行调试
     print(f"DEBUG: PID={event.pid}, COMM={comm}, FILENAME={filename}")
 
-    # 保留原始过滤条件
     if "firefox" in comm.lower() or "firefox" in filename.lower():
         print(f"Firefox launched! PID: {event.pid}, Path: {filename}")
 
