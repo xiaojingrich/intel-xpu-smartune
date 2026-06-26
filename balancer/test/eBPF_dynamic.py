@@ -4,27 +4,25 @@
 from bcc import BPF
 import ctypes
 
-# 定义与BPF代码中相同的常量
+# BPF constants (must match C definitions)
 COMM_LEN = 32
 PY_MAX_TARGET_LEN = 32
-MAX_DYNAMIC_APPS = 32  # 添加最大动态应用数限制
+MAX_DYNAMIC_APPS = 32
 
 bpf_code = """
 #include <uapi/linux/ptrace.h>
 
 #define COMM_LEN 32
 #define MAX_TARGET_LEN 32
-#define MAX_DYNAMIC_APPS 32  // 在BPF代码中也定义
+#define MAX_DYNAMIC_APPS 32
 
-// 使用结构体定义应用名
 struct appname_t {
     char name[MAX_TARGET_LEN];
 };
 
-// 定义BPF map来存储动态黑名单
 BPF_HASH(blocked_apps, u32, struct appname_t);
 
-// 初始静态黑名单
+// Static blocklist
 static const char INITIAL_TARGETS[][MAX_TARGET_LEN] = {
     "chrome", "chromium", "edge", "brave", "notepad"
 };
@@ -54,18 +52,17 @@ static inline int bpf_strstr(const char *str, const char *substr) {
         #pragma unroll
         for (int j = 0; j < MAX_TARGET_LEN; j++) {
             if (substr[j] == '\\0') break;
-            if (str[i+j] == '\\0' || str[i+j] != substr[j]) {  // 添加对str边界的检查
+            if (str[i+j] == '\\0' || str[i+j] != substr[j]) {  
                 match = 0;
                 break;
             }
         }
-        if (match && substr[0] != '\\0') {  // 确保匹配的是完整子串
+        if (match && substr[0] != '\\0') {  
             return 1;
         }
     }
     return 0;
 }
-
 
 TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     const char **argv = (const char **)args->argv;
@@ -80,7 +77,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
         return 0;
     }
 
-    // 1. 检查静态黑名单
+    // 1. Check static blocklist
     #pragma unroll
     for (int i = 0; i < sizeof(INITIAL_TARGETS)/sizeof(INITIAL_TARGETS[0]); i++) {
         if (is_substring(comm, INITIAL_TARGETS[i]) || is_substring(fname, INITIAL_TARGETS[i])) {
@@ -91,7 +88,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
         }
     }
 
-    // 2. 检查动态黑名单    
+    // 2. Check dynamic blocklist    
     u32 key = 0;
     struct appname_t *val;
     int count = 0;
@@ -113,29 +110,25 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
 }
 """
 
-# 初始化BPF
+# Initialize BPF
 bpf = BPF(text=bpf_code)
-
 
 def add_to_blacklist(app_name):
     print(f"add_to_blacklist... '{app_name}'")
 
-    # 定义结构体类型
     class AppName(ctypes.Structure):
         _fields_ = [("name", ctypes.c_char * PY_MAX_TARGET_LEN)]
 
-    # 创建结构体实例
     value = AppName()
 
-    # 准备要写入的字符串（确保以null结尾）
+    # Null-terminate the name
     app_name_bytes = app_name.encode('utf-8')[:PY_MAX_TARGET_LEN - 1]
     value.name = app_name_bytes + b'\0'
 
-    # 查找下一个可用的key
+    # Find next available key
     next_key = 0
     while next_key < MAX_DYNAMIC_APPS:
         try:
-            # 尝试获取key，如果不存在则使用这个key
             _ = bpf["blocked_apps"][ctypes.c_uint32(next_key)]
             next_key += 1
         except KeyError:
@@ -147,20 +140,15 @@ def add_to_blacklist(app_name):
 
     key = ctypes.c_uint32(next_key)
 
-    # 打印调试信息
     print(f"Setting key={key.value}, value.name={value.name} (len={len(app_name_bytes)})")
 
-    # 更新map
     bpf["blocked_apps"][key] = value
 
-    # 验证是否设置成功
     val = bpf["blocked_apps"][key]
     print(f"Verification: stored value={val.name.decode('utf-8', errors='replace')}")
 
     print(f"Added '{app_name}' to dynamic blacklist")
 
-
-# 示例：添加"ls"到黑名单
 add_to_blacklist("top")
 add_to_blacklist("wget")
 

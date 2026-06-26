@@ -715,7 +715,6 @@ def get_dbus_address():
 
     # Method 2: retrieve from process environment
     try:
-        import psutil
         for proc in psutil.process_iter(['environ']):
             try:
                 env = proc.environ()
@@ -732,7 +731,7 @@ def get_dbus_address():
         display = subprocess.check_output(cmd).decode().strip()
         if display:
             return f"unix:path=/run/user/{uid}/bus"
-    except:
+    except Exception:
         pass
 
     return None

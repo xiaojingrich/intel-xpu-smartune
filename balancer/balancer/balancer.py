@@ -137,10 +137,9 @@ class DynamicBalancer:
         self.resource_monitor = self.controlManager.res
         self.io_ctl = IOController()
 
-        # Resource management
-        self.workload_groups = {}  # registered workload types
-        self.running_tasks = {}  # pid -> WorkloadTask
-        self.known_pids = set()  # set of already-identified PIDs
+        self.workload_groups = {}
+        self.running_tasks = {}
+        self.known_pids = set()
 
         self.is_running = False
         self.app_detect_queue = JoinableQueue(1000000)
@@ -148,7 +147,6 @@ class DynamicBalancer:
 
         self._init_default_workloads()
 
-        # Network controller
         self.network_controller = NetworkController()
 
     def _init_default_workloads(self):
@@ -158,8 +156,6 @@ class DynamicBalancer:
             WorkloadGroup("normal", 50, 100, 0, 200),
             WorkloadGroup("best-effort", 20, 50, 0, 100)
         ]
-        # for group in default_groups:
-        #     self.register_workload_group(group)
 
     def start(self):
         """
@@ -231,7 +227,6 @@ class DynamicBalancer:
 
         def reset_state():
             nonlocal top_consume_apps, idle_check_interval, pressure_start_time
-            # logger.debug("reset_state called")
             top_consume_apps = []
             idle_check_interval = default_idle_check_interval
             pressure_start_time = None  # reset timer
@@ -322,7 +317,6 @@ class DynamicBalancer:
                                                                    direction="egress")
             self.network_controller.network.sample_network_pressure()
             if current_time - last_network_sample_time >= network_sample_interval:
-                # Sample ingress traffic
                 last_network_sample_time = current_time
                 network_data = self.network_controller.network.get_current_pressure()
                 tx_pressure, rx_pressure, *_ = self.controlManager.update_network_pressure_level(network_data)
@@ -347,16 +341,9 @@ class DynamicBalancer:
             try:
                 current_time = time.time()
 
-                # Re-read every iteration so the UI Switch toggle takes effect without
-                # restarting the service.  When disabled, only the "find a new top
-                # consumer and limit it" branches are skipped; pressure sampling,
-                # already-limited-app restoration, pending-queue processing, and
-                # network shaping all keep running so previously limited apps still
-                # converge back to normal as system pressure subsides.
                 _prc = self.config.passive_resource_control or {}
                 passive_enabled = bool(_prc.get('enabled', True))
 
-                # Process immediately when the queue is non-empty; poll every 10s otherwise
                 if not self.app_priority_queue.empty() or (current_time - last_check_time) >= idle_check_interval:
                     # Use consume_peak_pressure_level() instead of get_current_pressure_level()
                     # so that transient "critical" spikes that occurred while the
@@ -402,15 +389,7 @@ class DynamicBalancer:
                         sustained_critical_iters = 0
 
                     if policy == "separated":
-                        # When passive control is disabled we deliberately fall through to
-                        # the restore / queue-drain branches below, even if pressure is
-                        # critical: skipping the expensive top-consumer fetch + auto-limit
-                        # is the whole point.  Restore only acts on medium/low pressure,
-                        # so a genuinely-critical system simply leaves already-limited
-                        # apps alone until pressure subsides — same end state, just no
-                        # new auto-limits.
                         if passive_enabled and (pressure == "critical" or is_disk_io_stressed):
-                            # Reset the low-pressure timer
                             restore_pending = False
 
                             if not is_disk_io_stressed:
@@ -421,39 +400,13 @@ class DynamicBalancer:
                                 disk_io_not_stressed_start_time = None
                                 top_consume_apps = self.resource_monitor.get_top_disk_io_consumers()
                                 reach_threshold = True  # IO pressure always counts as threshold-crossing
-                            # logger.debug(f"Top resource consumers(currently = 1): {top_consume_apps}")
-                            """
-                                Top resource consumers:[
-                                   {
-                                      "process":{
-                                         "pid":5508,
-                                         "name":"stress",
-                                         "cmdline":"stress --cpu 25 --io 30 --vm 3 --vm-bytes 21G",
-                                         "score":469.53,
-                                         "cpu_avg":96.2,
-                                         "mem_rss":16.11,
-                                         "io_read_rate":0.0
-                                      },
-                                      "app":{
-                                         "type":"cgroup",
-                                         "id":"vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope",
-                                         "name":"CGroup: vte-spawn-4573f009-2887-47a4-a7d8-f573b6965109.scope"
-                                      }
-                                   },
-                                   {  # Only top1 currently.
-                                     ...
-                                   },
-                                   ...
-                                ]
-                            """
                             if top_consume_apps:
-                                # Check whether this process has already been rate-limited
                                 for app_info in top_consume_apps:
                                     current_app_id = (app_info.get('app') or {}).get('id')
 
                                     if current_app_id in g_limited_apps:
                                         _, _, _, state = g_limited_apps[current_app_id]
-                                        is_limited_app_dominant = (state != "partially_restored")  # only consider fully-limited apps as dominant
+                                        is_limited_app_dominant = (state != "partially_restored")
                                         break
                                     else:
                                         is_limited_app_dominant = False
@@ -477,14 +430,12 @@ class DynamicBalancer:
                                         is_disk_io_stressed=is_disk_io_stressed
                                     )
 
-                                # Remove the checked app regardless of whether it was handled
                                 top_consume_apps.pop(0)
 
                             else:
                                 reset_state()
 
                         elif not self.app_priority_queue.empty() and pressure != "critical" and not is_disk_io_stressed:
-                            # Process apps in the task queue
                             app_data, priority = self.app_priority_queue.get()
                             logger.info(
                                 f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
@@ -496,7 +447,6 @@ class DynamicBalancer:
                                 'status': "running",
                                 'purpose': "app"
                             }, True)
-                            # Reset top-app state after draining the queue
                             reset_state()
                         else:
                             if g_limited_apps and not restore_pending:
@@ -507,7 +457,6 @@ class DynamicBalancer:
                                                    any(app_data[2].get('io_limited', False) for app_data in
                                                        g_limited_apps.values()))
                                 if should_check_pressure or should_check_io:
-                                    # Pressure level is unstable; reset the timer
                                     logger.info(f"pressure_start_time: {pressure_start_time}, "
                                                 f"current_pressure: {current_pressure}, pressure: {pressure}")
                                     if should_check_pressure:
@@ -533,7 +482,6 @@ class DynamicBalancer:
 
                                     logger.info(f"pressure_stable: {pressure_stable}, io_stable: {io_stable}, io_double_stable: {io_double_stable}")
 
-                                    # Check whether the stability period has elapsed
                                     if pressure_stable and pressure == "medium":
                                         restore_pending = True
                                         app_id, (app_name, limit_rates, limit_parts, state) = next(
@@ -565,7 +513,6 @@ class DynamicBalancer:
                                         app_id, (app_name, limit_rates, limit_parts, state) = next(
                                             iter(g_limited_apps.items()))
 
-                                        # Perform the restore operation
                                         success = self.restore_resources(app_id, app_name, limit_rates, limit_parts,
                                                                          "full")
                                         if success:
@@ -583,7 +530,6 @@ class DynamicBalancer:
                                                 g_limited_apps.pop(app_id, None)
                                                 logger.info(f"Fully restored app {app_id}, removed from limited apps")
 
-                                                # Reset the timer only after full restore and IO stability
                                                 if io_double_stable:
                                                     disk_io_not_stressed_start_time = None
                                                     logger.debug("Reset IO stress timer after full restoration")
@@ -597,37 +543,29 @@ class DynamicBalancer:
                                 else:
                                     reset_state()
                     elif policy == "combined":
-                        # See the matching note in the "separated" branch: when passive
-                        # control is off we skip the expensive top fetch + auto-limit and
-                        # let the restore / queue-drain branches handle the iteration.
                         if passive_enabled and pressure == "critical":
-                            # Reset the low-pressure timer
                             pressure_start_time = None
-                            # First time entering critical state: obtain the top-app list
                             restore_pending = False
                             if not top_consume_apps:
                                 top_consume_apps, reach_threshold = _resolve_top_for_critical()
 
                             if top_consume_apps:
-                                # Check whether this process has already been rate-limited
                                 for app_info in top_consume_apps:
                                     current_app_id = (app_info.get('app') or {}).get('id')
 
                                     if current_app_id in g_limited_apps:
                                         _, _, _, state = g_limited_apps[current_app_id]
-                                        is_limited_app_dominant = (state != "partially_restored")  # only consider fully-limited apps as dominant
+                                        is_limited_app_dominant = (state != "partially_restored")
                                         break
                                     else:
                                         is_limited_app_dominant = False
 
                                 logger.debug(f"Balance- was the process limited before? {is_limited_app_dominant}")
                                 self.controlManager.set_limited_app_dominant(is_limited_app_dominant)
-                                # Invoke the dedicated handler
                                 should_adjust, is_controlled, app_id, limit_rates = self._handle_critical_pressure(
                                     top_consume_apps, reach_threshold)
 
                                 if not is_limited_app_dominant and reach_threshold and should_adjust and app_id:
-                                    # Apply resource adjustments
                                     target = top_consume_apps[0]
                                     app_name = target.get('process', {}).get('name') or ''
                                     total_mem = self.resource_monitor.get_total_memory()
@@ -636,11 +574,9 @@ class DynamicBalancer:
                                     per_cg_mem_rss = target.get('per_cgroup_mem_rss', {})
                                     per_cg_cpu = target.get('per_cgroup_cpu', {})
 
-                                    # Initialise limit result flags
                                     resource_limited = False
                                     io_limited = False
 
-                                    # CPU/memory limit – distribute proportionally for multi-cgroup apps
                                     cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
                                     mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get(
                                         "mem_rate") else None
@@ -683,11 +619,10 @@ class DynamicBalancer:
                                             else:
                                                 logger.warning(f"Failed to limit CPU/Memory for {app_name}")
 
-                                    # Disk IO limit
                                     io_limits = limit_rates.get("disk_io_rate", {})
                                     if io_limits and self.is_running:
                                         limits = {
-                                            "default": {  # add per-disk entries (e.g. "nvme0n1": {...}) for fine-grained control
+                                            "default": {
                                                 "rbps": io_limits['read'] * 1024 ** 2,
                                                 "wbps": io_limits['write'] * 1024 ** 2,
                                                 "wiops": io_limits['write_iops'],
@@ -703,12 +638,11 @@ class DynamicBalancer:
                                         for extra_id in extra_cgroup_ids:
                                             self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
-                                    # Record in g_limited_apps as long as at least one limit succeeded
                                     if resource_limited or io_limited:
                                         g_limited_apps[app_id] = (app_name, limit_rates, {
                                             'cpu_mem_limited': resource_limited,
                                             'io_limited': io_limited
-                                        }, None)  # None indicates fully limited
+                                        }, None)
                                         if extra_cgroup_ids:
                                             g_extra_cgroup_ids[app_id] = extra_cgroup_ids
 
@@ -724,13 +658,11 @@ class DynamicBalancer:
                                     else:
                                         logger.warning(f"No resource limits successfully applied for {app_name}")
 
-                                # Remove the checked app regardless of whether it was handled
                                 top_consume_apps.pop(0)
 
                             else:
                                 reset_state()
                         elif not self.app_priority_queue.empty() and pressure != "critical":
-                            # Process apps in the task queue
                             app_data, priority = self.app_priority_queue.get()
                             logger.info(
                                 f"Starting app: {app_data['app_name']} (PID: {app_data['pid']}, Priority: {priority})")
@@ -742,13 +674,10 @@ class DynamicBalancer:
                                 'status': "running",
                                 'purpose': "app"
                             }, True)
-                            # Reset top-app state after draining the queue
                             reset_state()
                         else:
-                            # Non-critical state: wait for STABLE_PERIOD before restoring
                             if g_limited_apps and not restore_pending:
                                 if pressure in ("medium", "low"):
-                                    # Pressure is unstable; reset timer — act only after it stabilises
                                     if (pressure_start_time is None) or (current_pressure != pressure):
                                         pressure_start_time = current_time
                                         current_pressure = pressure
@@ -757,13 +686,10 @@ class DynamicBalancer:
                                             f"Will restore resources after {STABLE_PERIOD} sec if it remains stable."
                                         )
 
-                                    # Check whether the stability period has elapsed
                                     elif current_time - pressure_start_time >= STABLE_PERIOD:
                                         restore_pending = True
 
-                                        # Choose restore strategy based on pressure level
                                         if pressure == "medium":
-                                            # Cannot remove yet; restore is only partial
                                             app_id, (app_name, limit_rates, limit_parts, state) = next(iter(g_limited_apps.items()))
                                             if state != "partially_restored":
                                                 total_mem = self.resource_monitor.get_total_memory()
@@ -771,12 +697,9 @@ class DynamicBalancer:
                                                     f"Pressure remained at 'medium' for {STABLE_PERIOD} sec. "
                                                     f"Partially restoring app {app_id} (twice the rate of limited resources)."
                                                 )
-                                                # Extra cgroups that were limited alongside the primary
                                                 extra_ids = g_extra_cgroup_ids.get(app_id, [])
-
                                                 restore_success = True
 
-                                                # Restore CPU/memory (if previously limited)
                                                 if limit_parts.get('cpu_mem_limited', False):
                                                     cpu_restore = int(100 * limit_rates[
                                                         "cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
@@ -803,13 +726,12 @@ class DynamicBalancer:
                                                                 is_restore=False,
                                                             )
 
-                                                # Restore IO limits (if previously limited)
                                                 if (limit_parts.get('io_limited', False) and "disk_io_rate" in limit_rates) and self.is_running:
                                                     io_restored = True
                                                     io_limits = limit_rates["disk_io_rate"]
 
                                                     limits = {
-                                                        "default": {  # add per-disk entries (e.g. "nvme0n1": {...}) for fine-grained control
+                                                        "default": {
                                                             "rbps": io_limits['read'] * 2 * 1024 ** 2,
                                                             "wbps": io_limits['write'] * 2 * 1024 ** 2,
                                                             "wiops": io_limits['write_iops'] * 2,
@@ -831,16 +753,14 @@ class DynamicBalancer:
                                                     if not io_restored:
                                                         restore_success = False
 
-                                                # Update state
                                                 if restore_success:
                                                     g_limited_apps[app_id] = (
                                                     app_name, limit_rates, limit_parts, "partially_restored")
                                                 else:
                                                     logger.warning(f"Partial restore failed for {app_name}")
 
-                                                g_limited_apps.move_to_end(app_id)  # move to end to avoid re-limiting the same app
+                                                g_limited_apps.move_to_end(app_id)
                                         else:  # pressure == "low"
-                                            # Fully restored; remove from tracking
                                             app_id, (app_name, _, limit_parts, _) = g_limited_apps.popitem()
                                             logger.info(
                                                 f"Pressure remained at 'low' for {STABLE_PERIOD} sec. "
@@ -850,7 +770,6 @@ class DynamicBalancer:
                                             restore_success = True
                                             extra_ids = g_extra_cgroup_ids.pop(app_id, [])
 
-                                            # Restore CPU/memory (if previously limited)
                                             if limit_parts.get('cpu_mem_limited', False) and self.is_running:
                                                 if not self.controlManager.adjust_resources(app_id, "low"):
                                                     logger.error(f"Failed to fully restore CPU/Memory for {app_name}")
@@ -858,11 +777,9 @@ class DynamicBalancer:
                                                 for extra_id in extra_ids:
                                                     self.controlManager.adjust_resources(extra_id, "low")
 
-                                            # Restore IO limits (if previously limited)
                                             if limit_parts.get('io_limited', False) and self.is_running:
                                                 io_restored = True
 
-                                                # Remove IO limits
                                                 if not self.io_ctl.restore_disk_io_throttle(app_id):
                                                     logger.error(f"Failed to remove IO limits for {app_name}")
                                                     io_restored = False
@@ -872,7 +789,6 @@ class DynamicBalancer:
                                                 if not io_restored:
                                                     restore_success = False
 
-                                            # Notify the user after full resource restore
                                             if restore_success:
                                                 app_utils.update_app_status(app_id, "running")
                                                 app_utils.callback_manager.send_callback_notification({
@@ -902,42 +818,33 @@ class DynamicBalancer:
         logger.info("Resource handle service is wait for processing")
         while self.is_running:
             try:
-                # Dequeue and process tasks from app_detect_queue
                 coming_app = self.bpf_monitor.app_pending_queue.get(block=True, timeout=5)
                 logger.info(f"_run_handle_loop: Processing app {coming_app}")
 
-                # Look up the app priority in the DB; default to low if not configured
-                # priority = "1000"  # critical
-                # priority_value = {"Calculator": 1000, "test2": 1500, "test3": 1300}
                 priority = app_utils.get_app_priority(app_name=coming_app["app_name"])
                 logger.info(f"_run_handle_loop: App {coming_app['app_name']} priority is {priority}")
 
-                # Enqueue the task for processing
                 priority_num = app_utils.get_priority_value(priority)
                 logger.debug(f"_run_handle_loop: priority value is {priority_num}")
                 self.app_priority_queue.put((coming_app, priority_num))
                 logger.info(f"_run_handle_loop: Resource insufficient, {coming_app} app added to pending queue")
 
-            except:
+            except Exception:
                 time.sleep(2)
         logger.debug("Exiting _run_handle_loop")
 
     def _run_app_intercept_loop(self):
         logger.info("Resource app intercept service is wait for processing")
 
-        # Open the perf buffer
         self.bpf_monitor.bpf["events"].open_perf_buffer(self.bpf_monitor.print_event)
-        logger.debug("Ctrl+C to exit")
 
         monitor_apps = app_utils.get_controlled_apps()
 
         if monitor_apps:
-            # Add controlled apps to the BPF monitor list (filter out empty names)
             monitored_names = [app["app_name"] for app in monitor_apps if app.get("app_name") and app["app_name"].strip()]
             self.bpf_monitor.add_to_monitorlist(monitored_names)
             logger.info(f"Monitoring execve() for: {', '.join(monitored_names)}")
 
-            # Adjust OOM priority for critical apps
             logger.debug(f"monitor_apps: {monitor_apps}")
             for app in monitor_apps:
                 app_utils.adjust_oom_priority(app["app_id"], app["app_name"], app["priority"], app.get("cmdline", ""))
@@ -946,7 +853,6 @@ class DynamicBalancer:
 
         while self.is_running:
             try:
-                # Monitor launch events
                 self.bpf_monitor.bpf.perf_buffer_poll(timeout=100)
             except KeyboardInterrupt:
                 logger.debug("Exiting...")
@@ -963,26 +869,19 @@ class DynamicBalancer:
         total_mem = self.resource_monitor.get_total_memory()
         logger.info(f"Adjusting resources for app: {app_id}")
 
-        # Extra cgroups for multi-process apps (e.g. hs_vlm.service alongside hs_agent.service).
-        # These are populated by the monitor when it merges multiple cgroups into one entry.
         extra_cgroup_ids = target_app.get('extra_cgroups', [])
-        # Per-cgroup breakdown (basename -> raw bytes/cpu_total) for proportional distribution.
         per_cg_mem_rss = target_app.get('per_cgroup_mem_rss', {})
         per_cg_cpu = target_app.get('per_cgroup_cpu', {})
 
-        # Initialise limit result flags
         resource_limited = False
         io_limited = False
 
-        # CPU/memory limits (only applied outside IO-pressure scenarios)
         if not is_disk_io_stressed:
             cpu_rate = int(100 * limit_rates["cpu_rate"]) if limit_rates.get("cpu_rate") else None
             mem_rate = int(total_mem * limit_rates["mem_rate"]) if limit_rates.get("mem_rate") else None
 
             if (cpu_rate is not None or mem_rate is not None) and self.is_running:
                 if extra_cgroup_ids:
-                    # Multi-cgroup app: distribute total budget proportionally so that
-                    # the aggregate allowed headroom equals the intended cap, not N × cap.
                     all_ids = [app_id] + extra_cgroup_ids
                     mem_dist = _split_proportionally(mem_rate, all_ids, per_cg_mem_rss)
                     cpu_dist = _split_proportionally(cpu_rate, all_ids, per_cg_cpu)
@@ -1015,12 +914,11 @@ class DynamicBalancer:
                         resource_limited = True
                         logger.info(f"Successfully limited CPU/Memory for {app_name}")
 
-        # Disk IO limits
         if is_disk_io_stressed and limit_rates.get("disk_io_rate"):
             io_limits = limit_rates.get("disk_io_rate", {})
             if io_limits and self.is_running:
                 limits = {
-                    "default": {  # add per-disk entries for fine-grained control
+                    "default": {
                         "rbps": io_limits['read'] * 1024 ** 2,
                         "wbps": io_limits['write'] * 1024 ** 2,
                         "wiops": io_limits['write_iops'],
@@ -1033,7 +931,6 @@ class DynamicBalancer:
                 for extra_id in extra_cgroup_ids:
                     self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
-        # Record the limit outcome
         if resource_limited or io_limited:
             g_limited_apps[app_id] = (
                 app_name,
@@ -1066,11 +963,9 @@ class DynamicBalancer:
         """
         global g_limited_apps, g_extra_cgroup_ids
         restore_success = True
-        # Extra cgroups for multi-process apps (e.g. hs_vlm.service alongside hs_agent.service)
         extra_ids = g_extra_cgroup_ids.get(app_id, [])
 
         if self.is_running:
-            # Restore CPU/memory
             if limit_parts.get('cpu_mem_limited', False):
                 if restore_type == "partial":
                     cpu_restore = int(100 * limit_rates["cpu_rate"] * 2) if "cpu_rate" in limit_rates else None
@@ -1097,7 +992,6 @@ class DynamicBalancer:
                         }, None)
                     for extra_id in extra_ids:
                         self.controlManager.adjust_resources(extra_id, "low")
-            # Restore IO limits
             if limit_parts.get('io_limited', False):
                 if restore_type == "partial" and "disk_io_rate" in limit_rates:
                     io_limits = limit_rates["disk_io_rate"]
@@ -1125,7 +1019,6 @@ class DynamicBalancer:
                         }, None)
                     for extra_id in extra_ids:
                         self.io_ctl.restore_disk_io_throttle(extra_id)
-            # Remove extra cgroup tracking on full restore
             if restore_type == "full":
                 g_extra_cgroup_ids.pop(app_id, None)
 
@@ -1143,33 +1036,26 @@ class DynamicBalancer:
         if not app_info:
             return False, False, None, None
 
-        # Fetch control state
         app_id = app_info['app'].get('id') if app_info.get('app') else None
         app_name = (app_info.get('process', {}).get('name') or '').lower()
 
         is_controlled, controlled_data = app_utils.get_app_control_info(app_id, app_name)
         priority = controlled_data.get('priority') if controlled_data else None
 
-        # Case 1: current process is an unmanaged app
         if not is_controlled:
             controlled_apps = app_utils.get_controlled_apps() or []
-            # logger.debug(f"Disk IO stressed - checking controlled apps: {controlled_apps}")
             for controlled_app in controlled_apps:
-                # Check whether the managed app is running and consuming high IO
                 running_pids = app_utils.get_app_processes(controlled_app['app_name'])
                 logger.debug(f"Disk IO stressed - controlled app {controlled_app['app_name']} running PIDs: {running_pids}")
                 if running_pids:
-                    # Check whether these PIDs exceed the disk IO threshold
-                    # iotop -b -p <pid> -o -k -n 3 -d 1
                     is_high_io, msg = app_utils.check_pids_disk_io_usage(running_pids, threshold_mb=100)
 
-                    if is_high_io:  # unmanaged app must yield its disk IO
+                    if is_high_io:
                         return True, False, app_id, self.get_limited_rates("undefined")
                     else:
                         logger.info(f"Disk IO stressed - No controlled app with high IO usage found.")
             return False, False, None, None
 
-        # Case 2: current process is a managed app — only check whether a critical app is running with high IO
         elif priority != 'critical':
             critical_apps = app_utils.get_controlled_apps(priority="Critical") or []
             for critical_app in critical_apps:
@@ -1186,7 +1072,6 @@ class DynamicBalancer:
         if not top_consumers or not top_consumers[0]:
             return False, False, None, None
 
-        # Initialise instance variables
         self._critical_counter = getattr(self, '_critical_counter', 0)
         self._last_notification_time = getattr(self, '_last_notification_time', 0)
 
@@ -1197,11 +1082,9 @@ class DynamicBalancer:
         is_controlled, controlled_data = app_utils.get_app_control_info(app_id, app_name)
         priority = controlled_data.get('priority') if controlled_data else None
 
-        # System resource usage snapshot
         usage_data = self.resource_monitor.get_resource_usage()
         is_sys_busy = usage_data['cpu']['is_busy'] or usage_data['memory']['is_busy']
 
-        # Case 0: special scenario handling
         if is_sys_busy and not reach_threshold:
             current_time = time.time()
             if current_time - self._last_notification_time >= self.config.cooldown_time:
@@ -1215,12 +1098,10 @@ class DynamicBalancer:
             self._critical_counter = 0
             return False, False, None, None
 
-        # Unmanaged app or managed non-critical app -> apply adjustment directly
         if not is_controlled or priority != 'critical':
             self._critical_counter = 0
             return True, is_controlled, app_id, self.get_limited_rates(priority or "undefined")
 
-        # Critical managed app -> skip; increment counter
         self._critical_counter += 1
         if self._critical_counter >= 1:
             current_time = time.time()
@@ -1258,7 +1139,6 @@ class DynamicBalancer:
                 restore_success = True
                 extra_ids = g_extra_cgroup_ids.pop(app_id, [])
 
-                # Restore CPU/Memory limits
                 if limit_parts.get('cpu_mem_limited', False):
                     if not self.controlManager.adjust_resources(app_id, "low"):
                         logger.error(f"Failed to restore CPU/Memory for {app_source} limited app {app_id}")
@@ -1266,7 +1146,6 @@ class DynamicBalancer:
                     for extra_id in extra_ids:
                         self.controlManager.adjust_resources(extra_id, "low")
 
-                # Restore IO limits
                 if limit_parts.get('io_limited', False):
                     if not self.io_ctl.restore_disk_io_throttle(app_id):
                         logger.error(f"Failed to remove IO limits for {app_source} limited app {app_id}")
@@ -1279,7 +1158,6 @@ class DynamicBalancer:
             except Exception as e:
                 logger.error(f"Failed to restore resources for app {app_id}: {str(e)}")
             finally:
-                # Remove app from tracking regardless of restore success to avoid repeated attempts on failure
                 g_limited_apps.pop(app_id, None)
                 g_limited_apps_manual.pop(app_id, None)
                 g_manual_limit_baseline.pop(app_id, None)
@@ -1292,10 +1170,7 @@ class DynamicBalancer:
             data, _ = item
             return data.get('app_id') == app_id
 
-        # Remove matching items from the queue
         removed_items = self.app_priority_queue.remove_if(condition)
-
-        # Terminate the associated process
         killed = False
         for item in removed_items:
             data, _ = item
@@ -1349,7 +1224,6 @@ class DynamicBalancer:
                 except (TypeError, ValueError):
                     continue
 
-            # Make sure current-priority config is always included if present.
             p_val = rate_cfg.get((priority or "undefined").lower())
             try:
                 if p_val is not None:
@@ -1394,10 +1268,6 @@ class DynamicBalancer:
 
         cpu_rate = rates.get("cpu_rate")
         mem_rate = rates.get("mem_rate")
-        # Use the saved per-app disk IO rate values for display regardless of whether the
-        # enabled switch is on or off.  get_limited_rates() skips populating disk_io_rate
-        # when disk_enabled=False, which would cause the form to fall back to config defaults
-        # instead of the previously saved values.
         saved_disk_rate = (
             app_overrides.get("disk_io", {}).get("rate")
             if isinstance(app_overrides, dict) and isinstance(app_overrides.get("disk_io"), dict)
@@ -1418,7 +1288,6 @@ class DynamicBalancer:
         cgroup_paths = usage.get("cgroup_paths") or ([usage.get("cgroup_path")] if usage.get("cgroup_path") else [])
         cgroup_ids = [os.path.basename(path) for path in cgroup_paths if path]
 
-        # Config-level defaults for disk IO at this priority, used as fallback when no per-app override is active.
         disk_policy = (self.config.limit_policy or {}).get('disk_io', {}) if hasattr(self.config, 'limit_policy') else {}
         disk_rates_cfg = disk_policy.get('rate', {}) if isinstance(disk_policy, dict) else {}
         cfg_disk_rate = (
@@ -1437,8 +1306,6 @@ class DynamicBalancer:
                 value = 1
             return {"value": value, "min": 1, "max": value}
 
-        # disk IO section is enabled if the user has previously saved a per-app override with
-        # enabled=True, OR if the app currently exhibits high IO pressure.
         has_app_io_override = bool(
             isinstance(app_overrides, dict)
             and isinstance(app_overrides.get("disk_io"), dict)
@@ -1494,7 +1361,6 @@ class DynamicBalancer:
             "disk_io_rate": None
         }
 
-        # Validate limit_policy configuration
         if not hasattr(self.config, 'limit_policy'):
             return result
 
@@ -1503,7 +1369,6 @@ class DynamicBalancer:
 
         limit_policy_cfg = self.config.limit_policy or {}
 
-        # Handle CPU limits
         cpu_cfg = limit_policy_cfg.get('cpu', {})
         cpu_rates = cpu_cfg.get('rate', {})
         cpu_ovr = overrides.get("cpu", {}) if isinstance(overrides.get("cpu", {}), dict) else {}
@@ -1512,7 +1377,6 @@ class DynamicBalancer:
         if cpu_enabled and cpu_rate is not None:
             result['cpu_rate'] = self._clamp_rate(cpu_rate, bounds["cpu"]["min"], bounds["cpu"]["max"])
 
-        # Handle memory limits
         mem_cfg = limit_policy_cfg.get('memory', {})
         mem_rates = mem_cfg.get('rate', {})
         mem_ovr = overrides.get("memory", {}) if isinstance(overrides.get("memory", {}), dict) else {}
@@ -1521,7 +1385,6 @@ class DynamicBalancer:
         if mem_enabled and mem_rate is not None:
             result['mem_rate'] = self._clamp_rate(mem_rate, bounds["memory"]["min"], bounds["memory"]["max"])
 
-        # Handle disk IO limits
         disk_cfg = limit_policy_cfg.get('disk_io', {})
         disk_rates = disk_cfg.get('rate', {})
         default_disk_rate = disk_rates.get(priority)
@@ -1560,7 +1423,6 @@ class DynamicBalancer:
         """Set resource limits for an application (balanced policy)."""
         global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids, g_manual_limit_baseline
 
-        # Get limit rates based on priority
         priority = priority or "undefined"
         if isinstance(limit_overrides, dict):
             try:
@@ -1573,14 +1435,11 @@ class DynamicBalancer:
             logger.error(f"No limit rates defined for priority: {priority}")
             return False
 
-        # Get app resource usage data.
         usage = app_utils.get_app_resource_usage(app_id, app_name)
         if usage is None:
             logger.warning(f"No resource usage data for {app_name}, using empty defaults")
             usage = {}
 
-        # For multi-process apps usage.cgroup_paths lists every cgroup; for
-        # single-cgroup apps fall back to the single cgroup_path.
         all_cgroup_paths = usage.get("cgroup_paths") or (
             [usage["cgroup_path"]] if usage.get("cgroup_path") else []
         )
@@ -1591,7 +1450,6 @@ class DynamicBalancer:
         effective_app_id = effective_app_ids[0]   # primary (lexicographically smallest cgroup)
         extra_effective_ids = effective_app_ids[1:]
 
-        # Collect raw (unfiltered) resource values from the current sample.
         raw_cpu_percent = usage.get("cpu_percent", 0)
         mem_current = usage.get("mem_current", 0) + usage.get("mem_swap_current", 0)  # RSS + swap = true working set
         io_read_mb = usage.get("io_read_mb", 0)
@@ -1599,12 +1457,6 @@ class DynamicBalancer:
         io_read_iops = usage.get("io_read_iops", 0)
         io_write_iops = usage.get("io_write_iops", 0)
 
-        # Peak-latch: if this app was previously manually limited, compare the current
-        # sample against the stored peak and take the higher value for each resource.
-        # This prevents a second "limit" invocation from computing an even tighter cap
-        # because the first limit is still active and artificially suppresses the reading.
-        # The baseline stores raw (pre-filter) cpu_percent so comparisons remain meaningful
-        # even when the first sample was below the 10% threshold.
         baseline = g_manual_limit_baseline.get(effective_app_id, {})
         if baseline:
             raw_cpu_percent = max(raw_cpu_percent, baseline.get("cpu_percent", 0))
@@ -1618,23 +1470,13 @@ class DynamicBalancer:
                 f"Mem {usage.get('mem_current', 0) + usage.get('mem_swap_current', 0):.1f}→{mem_current:.1f} MB"
             )
 
-        # Apply CPU threshold filter once, after peak-latch is resolved.
-        # cpu_percent here is "share of all cores" (Δ / elapsed / num_cpus); a single
-        # core fully pegged on a 16-core box reads ~6.3%. A 10% gate would discard
-        # 1-core workloads entirely, so use 2% (~1/3 of one core on a 16-core box).
         cpu_usage_percent = raw_cpu_percent if raw_cpu_percent >= 2 else 0
 
-        # Keep automatic IO-pressure gating for legacy/auto paths, but if user passes
-        # disk_io overrides from UI, honor user decision directly.
         is_io_limit = self._is_io_limit_reached(io_read_mb, io_write_mb, io_read_iops, io_write_iops)
         force_user_io_limit = bool(
             isinstance(limit_overrides, dict) and isinstance(limit_overrides.get("disk_io"), dict)
         )
 
-        # Set limits based on usage and configured rates.
-        # Use max(1, int(...)) so a small but non-zero usage*rate (e.g.
-        # 6.3 * 0.05 = 0.315) doesn't floor to 0 and look like "no limit
-        # requested" — controller.adjust_resources rejects cpu_quota=0 anyway.
         cpu_quota = (max(1, int(cpu_usage_percent * limit_rates["cpu_rate"]))
                      if (limit_rates.get("cpu_rate") and cpu_usage_percent > 0) else None)
         mem_high = (max(1, int(mem_current * limit_rates["mem_rate"]))
@@ -1642,9 +1484,6 @@ class DynamicBalancer:
         io_limits = limit_rates.get("disk_io_rate", {})
         should_apply_io_limit = bool(io_limits) and (force_user_io_limit or is_io_limit)
 
-        # Quantization trace: shows whether int(usage * rate) collapsed a real
-        # usage reading to 0 (i.e. usage*rate < 1). Helps diagnose cases where
-        # cpu_usage_percent>0 but adjust_resources later rejects cpu_quota=0.
         logger.debug(
             f"[set_resource_limit] {app_name}: cpu_usage_percent={cpu_usage_percent} "
             f"* cpu_rate={limit_rates.get('cpu_rate')} -> cpu_quota={cpu_quota}; "
@@ -1653,11 +1492,6 @@ class DynamicBalancer:
             f"should_apply_io_limit={should_apply_io_limit}"
         )
 
-        # If there is nothing to limit (process undetectable or usage too low), tell
-        # the caller so it can surface a friendly message — this is NOT a failure.
-        # Returning a {"skipped": reason} dict lets the HTTP layer respond 200 with
-        # the reason as retmsg (single notification, dialog auto-closes), instead of
-        # the generic "No matching app found or failed to set resource limit" error.
         no_cpu_limit = cpu_quota is None
         no_mem_limit = mem_high is None
         no_io_limit = not should_apply_io_limit
@@ -1674,16 +1508,12 @@ class DynamicBalancer:
                      f"Memory: {mem_high if mem_high else 'No Limit'}, is_io_limit: {is_io_limit}, "
                      f"force_user_io_limit: {force_user_io_limit}, should_apply_io_limit: {should_apply_io_limit}")
 
-        # 5. Apply resource limits
         resource_limited = False
         io_limited = False
 
-        # Per-cgroup breakdown for proportional distribution (keyed by basename).
-        # Only present for multi-process apps from _get_multi_process_app_resource_usage.
-        per_cg_mem = usage.get('per_cgroup_mem', {})       # {basename: bytes}
-        per_cg_cpu_delta = usage.get('per_cgroup_cpu_delta', {})  # {basename: cpu usec delta}
+        per_cg_mem = usage.get('per_cgroup_mem', {})
+        per_cg_cpu_delta = usage.get('per_cgroup_cpu_delta', {})
 
-        # Apply peak-latch to per-cgroup breakdowns so proportional distribution uses historical peak weights.
         if baseline:
             baseline_pcg_mem = baseline.get("per_cgroup_mem", {})
             baseline_pcg_cpu = baseline.get("per_cgroup_cpu_delta", {})
@@ -1698,8 +1528,6 @@ class DynamicBalancer:
                     for cg in set(per_cg_cpu_delta) | set(baseline_pcg_cpu)
                 }
 
-        # CPU/memory limits – distribute proportionally across multi-cgroup apps so the
-        # aggregate allowed headroom equals the intended cap, not N × cap.
         if (cpu_quota is not None or mem_high is not None) and self.is_running:
             if extra_effective_ids:
                 all_ids = [effective_app_id] + extra_effective_ids
@@ -1712,8 +1540,6 @@ class DynamicBalancer:
                 )
                 if primary_ok:
                     resource_limited = True
-                    # The memory limit will affect the data of PSI, causing misjudgment of the system pressure,
-                    # and it is necessary to reduce the effect of data on psi
                     self.controlManager.set_limited_app_dominant(True)
                     logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
                 else:
@@ -1735,17 +1561,14 @@ class DynamicBalancer:
                         mem_high=mem_high
                 ):
                     resource_limited = True
-                    # The memory limit will affect the data of PSI, causing misjudgment of the system pressure,
-                    # and it is necessary to reduce the effect of data on psi
                     self.controlManager.set_limited_app_dominant(True)
                     logger.info(f"Successfully set CPU/Memory limits for {app_name} ({effective_app_id})")
                 else:
                     logger.error(f"Failed to set CPU/Memory limits for {app_name} ({effective_app_id})")
 
-        # Disk IO limits – apply to primary and all extra cgroups
         if should_apply_io_limit and io_limits and self.is_running:
             limits = {
-                "default": {  # add per-disk entries for fine-grained control
+                "default": {
                     "rbps": io_limits['read'] * 1024 ** 2,
                     "wbps": io_limits['write'] * 1024 ** 2,
                     "wiops": io_limits['write_iops'],
@@ -1760,20 +1583,16 @@ class DynamicBalancer:
             for extra_id in extra_effective_ids:
                 self.io_ctl.set_disk_io_throttle(extra_id, limits=limits)
 
-        # Manual limits go to g_limited_apps_manual and should NOT be auto-restored.
-        # Remove from g_limited_apps if it was previously auto-limited to prevent
-        # the monitoring loop from auto-restoring a manually-limited app.
         if effective_app_id in g_limited_apps:
             g_limited_apps.pop(effective_app_id, None)
             logger.info(f"Removed {app_name} from auto-limited apps (now manually limited)")
 
-        # 6. Record the limit state (as long as at least one limit succeeded)
         if resource_limited or io_limited:
             g_limited_apps_manual[effective_app_id] = (app_name, limit_rates, {
                 'cpu_mem_limited': resource_limited,
                 'io_limited': io_limited
-            }, None)  # None indicates fully limited
-            g_app_id_mapping[app_id] = effective_app_ids  # store full list for restore
+            }, None)
+            g_app_id_mapping[app_id] = effective_app_ids
             if extra_effective_ids:
                 g_extra_cgroup_ids[effective_app_id] = extra_effective_ids
             app_utils.update_app_status(app_id, "a_limited")
@@ -1783,10 +1602,6 @@ class DynamicBalancer:
                 'status': "a_limited",
                 'purpose': "app"
             }, False)
-            # Save/update the peak-latch baseline so future limit invocations use max(current, peak).
-            # Intentionally not cleared on restore so that a re-limit after restore still benefits
-            # from the historical high-water mark.  raw_cpu_percent already holds max(current, baseline)
-            # after the peak-latch block above.
             g_manual_limit_baseline[effective_app_id] = {
                 "cpu_percent": raw_cpu_percent,
                 "mem_total": mem_current,
@@ -1807,12 +1622,10 @@ class DynamicBalancer:
         """Restore resource limits for the given app_id."""
         global g_limited_apps_manual, g_app_id_mapping, g_extra_cgroup_ids
 
-        # Get the effective app ID(s) – may be a list for multi-cgroup apps
         raw = g_app_id_mapping.pop(app_id, app_id)
         effective_app_ids = raw if isinstance(raw, list) else [raw]
         effective_app_id = effective_app_ids[0]
         extra_effective_ids = effective_app_ids[1:]
-        # Also pick up any extras recorded via g_extra_cgroup_ids (e.g. from auto path)
         extra_effective_ids = extra_effective_ids or g_extra_cgroup_ids.pop(effective_app_id, [])
 
         app_name, _, limit_parts, _ = g_limited_apps_manual.pop(effective_app_id, (None, None, {}, None))
@@ -1820,7 +1633,6 @@ class DynamicBalancer:
         try:
             logger.info(f"Restoring resources for app: {app_id}, name: {app_name}")
 
-            # Restore CPU/memory – primary and all extra cgroups
             if limit_parts.get('cpu_mem_limited', False):
                 if not self.controlManager.adjust_resources(effective_app_id, "low"):
                     logger.error(f"Failed to restore CPU/Memory for {app_id} ({effective_app_id})")
@@ -1828,7 +1640,6 @@ class DynamicBalancer:
                 for extra_id in extra_effective_ids:
                     self.controlManager.adjust_resources(extra_id, "low")
 
-            # Restore IO limits – primary and all extra cgroups
             if limit_parts.get('io_limited', False):
                 if not self.io_ctl.restore_disk_io_throttle(effective_app_id):
                     logger.error(f"Failed to remove IO limits for {app_id} ({effective_app_id})")
@@ -1851,7 +1662,6 @@ class DynamicBalancer:
             logger.error(f"Failed to restore resources for {app_id}: {str(e)}")
             return False
         finally:
-            # PSI data is may not right, so we need to delay the reset of dominant status.
             time.sleep(self.config.regular_update_sys_pressure_time)
             self.controlManager.set_limited_app_dominant(False)
 

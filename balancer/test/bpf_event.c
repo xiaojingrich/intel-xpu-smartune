@@ -10,9 +10,8 @@
 
 #define COMM_LEN 32
 #define MAX_TARGET_LEN 32
-#define MAX_DYNAMIC_APPS 32  // 在BPF代码中也定义
+#define MAX_DYNAMIC_APPS 32
 
-// 定义事件结构
 struct event_t {
     u32 pid;
     char comm[COMM_LEN];
@@ -20,16 +19,14 @@ struct event_t {
     char blocked_type[16];  // "static" or "dynamic"
 };
 
-// 使用结构体定义应用名
 struct appname_t {
     char name[MAX_TARGET_LEN];
 };
 
-// 定义BPF map来存储动态黑名单
 BPF_HASH(blocked_apps, u32, struct appname_t);
 BPF_PERF_OUTPUT(events);
 
-// 初始静态黑名单
+// Static blocklist
 static const char INITIAL_TARGETS[][MAX_TARGET_LEN] = {
     "chrome", "chromium", "edge", "brave", "notepad"
 };
@@ -59,12 +56,12 @@ static inline int bpf_strstr(const char *str, const char *substr) {
         #pragma unroll
         for (int j = 0; j < MAX_TARGET_LEN; j++) {
             if (substr[j] == '\0') break;
-            if (str[i+j] == '\0' || str[i+j] != substr[j]) {  // 添加对str边界的检查
+            if (str[i+j] == '\0' || str[i+j] != substr[j]) {
                 match = 0;
                 break;
             }
         }
-        if (match && substr[0] != '\0') {  // 确保匹配的是完整子串
+        if (match && substr[0] != '\0') {
             return 1;
         }
     }
@@ -84,11 +81,10 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
         return 0;
     }
 
-    // 1. 检查静态黑名单
+    // 1. Check static blocklist
     #pragma unroll
     for (int i = 0; i < sizeof(INITIAL_TARGETS)/sizeof(INITIAL_TARGETS[0]); i++) {
         if (is_substring(fname, INITIAL_TARGETS[i])) {
-            // 创建并提交事件
             struct event_t event = {};
             u64 pid_tgid = bpf_get_current_pid_tgid();
             event.pid = pid_tgid >> 32;
@@ -104,7 +100,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
         }
     }
 
-    // 2. 检查动态黑名单
+    // 2. Check dynamic blocklist
     u32 key = 0;
     struct appname_t *val;
     int count = 0;
@@ -112,7 +108,6 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     while (count < MAX_DYNAMIC_APPS && (val = blocked_apps.lookup(&key))) {
         if (val) {
             if (bpf_strstr(fname, val->name)) {
-                // 创建并提交事件
                 struct event_t event = {};
                 u64 pid_tgid = bpf_get_current_pid_tgid();
                 event.pid = pid_tgid >> 32;

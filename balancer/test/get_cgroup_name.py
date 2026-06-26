@@ -17,7 +17,7 @@ except Exception as e:
 
 
 def _find_systemd_unit(pid):
-    """通过systemd-cgls查找进程所属的scope, service"""
+    """Find the systemd scope/service owning a process via systemd-cgls."""
     try:
         result = subprocess.run(
             ['systemd-cgls', '--no-page'],
@@ -27,20 +27,16 @@ def _find_systemd_unit(pid):
             check=True
         )
 
-        # 查找包含指定PID的行及其父unit
         lines = result.stdout.split('\n')
         for i, line in enumerate(lines):
             if f'─{pid} ' in line or f'─{pid}\n' in line:
-                # 向上查找最近的unit(scope或service)
                 for j in range(i, -1, -1):
                     line_content = lines[j]
                     if '.scope' in line_content or '.service' in line_content:
-                        # 匹配类似 "├─session-c20.scope" 或 "├─fileManage.service"
                         unit_match = re.search(r"─(.*?\.(?:scope|service))", line_content)
                         if unit_match:
                             return unit_match.group(1)
 
-                        # 如果没有匹配到，尝试更宽松的匹配
                         unit_match = re.search(r"\b([\w-]+\.(?:scope|service))\b", line_content)
                         if unit_match:
                             return unit_match.group(1)
@@ -49,13 +45,10 @@ def _find_systemd_unit(pid):
     return None
 
 def _try_match_app(process_info):
-    """尝试匹配桌面应用或systemd scope"""
-    # logger.debug(f"process_info: {process_info}")
-    # 1. 先尝试匹配桌面应用
+    """Match a process to a desktop app or systemd scope."""
     if desktop_apps:
         for app_id, app in desktop_apps.items():
             try:
-                # 检查应用的可执行文件是否匹配
                 cmd = app.get_commandline()
                 if cmd and process_info['exe'] and process_info['exe'] in cmd:
                     return {
@@ -64,7 +57,6 @@ def _try_match_app(process_info):
                         'name': app.get_display_name()
                     }
 
-                # 检查应用名称是否匹配进程名
                 if app.get_name().lower() in process_info['name'].lower():
                     return {
                         'type': 'desktop',
@@ -74,7 +66,7 @@ def _try_match_app(process_info):
             except Exception:
                 continue
 
-    # 2. 尝试通过systemd-cgls查找scope或者service
+    # Fallback: look up systemd scope/service
     unit = _find_systemd_unit(process_info['pids'][0])  # the first PID
     if unit:
         return {

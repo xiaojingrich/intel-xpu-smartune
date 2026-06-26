@@ -26,7 +26,7 @@ def test_add_workload():
 
 
 def test_get_apps():
-    """测试获取应用列表API"""
+    """Test get apps list API."""
     try:
         resp = requests.get(
             f"{BASE_URL}/app/get_apps",
@@ -37,7 +37,6 @@ def test_get_apps():
         print("Response:")
         print(json.dumps(resp.json(), indent=2))
 
-        # 验证基本响应结构
         data = resp.json()
         assert isinstance(data.get("data", []), list), "Response data should be a list"
         print("✓ Valid response structure")
@@ -46,17 +45,17 @@ def test_get_apps():
 
 
 def test_set_priority():
-    """测试设置优先级API"""
+    """Test set priority API."""
     test_cases = [
         {
-            "name": "正常设置优先级",
+            "name": "Normal priority set",
             "payload": {"app_id": "gnome-privacy-panel.desktop", "priority": 60, "cgroup": "system"},
             "expected": 60
         },
         {
-            "name": "设置不存在的应用",
+            "name": "Non-existent app",
             "payload": {"app_id": "nonexistent.app", "priority": 80, "cgroup": "user"},
-            "expected": None  # 预期会失败
+            "expected": None
         }
     ]
 
@@ -80,7 +79,7 @@ def test_set_priority():
 
 
 def test_get_priority():
-    """测试根据app_id获取优先级设置API"""
+    """Test get priority by app_id API."""
     try:
         print("\n[POST /app/get_priority_data]")
         test_app_id = "org.gnome.Calculator.desktop"
@@ -96,7 +95,6 @@ def test_get_priority():
         print("Response:")
         print(json.dumps(resp.json(), indent=2))
 
-        # 检查响应数据
         data = resp.json()
         if resp.status_code == 200:
             if data.get("data") and data["data"]["app_id"] == test_app_id:
@@ -113,7 +111,7 @@ def test_get_priority():
 
 
 def test_set_control():
-    """测试设置应用管控API"""
+    """Test set app control API."""
     test_cases = [
         {
             "name": "Firefox",
@@ -156,11 +154,11 @@ def test_set_control():
             print("Response:")
             print(json.dumps(resp.json(), indent=2))
         except Exception as e:
-            print(f"测试失败: {str(e)}")
+            print(f"Test failed: {str(e)}")
 
 
 def test_submit_task():
-    """测试提交任务"""
+    """Test submit task API."""
     try:
         print("\n[POST /submit_task] Submitting task...")
         resp = requests.post(
@@ -174,7 +172,7 @@ def test_submit_task():
         print("Response:", resp.json())
 
     except Exception as e:
-        print(f"测试失败: {str(e)}")
+        print(f"Test failed: {str(e)}")
 
 
 if __name__ == "__main__":
@@ -183,4 +181,4 @@ if __name__ == "__main__":
     # test_set_priority()
     # test_get_priority()
     # test_set_control()
-    test_submit_task()  # 测试任务提交
+    test_submit_task()

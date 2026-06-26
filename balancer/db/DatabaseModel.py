@@ -3,7 +3,19 @@
 
 import os
 import json
-from peewee import *
+from peewee import (
+    AutoField,
+    BigIntegerField,
+    BooleanField,
+    CharField,
+    DateTimeField,
+    IntegerField,
+    IntegrityError,
+    Model,
+    OperationalError,
+    SqliteDatabase,
+    TextField,
+)
 from threading import Lock
 import time
 from datetime import datetime
