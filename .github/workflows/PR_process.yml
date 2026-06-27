@@ -7,7 +7,7 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 env:
-  COV_HOME: "/home/jianfeng/cov-analysis-linux64-2025.3.0"
+  COV_HOME: "/home/tingjiec/cov-analysis-linux64-2025.3.0"
 
 jobs:
   trivy-analysis:
@@ -78,10 +78,10 @@ jobs:
       - name: Run Bandit Scan
         shell: bash
         run: |
-          source /home/jianfeng/workspace/myvenv/bin/activate
+          source /home/tingjiec/myvenv/bin/activate
 
           bandit -r . \
-            -c /home/jianfeng/workspace/ipas_default.config \
+            -c /home/tingjiec/ipas_default.config \
             -f txt | tee bandit_report.txt
 
       - name: Update GitHub Job Summary
