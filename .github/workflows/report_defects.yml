@@ -52,6 +52,7 @@ jobs:
       - name: Coverity Capture & Analyze (C)
         run: |
           unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+          chmod +x ./coverity_build/build_ebpf.sh
           $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c | tee c_analysis_log.txt
           $COV_HOME/bin/cov-commit-defects --dir ./cov-int-c --stream "Stream_2" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
