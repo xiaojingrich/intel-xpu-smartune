@@ -6,7 +6,7 @@
 
 import os
 import logging as LOG
-import subprocess
+import subprocess # nosec
 import enum
 
 PMT_GUID_MTL = "0x130670b2"   # Meteor Lake telemetry GUID

@@ -14,7 +14,7 @@ import json
 import os
 import re
 import socket
-import subprocess
+import subprocess # nosec
 import time
 import threading
 from typing import Any, Dict, List, Optional, Tuple

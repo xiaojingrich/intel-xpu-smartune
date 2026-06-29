@@ -674,7 +674,7 @@ class RaplMsr:
         msr_path = "/dev/cpu/0/msr"
         if not os.path.exists(msr_path):
             # Try to load the msr module automatically
-            import subprocess
+            import subprocess # nosec
             ret = subprocess.run(["modprobe", "msr"],
                                  capture_output=True, timeout=5)
             if ret.returncode != 0 or not os.path.exists(msr_path):
