@@ -2513,7 +2513,7 @@ export default function SystemOverview({ active }: Props) {
         const txMbps = toMbps(fallbackTx)
         updates['bw:network:rx_mbps'] = rxMbps
         updates['bw:network:tx_mbps'] = txMbps
-        const staticPeakMbps = isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
+        const staticPeakMbps = isNumber(staticInfo?.io?.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
           ? staticInfo.io.network_peak_mbps : null
         const rxUtil = isNumber(rxMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(rxMbps / staticPeakMbps * 100, 100) : null
         const txUtil = isNumber(txMbps) && isNumber(staticPeakMbps) && staticPeakMbps > 0 ? Math.min(txMbps / staticPeakMbps * 100, 100) : null
@@ -2724,9 +2724,9 @@ export default function SystemOverview({ active }: Props) {
     return parts.length ? parts.join(' / ') : overall
   }, [staticInfo?.cpu.freq_mhz])
 
-  const cpuSnapshotMeta = staticInfo?.cpu.model_name
-    ? `${staticInfo.cpu.core_count.logical} cores | ${cpuFreqRangeMeta} | ${staticInfo.cpu.model_name}`
-    : dynamicInfo?.cpu.per_core_usage?.length
+  const cpuSnapshotMeta = staticInfo?.cpu?.model_name
+    ? `${staticInfo.cpu.core_count?.logical ?? 0} cores | ${cpuFreqRangeMeta} | ${staticInfo.cpu.model_name}`
+    : dynamicInfo?.cpu?.per_core_usage?.length
       ? `${dynamicInfo.cpu.per_core_usage.length} cores`
       : 'No data'
 
@@ -2744,12 +2744,12 @@ export default function SystemOverview({ active }: Props) {
       const configuredSpeed = firstDev?.configured_speed
       const speedStr = (configuredSpeed && configuredSpeed !== 'Unknown')
         ? configuredSpeed
-        : (staticInfo.memory.ddr_speeds.length ? staticInfo.memory.ddr_speeds.join('/') : null)
+        : (staticInfo.memory.ddr_speeds?.length ? staticInfo.memory.ddr_speeds.join('/') : null)
       if (speedStr) parts.push(speedStr)
       else if (!memTypes.length) parts.push('DDR N/A')
       return parts.join(' | ')
     }
-    return isNumber(dynamicInfo?.memory.total_gb)
+    return isNumber(dynamicInfo?.memory?.total_gb)
       ? `${dynamicInfo.memory.total_gb.toFixed(1)} GB total`
       : 'No data'
   }, [staticInfo?.memory, dynamicInfo?.memory.total_gb])
@@ -2775,7 +2775,7 @@ export default function SystemOverview({ active }: Props) {
   }, [validNics, dynamicInfo])
 
   // Fallback for when no valid NICs exist (keep legacy single-card behavior)
-  const primaryInterfaceName = typeof staticInfo?.io.primary_interface === 'string'
+  const primaryInterfaceName = typeof staticInfo?.io?.primary_interface === 'string'
     ? staticInfo.io.primary_interface
     : null
   const fallbackNetworkRates = primaryInterfaceName && dynamicInfo?.network?.interfaces?.[primaryInterfaceName]
@@ -2786,7 +2786,7 @@ export default function SystemOverview({ active }: Props) {
   // Use static peak bandwidth for fallback utilization
   const fbRxMbps = toMbps(fallbackRxRate)
   const fbTxMbps = toMbps(fallbackTxRate)
-  const fbStaticPeakMbps = isNumber(staticInfo?.io.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
+  const fbStaticPeakMbps = isNumber(staticInfo?.io?.network_peak_mbps) && staticInfo.io.network_peak_mbps > 0
     ? staticInfo.io.network_peak_mbps : null
   const fallbackRxUtil = isNumber(fbRxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbRxMbps / fbStaticPeakMbps * 100, 100) : null
   const fallbackTxUtil = isNumber(fbTxMbps) && isNumber(fbStaticPeakMbps) && fbStaticPeakMbps > 0 ? Math.min(fbTxMbps / fbStaticPeakMbps * 100, 100) : null
@@ -2801,14 +2801,14 @@ export default function SystemOverview({ active }: Props) {
 
   const npuSnapshotMeta = (() => {
     const parts: string[] = []
-    if (staticInfo?.npu.pciid) parts.push(`[${staticInfo.npu.pciid}]`)
-    const freqEntries = Object.values(staticInfo?.npu.freq_bounds_mhz || {})
+    if (staticInfo?.npu?.pciid) parts.push(`[${staticInfo.npu.pciid}]`)
+    const freqEntries = Object.values(staticInfo?.npu?.freq_bounds_mhz || {})
     const maxFreq = freqEntries.length ? freqEntries[0]?.max_mhz : null
     if (isNumber(maxFreq)) parts.push(`Freq ${Math.round(maxFreq)} MHz`)
     if (parts.length) return parts.join(' | ')
-    return staticInfo?.npu.names?.length
+    return staticInfo?.npu?.names?.length
       ? staticInfo.npu.names.join(', ')
-      : dynamicInfo?.npu.npu_smi.error || 'npu-smi'
+      : dynamicInfo?.npu?.npu_smi?.error || 'npu-smi'
   })()
 
   const gpuSnapshotMeta = gpuDevices.length
@@ -2818,9 +2818,9 @@ export default function SystemOverview({ active }: Props) {
         if (d.pcieLink.current_speed) parts.push(`PCIe ${formatPcieLink(d.pcieLink.current_speed, d.pcieLink.current_width, d.pcieLink.max_speed, d.pcieLink.max_width)}`)
         return parts.join(' ')
       }).join(' | ')
-      + (staticInfo?.gpu.names.length ? ` | ${staticInfo.gpu.names.join(' / ')}` : '')
+      + (staticInfo?.gpu?.names?.length ? ` | ${staticInfo.gpu.names.join(' / ')}` : '')
     : (staticInfo?.gpu
-        ? `${staticInfo.gpu.count} GPU | ${staticInfo.gpu.names.join(' / ') || 'Unknown'}`
+        ? `${staticInfo.gpu.count ?? 0} GPU | ${staticInfo.gpu.names?.join(' / ') || 'Unknown'}`
         : 'No data')
 
   const diskDevices: [string, DiskDeviceData][] = dynamicInfo?.disk?.disk_io ? Object.entries(dynamicInfo.disk.disk_io) : []
@@ -2948,9 +2948,9 @@ export default function SystemOverview({ active }: Props) {
   }, [staticInfo?.disk.devices])
 
   const diskSnapshotMeta = busiestDisk?.[0]
-    ? `${busiestDisk[0]} | Total ${diskStaticTotalText} | ${staticInfo?.disk.device_count ?? '?'} device(s)`
+    ? `${busiestDisk[0]} | Total ${diskStaticTotalText} | ${staticInfo?.disk?.device_count ?? '?'} device(s)`
     : staticInfo?.disk
-      ? `Total ${diskStaticTotalText} | ${staticInfo.disk.device_count} device(s)`
+      ? `Total ${diskStaticTotalText} | ${staticInfo.disk.device_count ?? '?'} device(s)`
       : 'No static data'
 
   const gpuFilterOptions = useMemo(() => {
@@ -3247,7 +3247,7 @@ export default function SystemOverview({ active }: Props) {
                 ? `Peak BW: ${formatNetworkSpeed(networkNicCards[0].bandwidth)}`
                 : staticInfo?.io
                   ? [
-                      `NIC ${formatPlain(staticInfo.io.nic_count)}`,
+                      `NIC ${formatPlain(staticInfo.io.nic_count ?? 0)}`,
                       staticInfo.io.network_speeds_mbps ? summarizeNetworkSpeeds(staticInfo.io.network_speeds_mbps) : null,
                     ].filter(Boolean).join(' | ')
                   : 'No data'
