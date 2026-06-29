@@ -7,7 +7,8 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 env:
-  COV_HOME: "/home/tingjiec/cov-analysis-linux64-2025.3.0"
+  COV_USER_HOME: ${{ vars.COV_USER_HOME }}
+  COV_HOME: "${{ vars.COV_USER_HOME }}/cov-analysis-linux64-2025.3.0"
 
 jobs:
   trivy-analysis:
@@ -78,10 +79,10 @@ jobs:
       - name: Run Bandit Scan
         shell: bash
         run: |
-          source /home/tingjiec/myvenv/bin/activate
+          source ${{ vars.COV_USER_HOME }}/myvenv/bin/activate
 
           bandit -r . \
-            -c /home/tingjiec/ipas_default.config \
+            -c $GITHUB_WORKSPACE/.github/static_check/ipas_default.config \
             -f txt | tee bandit_report.txt
 
       - name: Update GitHub Job Summary
@@ -126,8 +127,8 @@ jobs:
 
       - name: Coverity Capture & Analyze (C)
         run: |
+          chmod +x ./coverity_build/build_ebpf.sh
           $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
-
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c
 
       - name: Format Errors to Text
@@ -156,7 +157,7 @@ jobs:
 
           echo "### Coverity report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 扫描类型 | 发现问题数 | 状态 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan Type | Issues Found | Status |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :---: | :---: |" >> $GITHUB_STEP_SUMMARY
 
           PY_STATUS=$([ "$PY_ISSUES" -eq "0" ] && echo "✅ Clean" || echo "⚠️ Action Required")
@@ -164,12 +165,12 @@ jobs:
 
           C_STATUS=$([ "$C_ISSUES" -eq "0" ] && echo "✅ Clean" || echo "⚠️ Action Required")
           echo "| C (cov-build) | $C_ISSUES | $C_STATUS |" >> $GITHUB_STEP_SUMMARY
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**总计发现问题:** $TOTAL" >> $GITHUB_STEP_SUMMARY
+          echo "**Total issues found:** $TOTAL" >> $GITHUB_STEP_SUMMARY
 
           if [ "$TOTAL" -gt "0" ]; then
-            echo "<details><summary>点击查看错误详情详情 (Top 10)</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Click to view details (Top 10)</summary>" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo '```text' >> $GITHUB_STEP_SUMMARY
             head -n 10 full_project_scan_results_python.txt >> $GITHUB_STEP_SUMMARY

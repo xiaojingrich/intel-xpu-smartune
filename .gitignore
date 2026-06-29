@@ -6,3 +6,15 @@
 
 *.pyc
 __pycache__/
+
+# SSL certificates
+balancer/b_server.crt
+balancer/b_server.key
+
+# Database files
+balancer/my_database.db-shm
+balancer/my_database.db-wal
+my_database.db
+
+# Logs
+logs/

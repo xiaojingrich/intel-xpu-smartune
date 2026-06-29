@@ -565,37 +565,7 @@ class SystemPressureMonitor:
 
 @monitor_bp.route('/app_resource_stats', methods=['GET'])
 def get_app_resource_stats():
-    """
-    Return per-application CPU/memory resource usage for the App Resources dashboard tab.
-
-    Unlike /top_consumers (which returns only the top-1 process and applies system-pressure
-    threshold filtering), this endpoint returns the top N applications by combined CPU/memory
-    score without any threshold gate, making it suitable for general resource display.
-
-    Query params:
-        n (int, optional): Number of top apps to return. Default: 10.
-
-    Response data:
-        {
-            "apps": [
-                {
-                    "app_id": <str>,
-                    "app_name": <str>,
-                    "pid": <int>,
-                    "process_name": <str>,
-                    "cmdline": <str>,
-                    "cpu_usage": <float>,      # fraction of total CPU capacity (0-1)
-                    "memory_mb": <float>,      # resident memory in MB
-                    "io_read_rate": <float>,   # disk read rate in MB/s
-                    "io_write_rate": <float>,  # disk write rate in MB/s
-                    "score": <float>,
-                    "gpu_util": <float>,       # peak GPU engine utilisation % (0-100); 0 when GPU not in use
-                    "gpu_mem_mb": <float>      # GPU memory used in MB (drm-memory-* from /proc fdinfo)
-                },
-                ...
-            ]
-        }
-    """
+    """Return per-application CPU/memory/GPU resource usage (top N by score)."""
     try:
         # logger.debug(f"[poll-debug] app_resource_stats START client={request.remote_addr}")
         _start_app_stats_auto_refresh()
@@ -632,33 +602,7 @@ def get_app_resource_stats():
 
 @monitor_bp.route('/app_disk_io_stats', methods=['GET'])
 def get_app_disk_io_stats():
-    """
-    Return per-application disk I/O usage for the App Resources dashboard tab.
-
-    Unlike /top_disk_io_consumers (which returns only the top-1 process), this endpoint
-    returns the top N applications by disk I/O score, suitable for general display.
-
-    Query params:
-        n (int, optional): Number of top apps to return. Default: 10.
-
-    Response data:
-        {
-            "apps": [
-                {
-                    "pid": <int>,
-                    "name": <str>,          # dominant process name (highest IO contributor in cgroup)
-                    "app_name": <str>,      # human-readable app/cgroup name
-                    "cmdline": <str>,
-                    "io_read_rate": <float>,    # read throughput in MB/s
-                    "io_write_rate": <float>,   # write throughput in MB/s
-                    "io_read_iops": <float>,    # read operations per second
-                    "io_write_iops": <float>,   # write operations per second
-                    "score": <float>
-                },
-                ...
-            ]
-        }
-    """
+    """Return per-application disk I/O usage (top N by score)."""
     try:
         _start_app_stats_auto_refresh()
         n = int(request.args.get('n', 10))
@@ -690,27 +634,7 @@ def get_app_disk_io_stats():
 
 @monitor_bp.route('/processes', methods=['GET'])
 def get_processes():
-    """
-    Return a list of all running processes sorted by CPU usage, similar to the top command.
-
-    Response data:
-        {
-            "count": <int>,
-            "processes": [
-                {
-                    "pid": <int>,
-                    "name": <str>,
-                    "username": <str>,
-                    "cpu_percent": <float>,    # CPU usage percent
-                    "memory_percent": <float>, # memory usage percent
-                    "mem_rss_kb": <float>,     # resident set size in KB
-                    "status": <str>,           # process status (running/sleeping/...)
-                    "cmdline": <str>           # full command line
-                },
-                ...
-            ]
-        }
-    """
+    """Return all running processes sorted by CPU usage."""
     try:
         procs = []
         attrs = ['pid', 'name', 'username', 'cpu_percent', 'memory_percent',
@@ -749,22 +673,7 @@ def get_processes():
 
 @monitor_bp.route('/static_info', methods=['GET'])
 def get_static_info():
-    """
-    Return static system configuration info.
-
-    Response data:
-        {
-            "bios": { ... },
-            "os": { ... },
-            "driver": { ... },
-            "cpu": { ... },
-            "memory": { ... },
-            "io": { ... },
-            "gpu": { ... },
-            "npu": { ... },
-            "collected_at": <str>
-        }
-    """
+    """Return static system configuration info (hardware, OS, drivers)."""
     try:
         force_raw = (request.args.get('force_refresh') or '').strip().lower()
         force_refresh = force_raw in {'1', 'true', 'yes', 'y', 'on'}
@@ -784,26 +693,7 @@ def get_static_info():
 
 @monitor_bp.route('/dynamic_info', methods=['GET'])
 def get_dynamic_info():
-    """
-    Return dynamic system metrics snapshot.
-
-    The background auto-refresh thread keeps the cache up to date so this
-    endpoint responds immediately without blocking on metric collection.  On
-    the very first request (before the cache is populated) it falls back to
-    collecting synchronously.
-
-    Response data:
-        {
-            "cpu": { ... },
-            "memory": { ... },
-            "pressure": { ... },
-            "network": { ... },
-            "disk": { ... },
-            "gpu": { ... },
-            "npu": { ... },
-            "collected_at": <str>
-        }
-    """
+    """Return dynamic system metrics snapshot (background-cached)."""
     _start_dynamic_info_auto_refresh()
 
     with _DYNAMIC_INFO_CACHE_LOCK:
@@ -972,17 +862,7 @@ def get_history():
 
 @monitor_bp.route('/history/retention', methods=['GET'])
 def get_history_retention():
-    """Return the current MonitorSnapshot retention period and allowed options.
-
-    Response data:
-        {
-            "retention_days": <int>,        // current setting (1-7)
-            "default_days": <int>,          // built-in default (3)
-            "min_days": <int>,              // minimum allowed (1)
-            "max_days": <int>,              // maximum allowed (7)
-            "updated_at": <int>             // unix seconds; 0 if never written via API
-        }
-    """
+    """Return the current MonitorSnapshot retention period and allowed options."""
     _start_snapshot_cleanup_task()
     return construct_response(
         data={
@@ -998,32 +878,7 @@ def get_history_retention():
 
 @monitor_bp.route('/history/retention', methods=['POST'])
 def set_history_retention():
-    """Update the MonitorSnapshot retention period and optionally trigger an immediate cleanup.
-
-    Request body:
-        {
-            "retention_days": <int>,                // required, 1-7
-            "expected_updated_at": <int> (optional) // unix ts from prior GET
-        }
-
-    Optimistic concurrency: see /config/weights_top — same scheme, mismatch
-    is reported with ``RetCode.CONFLICT`` and a ``current`` payload.
-
-    Response (success):
-        {
-            "retention_days": <int>,
-            "deleted": <int>,         // rows deleted by the immediate cleanup sweep
-            "updated_at": <int>
-        }
-    Response (409 conflict):
-        {
-            "current": {
-                "retention_days": <int>,
-                "updated_at": <int>,
-                ...
-            }
-        }
-    """
+    """Update the MonitorSnapshot retention period with optimistic concurrency."""
     try:
         body = request.get_json(silent=True) or {}
         days_raw = body.get('retention_days')
@@ -1116,17 +971,7 @@ def set_history_retention():
 
 @monitor_bp.route('/config/weights_top', methods=['GET'])
 def get_weights_top():
-    """Get current weights_top configuration.
-
-    Response:
-        {
-            "cpu": int,
-            "memory": int,
-            "io": int,
-            "gpu": int,
-            "updated_at": int        // unix seconds; 0 if never written via API
-        }
-    """
+    """Get current weights_top configuration."""
     try:
         from config.config import b_config
         weights = dict(b_config.weights_top or {})
@@ -1146,38 +991,7 @@ def get_weights_top():
 
 @monitor_bp.route('/config/weights_top', methods=['POST'])
 def update_weights_top():
-    """Update weights_top configuration.
-
-    Request body:
-        {
-            "cpu": int (optional),
-            "memory": int (optional),
-            "gpu": int (optional),
-            "expected_updated_at": int (optional)   // unix ts from prior GET
-        }
-
-    Optimistic concurrency: when ``expected_updated_at`` is provided, it must
-    match the server's current updated_at; otherwise the request is rejected
-    with ``RetCode.CONFLICT`` and the response payload includes the latest
-    state so the client can prompt the user to reload.  Omitting the field
-    is allowed only when the server side has never been written through this
-    API (i.e. updated_at == 0), so first-time saves still work.
-
-    Note: I/O weight is not configurable via this API as Disk I/O ranking
-    uses pure throughput (MB/s) without weight adjustment.
-
-    Response (success):
-        {
-            "success": bool,
-            "updated_weights": dict,
-            "updated_at": int
-        }
-    Response (409 conflict):
-        {
-            "success": false,
-            "current": dict,        // latest weights including updated_at
-        }
-    """
+    """Update weights_top configuration with optimistic concurrency."""
     try:
         from config.config import b_config
 
@@ -1289,18 +1103,7 @@ def update_weights_top():
 
 @monitor_bp.route('/config/passive_control', methods=['GET'])
 def get_passive_control():
-    """Get the current passive resource-control switch state.
-
-    When ``enabled`` is False the balancer's _run_monitor_resource_loop skips
-    its pressure-driven auto-limit/auto-restore work; the network controller
-    and manual per-app limits remain active.
-
-    Response:
-        {
-            "enabled": bool,
-            "updated_at": int        // unix seconds; 0 if never written via API
-        }
-    """
+    """Get the current passive resource-control switch state."""
     try:
         from config.config import b_config
         prc = dict(b_config.passive_resource_control or {})
@@ -1322,30 +1125,7 @@ def get_passive_control():
 
 @monitor_bp.route('/config/passive_control', methods=['POST'])
 def update_passive_control():
-    """Toggle the passive resource-control switch.
-
-    Request body:
-        {
-            "enabled": bool,                          // required
-            "expected_updated_at": int (optional)     // unix ts from prior GET
-        }
-
-    Optimistic concurrency follows the same scheme as /config/weights_top:
-    if the server's updated_at has moved on, the request is rejected with
-    ``RetCode.CONFLICT`` and the latest state.
-
-    Response (success):
-        {
-            "success": true,
-            "enabled": bool,
-            "updated_at": int
-        }
-    Response (409 conflict):
-        {
-            "success": false,
-            "current": { "enabled": bool, "updated_at": int }
-        }
-    """
+    """Toggle the passive resource-control switch with optimistic concurrency."""
     try:
         from config.config import b_config
 

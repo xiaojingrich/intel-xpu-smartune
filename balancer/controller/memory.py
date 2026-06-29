@@ -35,7 +35,7 @@ class MemoryController(ControllerBase):
                 return True
             logger.info(f"Failed to set ManagedOOMMemoryPressure: {result.stderr.strip()}")
             return False
-        except:
+        except Exception:
             logger.error("Exception occurred while setting ManagedOOMMemoryPressure")
             return False
 

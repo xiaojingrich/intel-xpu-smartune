@@ -57,7 +57,11 @@ All endpoints return a standardized JSON structure:
 | App | `/app/set_priority` | POST | Set app priority | OOM score auto-adjustment |
 | App | `/app/get_priority_data` | POST | Get priority info | Query by app_id or name |
 | App | `/app/set_to_control` | POST | Enable app control | Register with BPF monitor |
-| App | `/app/remove_from_control` | POST | Remove from control | Unregister, restore OOM |
+| App | `/app/discover_search` | POST | Wizard: search processes | Keyword-based /proc scan |
+| App | `/app/discover_extract` | POST | Wizard: extract fields | Derive bpf_name/id from PIDs |
+| App | `/app/new_controlled_app` | POST | Wizard: register new app | Config + DB + BPF in one step |
+| App | `/app/purge_controlled_app` | POST | Hard-delete app | Removes config + DB + BPF |
+| App | `/app/remove_from_control` | POST | Soft-remove from control | Flips controlled=false |
 | App | `/app/get_controlled_app` | POST | List controlled apps | Full metadata, status |
 | App | `/app/check_running_apps` | POST | Scan running processes | Detect pre-existing apps |
 | App | `/app/get_pending_app` | POST | List pending apps | Sorted by priority DESC |
@@ -289,9 +293,169 @@ Or query by name:
 
 ---
 
+#### POST /app/discover_search
+
+**Purpose:** Wizard step — scan `/proc` for processes matching user-provided keywords so the UI can display candidate processes for the user to select.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | keywords | Yes | string[] | List of keywords to match against process names/cmdlines |
+
+**Request Example:**
+```json
+{
+  "keywords": ["helicon", "vlm"]
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Found 5 candidate(s) for keywords ['helicon', 'vlm']",
+  "data": {
+    "count": 5,
+    "candidates": [
+      {
+        "pid": 12345,
+        "comm": "HeliconSearch_a",
+        "exe": "/usr/local/heliconsearch/HeliconSearch_agent",
+        "cmdline": "/usr/local/heliconsearch/HeliconSearch_agent --mode=gpu",
+        "cgroup_unit": "heliconsearch.service"
+      }
+    ]
+  }
+}
+```
+
+---
+
+#### POST /app/discover_extract
+
+**Purpose:** Wizard step — read `/proc/<pid>` for user-selected PIDs and return aggregated fields (bpf_name, process_names, commandline, id suggestion) the wizard needs to auto-fill the registration form.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | pids | Yes | int[] | List of process IDs selected by the user |
+| Body | name | No | string | Display name (used to derive a default `id` slug) |
+
+**Request Example:**
+```json
+{
+  "pids": [12345, 12346],
+  "name": "heliconSearch"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Extracted fields from 2 pid(s)",
+  "data": {
+    "bpf_name": ["HeliconSearch_a", "VLMService"],
+    "process_names": ["HeliconSearch_agent", "VLMService"],
+    "commandline": "/usr/local/heliconsearch/HeliconSearch_agent",
+    "id_suggestion": "heliconsearch.service"
+  }
+}
+```
+
+---
+
+#### POST /app/new_controlled_app
+
+**Purpose:** Final wizard step — register a brand-new managed application. Persists to config.yaml, inserts a DB record, and rebuilds the BPF match cache so monitoring starts immediately without a restart.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | name | Yes | string | Display name |
+| Body | id | Yes | string | Unique identifier (DB primary key, systemd match) |
+| Body | priority | No | string | `"low"` / `"medium"` / `"high"` / `"critical"` (default: `"low"`) |
+| Body | commandline | No | string | argv[0] of the main process |
+| Body | bpf_name | No | string[] | Executable names for BPF execve watch |
+| Body | process_names | No | string[] | Process names for explicit lookup |
+| Body | remark | No | string | User-defined note |
+
+**Request Example:**
+```json
+{
+  "name": "heliconSearch",
+  "id": "heliconsearch.service",
+  "priority": "high",
+  "commandline": "/usr/local/heliconsearch/HeliconSearch_agent",
+  "bpf_name": ["HeliconSearch_a", "VLMService"],
+  "process_names": ["HeliconSearch_agent", "VLMService"]
+}
+```
+
+**Response (Success):**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Application 'heliconSearch' added",
+  "data": {
+    "name": "heliconSearch",
+    "id": "heliconsearch.service"
+  }
+}
+```
+
+**Response (409 Conflict — duplicate id, name, or overlapping processes):**
+```json
+{
+  "retcode": 409,
+  "retmsg": "An app with id 'heliconsearch.service' already exists. ...",
+  "data": {
+    "conflict": "id",
+    "with": "heliconSearch",
+    "with_id": "heliconsearch.service"
+  }
+}
+```
+
+---
+
+#### POST /app/purge_controlled_app
+
+**Purpose:** Hard-delete an application from BOTH config.yaml and the DB. Unlike `/app/remove_from_control` (which only flips `controlled=false`), this completely wipes the entry: removes config, deletes the DB row, restores OOM score, and refreshes the BPF cache. Used when the user wants to re-add an app whose process_names overlap with an existing entry.
+
+**Request:**
+
+| Type | Parameter | Required | Format | Description |
+|------|-----------|----------|--------|-------------|
+| Body | id | Yes | string | Application identifier to purge |
+
+**Request Example:**
+```json
+{
+  "id": "heliconsearch.service"
+}
+```
+
+**Response:**
+```json
+{
+  "retcode": 0,
+  "retmsg": "Application 'heliconSearch' purged; you can now re-add it",
+  "data": {
+    "id": "heliconsearch.service",
+    "name": "heliconSearch"
+  }
+}
+```
+
+---
+
 #### POST /app/remove_from_control
 
-**Purpose:** Remove an application from the control list and restore its OOM score.
+**Purpose:** Soft-remove an application from the control list (flips `controlled=false`) and restore its OOM score. The app remains in config so it can be re-enabled from the dropdown without reconfiguration.
 
 **Request:**
 

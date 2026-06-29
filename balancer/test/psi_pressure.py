@@ -6,21 +6,21 @@ import select
 
 class PSIEventMonitor:
     CPU_PRESSURE_FILE = "/proc/pressure/cpu"
-    MEMORY_PRESSURE_FILE = "/proc/pressure/memory"  # 新增
+    MEMORY_PRESSURE_FILE = "/proc/pressure/memory"
     IO_PRESSURE_FILE = "/proc/pressure/io"
     CPU_TRIGGER_THRESHOLD_MS = 100  # 100ms
-    MEMORY_TRIGGER_THRESHOLD_MS = 100  # 新增 100ms
+    MEMORY_TRIGGER_THRESHOLD_MS = 100
     IO_TRIGGER_THRESHOLD_MS = 100   # 100ms
-    TRACKING_WINDOW_SECS = 1        # 1秒窗口
+    TRACKING_WINDOW_SECS = 1
 
     def __init__(self):
         self.fds = {}
         self.cpu_event_count = 0
-        self.memory_event_count = 0  # 新增
+        self.memory_event_count = 0
         self.io_event_count = 0
 
     def _setup_trigger(self, fd, threshold_ms, window_secs):
-        """设置触发条件并验证"""
+        """Configure PSI trigger and verify."""
         trigger = f"some {threshold_ms * 1000} {window_secs * 1000000}\n"
         os.write(fd, trigger.encode())
         os.lseek(fd, 0, os.SEEK_SET)
@@ -28,16 +28,16 @@ class PSIEventMonitor:
         print(f"Set trigger: {trigger.strip()} | Current: {current_trigger.strip()}")
 
     def setup_polling(self):
-        """初始化文件描述符和触发器"""
+        """Initialize file descriptors and triggers."""
         try:
             print("Opening PSI files...")
             self.fds['cpu'] = os.open(self.CPU_PRESSURE_FILE, os.O_RDWR | os.O_NONBLOCK)
-            self.fds['memory'] = os.open(self.MEMORY_PRESSURE_FILE, os.O_RDWR | os.O_NONBLOCK)  # 新增
+            self.fds['memory'] = os.open(self.MEMORY_PRESSURE_FILE, os.O_RDWR | os.O_NONBLOCK)
             self.fds['io'] = os.open(self.IO_PRESSURE_FILE, os.O_RDWR | os.O_NONBLOCK)
-            print(f"FDs: CPU={self.fds['cpu']}, Memory={self.fds['memory']}, IO={self.fds['io']}")  # 修改
+            print(f"FDs: CPU={self.fds['cpu']}, Memory={self.fds['memory']}, IO={self.fds['io']}")
 
             self._setup_trigger(self.fds['cpu'], self.CPU_TRIGGER_THRESHOLD_MS, self.TRACKING_WINDOW_SECS)
-            self._setup_trigger(self.fds['memory'], self.MEMORY_TRIGGER_THRESHOLD_MS, self.TRACKING_WINDOW_SECS)  # 新增
+            self._setup_trigger(self.fds['memory'], self.MEMORY_TRIGGER_THRESHOLD_MS, self.TRACKING_WINDOW_SECS)
             self._setup_trigger(self.fds['io'], self.IO_TRIGGER_THRESHOLD_MS, self.TRACKING_WINDOW_SECS)
         except Exception as e:
             print(f"Setup failed: {e}")
@@ -45,7 +45,7 @@ class PSIEventMonitor:
             raise
 
     def wait_for_events(self):
-        """监听并处理事件"""
+        """Listen for and handle PSI events."""
         poller = select.poll()
         for fd in self.fds.values():
             poller.register(fd, select.POLLPRI)
@@ -62,7 +62,7 @@ class PSIEventMonitor:
                     if fd == self.fds['cpu']:
                         self.cpu_event_count += 1
                         print(f"CPU PSI event {self.cpu_event_count}")
-                    elif fd == self.fds['memory']:  # 新增
+                    elif fd == self.fds['memory']:
                         self.memory_event_count += 1
                         print(f"Memory PSI event {self.memory_event_count}")
                     elif fd == self.fds['io']:
@@ -75,7 +75,7 @@ class PSIEventMonitor:
                 break
 
     def cleanup(self):
-        """清理资源"""
+        """Clean up file descriptors."""
         for fd in self.fds.values():
             os.close(fd)
         print("Resources cleaned up.")

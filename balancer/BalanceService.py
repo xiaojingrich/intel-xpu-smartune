@@ -57,9 +57,6 @@ class DynamicService:
     def start(self):
         self.balancer.start()
 
-    def add_workload(self, priority, payload):
-        """Delegate directly to the balancer."""
-        self.balancer.add_workload(priority, payload)
 
     def cancel_relaunch(self, app_id):
         return self.balancer.cancel_relaunch_by_app_id(app_id)
@@ -187,27 +184,6 @@ def login():
             retmsg=str(e)
         )
 
-
-@app.route('/task/add_workload', methods=['POST'])
-def add_workload():
-    """Add a workload with the given priority."""
-    try:
-        data = request.json
-        _service.add_workload(
-            priority=data['priority'],
-            payload=data['payload']
-        )
-        return construct_response(
-            retmsg="Workload added successfully",
-            data={"status": "success"}
-        )
-    except Exception as e:
-        logger.error(f"API error: {str(e)}")
-        return construct_response(
-            data={},
-            retcode=RetCode.ARGUMENT_ERROR,
-            retmsg=f"Invalid request: {str(e)}"
-        )
 
 
 @app.route('/app/get_apps', methods=['GET', 'POST'])
@@ -449,13 +425,7 @@ def set_to_control():
 
 @app.route('/app/discover_search', methods=['POST'])
 def discover_search():
-    """Wizard step 2: scan /proc for processes matching user-provided keywords.
-
-    Body: { "keywords": ["helicon", "vlm"] }
-    Returns the candidate list with pid / comm / exe / cmdline / cgroup_unit
-    so the UI can let the user multi-select the processes that belong to
-    the application being added.
-    """
+    """Wizard: scan /proc for processes matching user-provided keywords."""
     try:
         from monitor import app_discovery
 
@@ -490,15 +460,7 @@ def discover_search():
 
 @app.route('/app/discover_extract', methods=['POST'])
 def discover_extract():
-    """Wizard step 3: read /proc/<pid> for the user-selected PIDs and return
-    the aggregated bpf_name / process_names / commandline / id_suggestion
-    fields the wizard would otherwise force the user to type.
-
-    Body: { "pids": [...], "name": "<display name>" }
-    The ``name`` is optional but, when supplied, is used to derive a
-    slug-based default for ``id_suggestion`` if none of the selected PIDs
-    share a systemd unit.
-    """
+    """Wizard: extract app fields from user-selected PIDs."""
     try:
         from monitor import app_discovery
 
@@ -534,25 +496,7 @@ def discover_extract():
 
 @app.route('/app/new_controlled_app', methods=['POST'])
 def new_controlled_app():
-    """Register a brand-new managed application (final wizard step).
-
-    Body: {
-        "name":         "<display name>",
-        "id":           "<unique id; suggested by the wizard>",
-        "priority":     "low" | "medium" | "high" | "critical"  (optional)
-        "commandline":  "<argv[0] of the main process>",
-        "bpf_name":     ["<comm>", ...],
-        "process_names": ["<exe basename>", ...]
-    }
-
-    On success the entry is appended to config.yaml's controlled_apps,
-    inserted into the AIAppPriority DB table, and the BPF match cache is
-    rebuilt so the new app is monitored without restarting the balancer.
-
-    The complementary endpoint, /app/purge_controlled_app, removes the
-    config + DB record entirely — used when the user wants to re-add an
-    app whose process_names overlap with an existing entry.
-    """
+    """Wizard final step: register a new managed application."""
     try:
         from config.config import b_config
 
@@ -708,18 +652,7 @@ def new_controlled_app():
 
 @app.route('/app/purge_controlled_app', methods=['POST'])
 def purge_controlled_app():
-    """Hard-delete an app from BOTH config.yaml and the DB.
-
-    Distinct from /app/remove_from_control, which only flips
-    ``controlled=False`` so the app can be re-enabled from the dropdown
-    without reconfiguration.  This endpoint is the explicit "wipe it
-    completely" path: removes the config entry, deletes the DB row, restores
-    the OOM score, and refreshes the BPF cache.  Used by the wizard when
-    the user wants to re-add an app whose process_names overlap with an
-    existing entry.
-
-    Body: { "id": "<existing app id>" }
-    """
+    """Hard-delete an app from both config.yaml and the DB."""
     try:
         from config.config import b_config
 

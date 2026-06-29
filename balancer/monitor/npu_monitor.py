@@ -6,6 +6,7 @@
 
 import os
 import logging as LOG
+import shlex
 import subprocess # nosec
 import enum
 
@@ -62,9 +63,11 @@ class CpuGen(enum.IntEnum):
         return ""
 
 def run_command(command, timeout=None):
+    if isinstance(command, str):
+        command = shlex.split(command)
     try:
         return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-                              check=True, shell=True, encoding='ascii', errors='ignore', cwd=None)
+                              check=True, shell=False, encoding='ascii', errors='ignore', cwd=None)
     except subprocess.TimeoutExpired as err:
         if not err.stdout:
             err.stdout = ''
@@ -256,7 +259,7 @@ def get_npu_processes(dev_file):  # pylint: disable=too-many-branches
     processes = []
 
     # Run lsof to get list of PIDs using /dev/accel/accel[N]
-    result = run_command(f'lsof {dev_file} 2>/dev/null')
+    result = run_command(['lsof', dev_file])
     if result.returncode != 0:
         return processes
 

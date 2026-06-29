@@ -11,23 +11,21 @@
 #define COMM_LEN 32
 #define MAX_FILE_LEN 64
 
-// 定义事件类型
 enum event_type {
     APP_START,
     APP_EXIT
 };
 
-// 定义事件结构
 struct event_t {
     u32 pid;
-    u32 type;  // 事件类型：APP_START 或 APP_EXIT
+    u32 type;  // APP_START or APP_EXIT
     char comm[COMM_LEN];
     char filename[MAX_FILE_LEN];
 };
 
 BPF_PERF_OUTPUT(events);
 
-// 跟踪execve系统调用（应用启动）
+// Trace execve syscall (app launch)
 TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     const char **argv = (const char **)args->argv;
     char fname[MAX_FILE_LEN] = {0};
@@ -53,7 +51,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     return 0;
 }
 
-// 跟踪进程退出（应用关闭）
+// Trace process exit
 TRACEPOINT_PROBE(sched, sched_process_exit) {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
@@ -65,7 +63,7 @@ TRACEPOINT_PROBE(sched, sched_process_exit) {
     event.pid = pid_tgid >> 32;
     event.type = APP_EXIT;
     bpf_probe_read_kernel_str(&event.comm, sizeof(event.comm), comm);
-    // 对于退出事件，filename设为空或保留进程名
+    // For exit events, reuse comm as filename
     bpf_probe_read_kernel_str(&event.filename, sizeof(event.filename), comm);
 
     events.perf_submit(args, &event, sizeof(event));
