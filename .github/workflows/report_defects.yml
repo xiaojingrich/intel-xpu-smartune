@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 env:
-  COV_HOME: "/home/jianfeng/cov-analysis-linux64-2025.3.0"
+  COV_USER_HOME: ${{ vars.COV_USER_HOME }}
+  COV_HOME: "${{ vars.COV_USER_HOME }}/cov-analysis-linux64-2025.3.0"
   COV_SERVER_URL: "https://coverityent.devtools.intel.com/prod3"
   COV_AUTH_KEY: ${{ secrets.COV_AUTH_KEY }}
 
@@ -17,10 +18,10 @@ jobs:
     runs-on: [self-hosted, linux]
 
     steps:
-      - name: Cleanup Workspace Permissions
-        run: |
-          echo "Fixing workspace permissions for self-hosted runner..."
-          sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
+      # - name: Cleanup Workspace Permissions
+      #   run: |
+      #     echo "Fixing workspace permissions for self-hosted runner..."
+      #     sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
 
       - name: Check out repository
         uses: actions/checkout@v4
@@ -40,20 +41,21 @@ jobs:
       - name: Create auth key file
         run: |
           echo "${COV_AUTH_KEY}" > cov_auth_key_file
-          chmod 700 cov_auth_key_file
+          chmod 600 cov_auth_key_file
 
       - name: Coverity Capture & Analyze (Python)
         run: |
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
           $COV_HOME/bin/coverity capture --dir ./cov-int-python
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-python
           $COV_HOME/bin/cov-commit-defects --dir ./cov-int-python --stream "Stream_1" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
 
       - name: Coverity Capture & Analyze (C)
         run: |
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+          chmod +x ./coverity_build/build_ebpf.sh
           $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
-          
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c | tee c_analysis_log.txt
-          
           $COV_HOME/bin/cov-commit-defects --dir ./cov-int-c --stream "Stream_2" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
 
       - name: Generate GitHub Step Summary
@@ -74,20 +76,21 @@ jobs:
       - name: Install Report Tool Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r /home/jianfeng/applications.analyzers.code.static.coverity-support/Scripts/Evidence/requirements.txt
+          pip install -r ${{ vars.COV_USER_HOME }}/applications.analyzers.code.static.coverity-support/Scripts/Evidence/requirements.txt
 
       - name: Generate SDL coverity report
         continue-on-error: true
         run: |
-          TOOL_DIR="/home/jianfeng/applications.analyzers.code.static.coverity-support/Scripts/Evidence"
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+          TOOL_DIR="${{ vars.COV_USER_HOME }}/applications.analyzers.code.static.coverity-support/Scripts/Evidence"
           python ${TOOL_DIR}/IPAS_SAST_Report_Tool.py \
-            ${TOOL_DIR}/covreport.yml \
+            $GITHUB_WORKSPACE/.github/static_check/covreport.yml \
             --output Intel_XPU_SmarTune.html \
             --auth-key-file cov_auth_key_file
 
       - name: Run Trivy Scan generate report
         run: |
-          trivy fs . --list-all-pkgs --format template --template "@/home/jianfeng/actions-runner/csv.tpl" --output ./trivy-report.csv
+          trivy fs . --list-all-pkgs --format template --template "@${{ vars.COV_USER_HOME }}/actions-runner/csv.tpl" --output ./trivy-report.csv
 
       - name: Upload Scan Results
         uses: actions/upload-artifact@v4
