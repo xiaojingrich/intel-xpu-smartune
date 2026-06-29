@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  COV_HOME: "/home/tingjiec/cov-analysis-linux64-2025.3.0"
+  COV_HOME: "/opt/coverity/analysis/"
   COV_SERVER_URL: "https://coverityent.devtools.intel.com/prod3"
   COV_AUTH_KEY: ${{ secrets.COV_AUTH_KEY }}
 
