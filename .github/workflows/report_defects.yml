@@ -77,6 +77,7 @@ jobs:
         with:
           repository: intel-innersource/applications.analyzers.code.static.coverity-support
           path: applications.analyzers.code.static.coverity-support
+          token: ${{ secrets.INNERSOURCE_TOKEN }}
 
       - name: Install Report Tool Dependencies
         run: |
