@@ -93,7 +93,7 @@ jobs:
 
       - name: Run Trivy Scan generate report
         run: |
-          trivy fs . --list-all-pkgs --format template --template "@/home/jianfeng/actions-runner/csv.tpl" --output ./trivy-report.csv
+          trivy fs . --list-all-pkgs --format template --template "@/home/tingjiec/actions-runner/csv.tpl" --output ./trivy-report.csv
 
       - name: Upload Scan Results
         uses: actions/upload-artifact@v4
