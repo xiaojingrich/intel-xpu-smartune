@@ -17,10 +17,10 @@ jobs:
     runs-on: [self-hosted, linux]
 
     steps:
-      - name: Cleanup Workspace Permissions
-        run: |
-          echo "Fixing workspace permissions for self-hosted runner..."
-          sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
+      # - name: Cleanup Workspace Permissions
+      #   run: |
+      #     echo "Fixing workspace permissions for self-hosted runner..."
+      #     sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
 
       - name: Check out repository
         uses: actions/checkout@v4
