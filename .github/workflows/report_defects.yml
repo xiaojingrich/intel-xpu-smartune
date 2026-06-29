@@ -84,7 +84,7 @@ jobs:
           unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
           TOOL_DIR="${{ vars.COV_USER_HOME }}/applications.analyzers.code.static.coverity-support/Scripts/Evidence"
           python ${TOOL_DIR}/IPAS_SAST_Report_Tool.py \
-            $GITHUB_WORKSPACE/.github/coverity/covreport.yml \
+            $GITHUB_WORKSPACE/.github/static_check/covreport.yml \
             --output Intel_XPU_SmarTune.html \
             --auth-key-file cov_auth_key_file
 
