@@ -80,6 +80,7 @@ jobs:
       - name: Generate SDL coverity report
         continue-on-error: true
         run: |
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
           TOOL_DIR="/home/tingjiec/applications.analyzers.code.static.coverity-support/Scripts/Evidence"
           python ${TOOL_DIR}/IPAS_SAST_Report_Tool.py \
             ${TOOL_DIR}/covreport.yml \
