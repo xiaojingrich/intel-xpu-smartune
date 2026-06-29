@@ -40,20 +40,30 @@ jobs:
       - name: Create auth key file
         run: |
           echo "${COV_AUTH_KEY}" > cov_auth_key_file
-          chmod 700 cov_auth_key_file
+          chmod 600 cov_auth_key_file
 
       - name: Coverity Capture & Analyze (Python)
+        env:
+          http_proxy: ""
+          https_proxy: ""
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
         run: |
           $COV_HOME/bin/coverity capture --dir ./cov-int-python
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-python
           $COV_HOME/bin/cov-commit-defects --dir ./cov-int-python --stream "Stream_1" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
 
       - name: Coverity Capture & Analyze (C)
+        env:
+          http_proxy: ""
+          https_proxy: ""
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
         run: |
           $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
-          
+
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c | tee c_analysis_log.txt
-          
+
           $COV_HOME/bin/cov-commit-defects --dir ./cov-int-c --stream "Stream_2" --url $COV_SERVER_URL --auth-key-file cov_auth_key_file
 
       - name: Generate GitHub Step Summary
