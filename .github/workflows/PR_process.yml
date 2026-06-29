@@ -127,8 +127,8 @@ jobs:
 
       - name: Coverity Capture & Analyze (C)
         run: |
+          chmod +x ./coverity_build/build_ebpf.sh
           $COV_HOME/bin/cov-build --dir ./cov-int-c ./coverity_build/build_ebpf.sh
-
           $COV_HOME/bin/coverity analyze --project-dir . --dir ./cov-int-c
 
       - name: Format Errors to Text
