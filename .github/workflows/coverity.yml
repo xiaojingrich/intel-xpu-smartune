@@ -73,7 +73,7 @@ jobs:
 
           echo "### Coverity report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 扫描类型 | 发现问题数 | 状态 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan Type | Issues Found | Status |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :---: | :---: |" >> $GITHUB_STEP_SUMMARY
 
           PY_STATUS=$([ "$PY_ISSUES" -eq "0" ] && echo "✅ Clean" || echo "⚠️ Action Required")
@@ -81,12 +81,12 @@ jobs:
 
           C_STATUS=$([ "$C_ISSUES" -eq "0" ] && echo "✅ Clean" || echo "⚠️ Action Required")
           echo "| C (cov-build) | $C_ISSUES | $C_STATUS |" >> $GITHUB_STEP_SUMMARY
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**总计发现问题:** $TOTAL" >> $GITHUB_STEP_SUMMARY
+          echo "**Total issues found:** $TOTAL" >> $GITHUB_STEP_SUMMARY
 
           if [ "$TOTAL" -gt "0" ]; then
-            echo "<details><summary>点击查看错误详情详情 (Top 10)</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Click to view details (Top 10)</summary>" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo '```text' >> $GITHUB_STEP_SUMMARY
             head -n 10 full_project_scan_results_python.txt >> $GITHUB_STEP_SUMMARY

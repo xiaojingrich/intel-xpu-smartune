@@ -3,8 +3,8 @@
 # Copyright (c) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# systemd 启动入口：由 balancer.service 调用，已经是 root 权限运行，
-# 所以脚本内不再使用 sudo，也不安装 trap（生命周期交给 systemd）。
+# Systemd entry point: called by balancer.service, already running as root.
+# No sudo usage or trap installation needed; lifecycle is managed by systemd.
 
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
