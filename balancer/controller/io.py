@@ -11,7 +11,6 @@ from config.config import b_config
 from utils.logger import logger
 from utils.app_utils import build_sudo_shell_redirect
 
-# Reserved
 class IOController:
     def __init__(self):
         self.config = b_config
@@ -263,7 +262,6 @@ class IOController:
                 for key in ["rbps", "wbps", "riops", "wiops"]:
                     if key in disk_limits:
                         limit_parts.append(f"{key}={disk_limits[key]}")
-                # logger.info(f"disk_limits: {disk_limits}, limit_parts: {limit_parts}")
                 limit_str = " ".join(limit_parts)
 
             if limit_str:  # skip if nothing to apply
@@ -386,13 +384,7 @@ if __name__ == "__main__":
     # Test setup
     cgroup_id = "vte-spawn-d689ffa6-5446-4dfb-99f3-c4e702c44ebb.scope"
 
-    # Test case 1: same limit for all disks
-    # io_ctl.set_write_io_throughput_throttle_app(cgroup_id, 60 * 1024 * 1024)  # write limit 60MB/s
-    # io_ctl.set_read_io_throughput_throttle_app(cgroup_id, 70 * 1024 * 1024)  # read limit 70MB/s
-    # io_ctl.set_write_iops_throttle_app(cgroup_id, 3200)  # write IOPS limit 3200
-    # io_ctl.set_read_iops_throttle_app(cgroup_id, 21000)  # read IOPS limit 21000
-
-    # Test case 2: compound limit config
+    # Test case: compound limit config
     limits = {
         "default": {
             "rbps": 30 * 1024 * 1024,
@@ -403,22 +395,13 @@ if __name__ == "__main__":
         "8:0": {"wbps": 10 * 1024 * 1024},  # sda write limit 10MB/s
         "nvme0n1": {"rbps": 33 * 1024 * 1024, "wbps": 27 * 1024 * 1024}  # nvme read 33MB/s, write 27MB/s
     }
-    # # io_ctl.set_disk_io_throttle(cgroup_id, limits)
     io_ctl.set_disk_io_throttle(
         cgroup_id,
         limits=limits,
         disk_filter=["nvme", "sda"],
     )
-    #
-    # # Test case 3: NVMe-only limits
-    # io_ctl.set_write_io_throughput_throttle_app(cgroup_id, 35 * 1024 * 1024, disk_filter="sda")
-    # io_ctl.set_read_io_throughput_throttle_app(cgroup_id, 55 * 1024 * 1024, disk_filter="nvme")
-    # io_ctl.set_write_iops_throttle_app(cgroup_id, 2300, disk_filter="sda")
-    # io_ctl.set_read_iops_throttle_app(cgroup_id, 22000, disk_filter="nvme")
 
-    # Set weight
     io_ctl.set_weight(cgroup_id, 300)
-    # Check current settings
     limits = io_ctl.get_current_io_limits(cgroup_id)
     if limits:
         print(

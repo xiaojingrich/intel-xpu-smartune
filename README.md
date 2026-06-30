@@ -2,7 +2,7 @@
 
 ## Overview
 
-Intel XPU SmarTune is a collection of platform tools and services designed to optimize and enhance the system operational efficiency of AI NAS, it comprises several components：SystemOvewview(monitor and systemPressure), App Resources, Processes, History, Balancer, About.
+Intel XPU SmarTune is a collection of platform tools and services designed to optimize and enhance the system operational efficiency of AI NAS, it comprises several components：SystemOverview(monitor and systemPressure), App Resources, Processes, History, Balancer, About.
 
 - Balancer [User Guide](https://github.com/intel/intel-xpu-smartune/tree/main/balancer#readme) is designed primarily for platform resource governance and application priority management.
 
@@ -125,7 +125,7 @@ intel-xpu-smartune/
     │   ├── gpu_monitor.py       #   Intel GPU monitoring (i915/Xe PMU, RAPL, fdinfo)
     │   ├── npu_monitor.py       #   Intel NPU monitoring via PMT telemetry and fdinfo
     │   ├── system_info.py       #   Static/dynamic hardware & software info collection
-    │   ├── metrics/             #   Per-subsystem metric collectors (cpu, gpu_perf, npu, history)
+    │   ├── metrics/             #   Per-subsystem metric collectors (cpu, gpu_info, gpu_perf, npu, history, utils)
     │   └── monitor_api.py       #   Flask Blueprint exposing /monitor/* REST endpoints
     ├── test/                    # Feature test scripts (BPF, PSI, disk I/O, notifications)
     ├── utils/                   # Shared utilities: logger, app_utils, http_utils
