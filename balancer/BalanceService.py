@@ -7,6 +7,7 @@ import os
 import hashlib
 import queue as _queue
 import signal
+import ssl
 from datetime import datetime
 from threading import Lock
 
@@ -1173,7 +1174,10 @@ def main():
         start_service()
         app._service_initialized = True
 
-    ssl_context = (CERT_FILE, KEY_FILE)
+    # Create secure SSL context with recommended settings
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(CERT_FILE, KEY_FILE)
+    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
         app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
     except KeyboardInterrupt:
