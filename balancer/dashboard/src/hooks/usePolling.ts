@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
 import { useEffect, useRef } from 'react'
 
 export function usePolling(callback: () => void | Promise<void>, intervalMs: number, enabled = true) {
