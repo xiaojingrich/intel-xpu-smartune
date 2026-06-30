@@ -1178,8 +1178,14 @@ def main():
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(CERT_FILE, KEY_FILE)
     ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    # Use environment variable for host binding, default to localhost for security
+    # Set BALANCER_HOST=0.0.0.0 to bind to all interfaces if needed
+    host = os.environ.get("BALANCER_HOST", "127.0.0.1")
+    port = int(os.environ.get("BALANCER_PORT", "9001"))
+
     try:
-        app.run(host="0.0.0.0", port=9001, debug=False, use_reloader=False, ssl_context=ssl_context)
+        app.run(host=host, port=port, debug=False, use_reloader=False, ssl_context=ssl_context)
     except KeyboardInterrupt:
         pass
     finally:

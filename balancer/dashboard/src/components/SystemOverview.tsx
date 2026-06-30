@@ -2726,7 +2726,7 @@ export default function SystemOverview({ active }: Props) {
 
   const cpuSnapshotMeta = staticInfo?.cpu?.model_name
     ? `${staticInfo.cpu.core_count?.logical ?? 0} cores | ${cpuFreqRangeMeta} | ${staticInfo.cpu.model_name}`
-    : dynamicInfo?.cpu?.per_core_usage?.length
+    : (dynamicInfo?.cpu?.per_core_usage?.length != null && dynamicInfo.cpu.per_core_usage.length > 0)
       ? `${dynamicInfo.cpu.per_core_usage.length} cores`
       : 'No data'
 
@@ -2749,10 +2749,10 @@ export default function SystemOverview({ active }: Props) {
       else if (!memTypes.length) parts.push('DDR N/A')
       return parts.join(' | ')
     }
-    return isNumber(dynamicInfo?.memory?.total_gb)
+    return (dynamicInfo?.memory?.total_gb != null && isNumber(dynamicInfo.memory.total_gb))
       ? `${dynamicInfo.memory.total_gb.toFixed(1)} GB total`
       : 'No data'
-  }, [staticInfo?.memory, dynamicInfo?.memory.total_gb])
+  }, [staticInfo?.memory, dynamicInfo?.memory?.total_gb])
 
   // Build per-NIC render data
   const networkNicCards = useMemo(() => {
