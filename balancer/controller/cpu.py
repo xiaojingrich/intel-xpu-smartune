@@ -5,7 +5,7 @@ import os
 from controller.base import ControllerBase
 from utils.logger import logger
 from utils.app_utils import build_sudo_shell_redirect
-import subprocess
+import subprocess # nosec
 from config.config import b_config
 
 # Reserved

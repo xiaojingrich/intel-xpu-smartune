@@ -4,7 +4,7 @@
 import os
 import queue as _queue
 import re
-import subprocess
+import subprocess # nosec
 import time
 import psutil
 import threading

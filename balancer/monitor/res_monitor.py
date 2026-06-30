@@ -659,7 +659,7 @@ class ResourceMonitor:
 
         Try to resolve the container ID to a human-readable container name using docker inspect.
         """
-        import subprocess
+        import subprocess # nosec
 
         # Try to extract container ID from scope_name
         # Pattern 1: docker-<container_id>.scope

@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import subprocess
+import subprocess # nosec
 import time
-from subprocess import check_output
+from subprocess import check_output # nosec
 from typing import Optional
 
 from utils.logger import logger

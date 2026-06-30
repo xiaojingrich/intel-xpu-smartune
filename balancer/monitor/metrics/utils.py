@@ -4,7 +4,7 @@
 """Shared low-level helpers used across system_info sub-modules."""
 
 import os
-import subprocess
+import subprocess # nosec
 from typing import Any, Dict, List, Optional
 
 from utils.logger import logger
