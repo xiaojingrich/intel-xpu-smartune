@@ -1530,9 +1530,11 @@ export default function HistoryDashboard({ active }: Props) {
     const { points, nicNames: nn, nicSpeeds: sp } = buildNetworkTrendPoints(dynamicItems)
     // Merge with static info NIC speeds as fallback (history data may lack speed_mbps)
     const merged = { ...sp }
-    if (staticInfo?.io?.network_speeds_mbps) {
+    if (staticInfo?.io?.network_speeds_mbps && typeof staticInfo.io.network_speeds_mbps === 'object') {
       for (const [name, speed] of Object.entries(staticInfo.io.network_speeds_mbps)) {
-        if (speed > 0 && !merged[name]) merged[name] = speed
+        if (typeof speed === 'number' && speed > 0 && !merged[name]) {
+          merged[name] = speed
+        }
       }
     }
     return { points: downsampleLTTB(points, MAX_CHART_POINTS, (p) => sumMetrics(p as unknown as Record<string, unknown>)), nicNames: nn, nicSpeeds: merged }
