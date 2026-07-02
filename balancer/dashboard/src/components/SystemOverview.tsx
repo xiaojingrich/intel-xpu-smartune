@@ -208,7 +208,7 @@ function formatPcieLink(
   return cur || max || 'N/A'
 }
 
-function summarizeFreqBounds(bounds?: Record<string, { min_mhz: number | null; max_mhz: number | null }>): string {
+function summarizeFreqBounds(bounds?: Record<string, { min_mhz?: number | null; max_mhz: number | null }>): string {
   const entries = Object.entries(bounds || {})
   if (!entries.length) return 'N/A'
   return entries
@@ -290,21 +290,24 @@ function getAdaptiveAxis(
 }
 
 function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: DynamicInfoData | null): GpuDeviceView[] {
-  const gpuUsageAvailable = Boolean(dynamicInfo?.gpu.gpu_usage.available)
-  const gpuUsageDevices: GpuUsageDevice[] = dynamicInfo?.gpu.gpu_usage.parsed?.devices || []
-  const dynamicVramEntries = Object.entries(dynamicInfo?.gpu.vram || {})
-  const staticVramEntries = Object.entries(staticInfo?.gpu.vram || {})
+  const dynamicGpu = dynamicInfo?.gpu
+  const staticGpu = staticInfo?.gpu
+  const gpuUsage = dynamicGpu?.gpu_usage
+  const gpuUsageAvailable = Boolean(gpuUsage?.available)
+  const gpuUsageDevices: GpuUsageDevice[] = gpuUsage?.parsed?.devices || []
+  const dynamicVramEntries = Object.entries(dynamicGpu?.vram || {})
+  const staticVramEntries = Object.entries(staticGpu?.vram || {})
   // Build BDF (short, without domain) -> lspci name lookup
   // e.g. "00:02.0" -> "00:02.0 VGA ... Intel Arc Graphics [8086:7d55]"
   const nameByBdf: Record<string, string> = {}
-  ;(staticInfo?.gpu.names || []).forEach((line) => {
+  ;(staticGpu?.names || []).forEach((line) => {
     const m = line.match(/^([0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])/i)
     if (m) nameByBdf[m[1].toLowerCase()] = line
   })
 
   // Build reverse map: pci_address -> cardKey (e.g. "0000:00:02.0" -> "card0")
   const pciToCardKey: Record<string, string> = {}
-  Object.entries(staticInfo?.gpu.pci_addresses || {}).forEach(([cardKey, pciAddr]) => {
+  Object.entries(staticGpu?.pci_addresses || {}).forEach(([cardKey, pciAddr]) => {
     pciToCardKey[pciAddr] = cardKey
   })
 
@@ -317,18 +320,18 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
       gpuUsageByCardKey[matched] = qdev
     } else {
       // fallback: use sorted card keys by position
-      const sortedKeys = Object.keys(staticInfo?.gpu.pci_addresses || {}).sort()
+      const sortedKeys = Object.keys(staticGpu?.pci_addresses || {}).sort()
       const fallbackKey = sortedKeys[idx]
       if (fallbackKey) gpuUsageByCardKey[fallbackKey] = qdev
     }
   })
 
   const cardKeySet = new Set<string>()
-  Object.keys(staticInfo?.gpu.vram || {}).forEach((k) => cardKeySet.add(k))
-  Object.keys(staticInfo?.gpu.freq_bounds_mhz || {}).forEach((k) => cardKeySet.add(k))
-  Object.keys(staticInfo?.gpu.pcie || {}).forEach((k) => cardKeySet.add(k))
-  Object.keys(staticInfo?.gpu.engines || {}).forEach((k) => cardKeySet.add(k))
-  Object.keys(staticInfo?.gpu.pci_addresses || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticGpu?.vram || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticGpu?.freq_bounds_mhz || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticGpu?.pcie || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticGpu?.engines || {}).forEach((k) => cardKeySet.add(k))
+  Object.keys(staticGpu?.pci_addresses || {}).forEach((k) => cardKeySet.add(k))
   gpuUsageDevices.forEach((_, idx) => { if (!staticInfo) cardKeySet.add(`card${idx}`) })
 
   const staticCardKeys = Array.from(cardKeySet).sort()
@@ -337,7 +340,7 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     dynamicVramEntries.length,
     staticVramEntries.length,
     staticCardKeys.length,
-    staticInfo?.gpu.count || 0,
+    staticGpu?.count || 0,
   )
 
   const devices: GpuDeviceView[] = []
@@ -349,18 +352,18 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
 
     const hasStaticCard = Boolean(staticCardKeys[index])
     const hasDynamicCard = Boolean(dynamicVramEntries[index]?.[0] || staticVramEntries[index]?.[0])
-    const withinStaticCount = Boolean((staticInfo?.gpu.count || 0) > index)
+    const withinStaticCount = Boolean((staticGpu?.count || 0) > index)
     const hasEvidence = Boolean(qdev || hasStaticCard || hasDynamicCard || withinStaticCount)
     if (!hasEvidence) continue
 
-    const vramDyn = dynamicInfo?.gpu.vram?.[cardKey] || dynamicVramEntries[index]?.[1]
-    const vramStatic = staticInfo?.gpu.vram?.[cardKey] || staticVramEntries[index]?.[1]
+    const vramDyn = dynamicGpu?.vram?.[cardKey] || dynamicVramEntries[index]?.[1]
+    const vramStatic = staticGpu?.vram?.[cardKey] || staticVramEntries[index]?.[1]
     const vramUsage = normalizePercent(vramDyn?.usage_percent ?? vramStatic?.usage_percent ?? null)
 
     // Determine iGPU vs dGPU. Authoritative source: Intel iGPU is always at
     // bus 00, device 02 (e.g. 0000:00:02.0). Fall back to qdev.dev_type when
     // the PCI address is unavailable.
-    const pciAddr = (staticInfo?.gpu.pci_addresses?.[cardKey] || qdev?.pci_dev || '').toLowerCase()
+    const pciAddr = (staticGpu?.pci_addresses?.[cardKey] || qdev?.pci_dev || '').toLowerCase()
     const isIntegratedByPci = /(^|:)00:02\./.test(pciAddr)
     const typeRaw = (qdev?.dev_type || '').toLowerCase()
     const isIntegratedByType = typeRaw.includes('integrated') || typeRaw.includes('igpu')
@@ -384,7 +387,7 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
     const gt1 = freqs.find((f) => f.name === 'gt1') || freqs[1]
 
     const engineSet = new Set<EngineKey>()
-    ;[...(qdev?.engines || []), ...((staticInfo?.gpu.engines?.[cardKey] || []) as string[])].forEach((name) => {
+    ;[...(qdev?.engines || []), ...((staticGpu?.engines?.[cardKey] || []) as string[])].forEach((name) => {
       const normalized = normalizeEngineName(name)
       if (normalized) engineSet.add(normalized)
     })
@@ -409,9 +412,9 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
 
     const id = qdev?.pci_dev || `${cardKey}-${index}`
     // Match lspci name by this card's BDF (strip domain prefix from full PCI address)
-    const cardPciAddr = staticInfo?.gpu.pci_addresses?.[cardKey]  // e.g. "0000:03:00.0"
+    const cardPciAddr = staticGpu?.pci_addresses?.[cardKey]  // e.g. "0000:03:00.0"
     const shortBdf = cardPciAddr ? cardPciAddr.replace(/^[0-9a-f]{4}:/i, '').toLowerCase() : null
-    const staticName = (shortBdf && nameByBdf[shortBdf]) || staticInfo?.gpu.names[index]
+    const staticName = (shortBdf && nameByBdf[shortBdf]) || staticGpu?.names?.[index]
     // Extract PCIe vendor:device ID e.g. "8086:7d55" from lspci name
     const pciIdMatch = staticName?.match(/\[([0-9a-f]{4}:[0-9a-f]{4})\]\s*(?:\(rev|$)/i)
     const pciId = pciIdMatch ? pciIdMatch[1] : null
@@ -427,31 +430,31 @@ function buildGpuDevices(staticInfo: StaticInfoData | null, dynamicInfo: Dynamic
       statusColor: color,
       name: staticName || qdev?.drv_name || cardKey,
       devType: qdev?.dev_type || 'unknown',
-      pci: qdev?.pci_dev || staticInfo?.gpu.pcie?.[cardKey]?.current_speed || 'N/A',
+      pci: qdev?.pci_dev || staticGpu?.pcie?.[cardKey]?.current_speed || 'N/A',
       driver: qdev?.drv_name || 'N/A',
       utilization,
       frequencies: { gt0, gt1 },
       freqBounds: {
-        min_mhz: staticInfo?.gpu.freq_bounds_mhz?.[cardKey]?.min_mhz ?? null,
-        max_mhz: staticInfo?.gpu.freq_bounds_mhz?.[cardKey]?.max_mhz ?? null,
+        min_mhz: staticGpu?.freq_bounds_mhz?.[cardKey]?.min_mhz ?? null,
+        max_mhz: staticGpu?.freq_bounds_mhz?.[cardKey]?.max_mhz ?? null,
       },
       gtFreqBounds: {
-        gt0: staticInfo?.gpu.gt_freq_bounds_mhz?.[cardKey]?.gt0,
-        gt1: staticInfo?.gpu.gt_freq_bounds_mhz?.[cardKey]?.gt1,
+        gt0: staticGpu?.gt_freq_bounds_mhz?.[cardKey]?.gt0,
+        gt1: staticGpu?.gt_freq_bounds_mhz?.[cardKey]?.gt1,
       },
       powerGpu: qdev?.power_w?.gpu ?? null,
       powerPkg: qdev?.power_w?.pkg ?? qdev?.power_w?.card ?? null,
       vramUsage,
-      euCount: staticInfo?.gpu.eu_count?.[cardKey] ?? null,
+      euCount: staticGpu?.eu_count?.[cardKey] ?? null,
       pciId,
       pcieLink: {
-        current_speed: staticInfo?.gpu.pcie?.[cardKey]?.current_speed ?? null,
-        current_width: staticInfo?.gpu.pcie?.[cardKey]?.current_width ?? null,
-        max_speed: staticInfo?.gpu.pcie?.[cardKey]?.max_speed ?? null,
-        max_width: staticInfo?.gpu.pcie?.[cardKey]?.max_width ?? null,
+        current_speed: staticGpu?.pcie?.[cardKey]?.current_speed ?? null,
+        current_width: staticGpu?.pcie?.[cardKey]?.current_width ?? null,
+        max_speed: staticGpu?.pcie?.[cardKey]?.max_speed ?? null,
+        max_width: staticGpu?.pcie?.[cardKey]?.max_width ?? null,
       },
       engines,
-      engineInstances: ((staticInfo?.gpu.engines?.[cardKey] || []) as string[]).slice(),
+      engineInstances: ((staticGpu?.engines?.[cardKey] || []) as string[]).slice(),
       engineUtil,
     })
   }
@@ -1499,7 +1502,6 @@ function TrendPanel({
   primaryChartHeight = 80,
   secondaryChartGap = 10,
   detailTopMargin = 12,
-  hideTotalBar,
   primaryChartLabel,
 }: {
   title: string
@@ -1586,7 +1588,7 @@ function TrendPanel({
             )}
             {hasSplitBars && (
               <div style={{ marginTop: 4, display: 'grid', gap: 8 }}>
-                {splitBars.map((bar) => {
+                {(splitBars ?? []).map((bar) => {
                   const splitGauge = isNumber(bar.value) ? Math.max(0, Math.min(bar.value, 100)) : 0
                   return (
                     <div key={`${title}-${bar.key}`}>
@@ -1720,7 +1722,7 @@ function CoreCell({
   usage: number | null
   freq: number | null
   temp: number | null
-  type: 'P' | 'E' | 'Core'
+  type: 'P' | 'E' | 'LPE' | 'Core'
   trend: Array<number | null>
   freqTrend: Array<number | null>
   trendWindow: '1m' | '5m'
@@ -2481,7 +2483,7 @@ export default function SystemOverview({ active }: Props) {
       })
 
       // Per-NIC trend data for each valid physical NIC
-      const validNics = staticInfo?.io.valid_nics || []
+      const validNics = staticInfo?.io?.valid_nics || []
       const allNetworkUtils: number[] = []
       for (const nic of validNics) {
         const nicName = nic.name
@@ -2587,7 +2589,7 @@ export default function SystemOverview({ active }: Props) {
     return gpuDevices.filter((d) => d.id === gpuFilter)
   }, [gpuDevices, gpuFilter])
 
-  const validNics = useMemo(() => staticInfo?.io.valid_nics || [], [staticInfo?.io.valid_nics])
+  const validNics = useMemo(() => staticInfo?.io?.valid_nics || [], [staticInfo?.io?.valid_nics])
 
   // Per-NIC series helper: generates utilization and bandwidth series for a given NIC name.
   // When nicName is null, uses the legacy fallback keys (util:network:rx, bw:network:rx_mbps).
@@ -2713,16 +2715,17 @@ export default function SystemOverview({ active }: Props) {
   )
 
   const cpuFreqRangeMeta = useMemo(() => {
-    const pf = staticInfo?.cpu.freq_mhz.p_core_freq_mhz
-    const ef = staticInfo?.cpu.freq_mhz.e_core_freq_mhz
-    const lf = staticInfo?.cpu.freq_mhz.lpe_core_freq_mhz
-    const overall = formatFreqRange(staticInfo?.cpu.freq_mhz.min_mhz, staticInfo?.cpu.freq_mhz.max_mhz)
+    const freqMhz = staticInfo?.cpu?.freq_mhz
+    const pf = freqMhz?.p_core_freq_mhz
+    const ef = freqMhz?.e_core_freq_mhz
+    const lf = freqMhz?.lpe_core_freq_mhz
+    const overall = formatFreqRange(freqMhz?.min_mhz, freqMhz?.max_mhz)
     const parts: string[] = []
     if (pf) parts.push(`P: ${formatFreqRange(pf.min_mhz, pf.max_mhz)}`)
     if (ef) parts.push(`E: ${formatFreqRange(ef.min_mhz, ef.max_mhz)}`)
     if (lf) parts.push(`LPE: ${formatFreqRange(lf.min_mhz, lf.max_mhz)}`)
     return parts.length ? parts.join(' / ') : overall
-  }, [staticInfo?.cpu.freq_mhz])
+  }, [staticInfo?.cpu?.freq_mhz])
 
   const cpuSnapshotMeta = staticInfo?.cpu?.model_name
     ? `${staticInfo.cpu.core_count?.logical ?? 0} cores | ${cpuFreqRangeMeta} | ${staticInfo.cpu.model_name}`
@@ -2833,8 +2836,8 @@ export default function SystemOverview({ active }: Props) {
     : null
   const maxDiskUtil = busiestDisk ? normalizePercent(busiestDisk[1]?.utilization) : null
 
-  const cpuUsagePct = normalizePercent(dynamicInfo?.cpu.usage_total ?? null)
-  const memoryUsagePct = normalizePercent(dynamicInfo?.memory.usage_percent ?? null)
+  const cpuUsagePct = normalizePercent(dynamicInfo?.cpu?.usage_total ?? null)
+  const memoryUsagePct = normalizePercent(dynamicInfo?.memory?.usage_percent ?? null)
 
   // System pressure: use the weighted composite score from SystemPressureMonitor when available
   const pressureScore = isNumber(dynamicInfo?.pressure?.score) ? (dynamicInfo.pressure.score as number) * 100 : null
@@ -2861,9 +2864,9 @@ export default function SystemOverview({ active }: Props) {
   const networkPressurePct = dynamicInfo?.pressure?.network_busy_pct ?? null
   const networkBusyLevelLabel = dynamicInfo?.pressure?.network_busy_level ?? 'NO DATA'
 
-  const npuParsed = useMemo(() => parseNpuRaw(dynamicInfo?.npu.npu_smi.raw), [dynamicInfo?.npu.npu_smi.raw])
+  const npuParsed = useMemo(() => parseNpuRaw(dynamicInfo?.npu?.npu_smi?.raw), [dynamicInfo?.npu?.npu_smi?.raw])
   const npuUtilValue = useMemo(() => {
-    if (!dynamicInfo?.npu.npu_smi.available) return null
+    if (!dynamicInfo?.npu?.npu_smi?.available) return null
     return typeof npuParsed?.utilization_percent === 'number' ? normalizePercent(npuParsed.utilization_percent as number) : null
   }, [dynamicInfo, npuParsed])
   const npuValue = npuUtilValue
@@ -2876,14 +2879,14 @@ export default function SystemOverview({ active }: Props) {
   const cpuTrendStatusColor = cpuTrendStatus ? (cpuBusy ? COLORS.red : COLORS.green) : COLORS.textMuted
   const memoryTrendStatusColor = memoryTrendStatus ? (memoryBusy ? COLORS.red : COLORS.green) : COLORS.textMuted
 
-  const coreGroups = useMemo(() => {
-    const usage = dynamicInfo?.cpu.per_core_usage || []
-    const freqs = dynamicInfo?.cpu.per_core_freq_mhz || []
+  const coreGroups = useMemo<Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }>>(() => {
+    const usage = dynamicInfo?.cpu?.per_core_usage || []
+    const freqs = dynamicInfo?.cpu?.per_core_freq_mhz || []
     if (!usage.length) return [] as Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }>
 
-    const p = dynamicInfo?.cpu.p_core_indices || []
-    const e = dynamicInfo?.cpu.e_core_indices || []
-    const lpe = dynamicInfo?.cpu.lpe_core_indices || []
+    const p = dynamicInfo?.cpu?.p_core_indices || []
+    const e = dynamicInfo?.cpu?.e_core_indices || []
+    const lpe = dynamicInfo?.cpu?.lpe_core_indices || []
 
     if (p.length || e.length || lpe.length) {
       const groups: Array<{ label: string; type: 'P' | 'E' | 'LPE' | 'Core'; indices: number[] }> = []
@@ -2903,49 +2906,49 @@ export default function SystemOverview({ active }: Props) {
   }, [dynamicInfo])
 
   const coreFreqAxisMax = useMemo(() => {
-    const staticMax = staticInfo?.cpu.freq_mhz.max_mhz
+    const staticMax = staticInfo?.cpu?.freq_mhz?.max_mhz
     const dynamicMax = Math.max(
       0,
-      ...(dynamicInfo?.cpu.per_core_freq_mhz || []).map((value) => (isNumber(value) ? value : 0))
+      ...(dynamicInfo?.cpu?.per_core_freq_mhz || []).map((value) => (isNumber(value) ? value : 0))
     )
     const candidate = isNumber(staticMax) ? staticMax : dynamicMax
     if (!isNumber(candidate) || candidate <= 0) return 1000
     return Math.max(1000, Math.ceil(candidate / 100) * 100)
-  }, [staticInfo?.cpu.freq_mhz.max_mhz, dynamicInfo?.cpu.per_core_freq_mhz])
+  }, [staticInfo?.cpu?.freq_mhz?.max_mhz, dynamicInfo?.cpu?.per_core_freq_mhz])
 
   const cpuStaticFreqText = cpuFreqRangeMeta
 
   const npuStaticFreqText = useMemo(
-    () => summarizeFreqBounds(staticInfo?.npu.freq_bounds_mhz),
-    [staticInfo?.npu.freq_bounds_mhz]
+    () => summarizeFreqBounds(staticInfo?.npu?.freq_bounds_mhz),
+    [staticInfo?.npu?.freq_bounds_mhz]
   )
 
   const networkPeakText = useMemo(
-    () => formatNetworkSpeed(staticInfo?.io.network_peak_mbps),
-    [staticInfo?.io.network_peak_mbps]
+    () => formatNetworkSpeed(staticInfo?.io?.network_peak_mbps),
+    [staticInfo?.io?.network_peak_mbps]
   )
 
   const networkSpeedMapText = useMemo(
-    () => summarizeNetworkSpeeds(staticInfo?.io.network_speeds_mbps),
-    [staticInfo?.io.network_speeds_mbps]
+    () => summarizeNetworkSpeeds(staticInfo?.io?.network_speeds_mbps),
+    [staticInfo?.io?.network_speeds_mbps]
   )
 
   const diskStaticTotalText = useMemo(
-    () => (isNumber(staticInfo?.disk.total_size_gb) ? `${staticInfo?.disk.total_size_gb.toFixed(2)} GB` : 'N/A'),
-    [staticInfo?.disk.total_size_gb]
+    () => (isNumber(staticInfo?.disk?.total_size_gb) ? `${staticInfo.disk.total_size_gb.toFixed(2)} GB` : 'N/A'),
+    [staticInfo?.disk?.total_size_gb]
   )
 
   const diskStaticDevicesText = useMemo(
-    () => `${staticInfo?.disk.device_count ?? 0} device(s) | ${summarizeDiskSizes(staticInfo?.disk.devices)}`,
-    [staticInfo?.disk.device_count, staticInfo?.disk.devices]
+    () => `${staticInfo?.disk?.device_count ?? 0} device(s) | ${summarizeDiskSizes(staticInfo?.disk?.devices)}`,
+    [staticInfo?.disk?.device_count, staticInfo?.disk?.devices]
   )
 
   // Map disk name → size_gb for use in per-disk TrendPanels
   const diskSizeLookup = useMemo(() => {
     const map: Record<string, number | null> = {}
-    staticInfo?.disk.devices?.forEach((d) => { map[d.name] = d.size_gb })
+    staticInfo?.disk?.devices?.forEach((d) => { map[d.name] = d.size_gb })
     return map
-  }, [staticInfo?.disk.devices])
+  }, [staticInfo?.disk?.devices])
 
   const diskSnapshotMeta = busiestDisk?.[0]
     ? `${busiestDisk[0]} | Total ${diskStaticTotalText} | ${staticInfo?.disk?.device_count ?? '?'} device(s)`
@@ -3089,21 +3092,21 @@ export default function SystemOverview({ active }: Props) {
             series={getSeries('util:cpu')}
             subtitle={cpuSnapshotMeta}
             details={[
-              { label: 'P-Core Usage', value: formatPercent(dynamicInfo?.cpu.p_core_usage), source: 'dynamic' },
-              ...(isNumber(dynamicInfo?.cpu.e_core_usage)
-                ? [{ label: 'E-Core Usage', value: formatPercent(dynamicInfo?.cpu.e_core_usage), source: 'dynamic' as DataSourceKind }]
+              { label: 'P-Core Usage', value: formatPercent(dynamicInfo?.cpu?.p_core_usage), source: 'dynamic' },
+              ...(isNumber(dynamicInfo?.cpu?.e_core_usage)
+                ? [{ label: 'E-Core Usage', value: formatPercent(dynamicInfo?.cpu?.e_core_usage), source: 'dynamic' as DataSourceKind }]
                 : []),
-              ...(isNumber(dynamicInfo?.cpu.lpe_core_usage)
-                ? [{ label: 'LPE-Core Usage', value: formatPercent(dynamicInfo?.cpu.lpe_core_usage), source: 'dynamic' as DataSourceKind }]
+              ...(isNumber(dynamicInfo?.cpu?.lpe_core_usage)
+                ? [{ label: 'LPE-Core Usage', value: formatPercent(dynamicInfo?.cpu?.lpe_core_usage), source: 'dynamic' as DataSourceKind }]
                 : []),
-              { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu.p_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
-              ...(isNumber(dynamicInfo?.cpu.e_core_freq_mhz)
-                ? [{ label: 'E-Core Freq', value: formatMetric(dynamicInfo?.cpu.e_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
+              { label: 'P-Core Freq', value: formatMetric(dynamicInfo?.cpu?.p_core_freq_mhz, 'MHz', 0), source: 'dynamic' },
+              ...(isNumber(dynamicInfo?.cpu?.e_core_freq_mhz)
+                ? [{ label: 'E-Core Freq', value: formatMetric(dynamicInfo?.cpu?.e_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
                 : []),
-              ...(isNumber(dynamicInfo?.cpu.lpe_core_freq_mhz)
-                ? [{ label: 'LPE-Core Freq', value: formatMetric(dynamicInfo?.cpu.lpe_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
+              ...(isNumber(dynamicInfo?.cpu?.lpe_core_freq_mhz)
+                ? [{ label: 'LPE-Core Freq', value: formatMetric(dynamicInfo?.cpu?.lpe_core_freq_mhz, 'MHz', 0), source: 'dynamic' as DataSourceKind }]
                 : []),
-              { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu.temperature_c, '°C', 1), source: 'dynamic' },
+              { label: 'Temperature', value: formatMetric(dynamicInfo?.cpu?.temperature_c, '°C', 1), source: 'dynamic' },
             ]}
             sparkMode={sparkMode}
             trendWindow={trendWindow}
@@ -3121,11 +3124,11 @@ export default function SystemOverview({ active }: Props) {
             series={getSeries('util:memory')}
             subtitle={memorySnapshotMeta}
             details={[
-              { label: 'Available', value: formatMetric(dynamicInfo?.memory.available_gb, 'GB', 1), source: 'dynamic' },
+              { label: 'Available', value: formatMetric(dynamicInfo?.memory?.available_gb, 'GB', 1), source: 'dynamic' },
               {
                 label: 'Usage',
                 value: (() => {
-                  const totalGb = dynamicInfo?.memory.total_gb ?? staticInfo?.memory.total_gb
+                  const totalGb = dynamicInfo?.memory?.total_gb ?? staticInfo?.memory?.total_gb
                   const usedGb = isNumber(totalGb) && isNumber(memoryTrendValue)
                     ? totalGb * memoryTrendValue / 100
                     : null
@@ -3135,7 +3138,7 @@ export default function SystemOverview({ active }: Props) {
                 })(),
                 source: 'dynamic',
               },
-              { label: 'Swap', value: dynamicInfo?.memory.swap_total_gb != null ? `${formatMetric(dynamicInfo.memory.swap_used_gb, 'GB', 1)} / ${dynamicInfo.memory.swap_total_gb.toFixed(1)} GB (${formatPercent(dynamicInfo.memory.swap_usage_percent)})` : 'N/A', source: 'dynamic' },
+              { label: 'Swap', value: dynamicInfo?.memory?.swap_total_gb != null ? `${formatMetric(dynamicInfo.memory.swap_used_gb, 'GB', 1)} / ${dynamicInfo.memory.swap_total_gb.toFixed(1)} GB (${formatPercent(dynamicInfo.memory.swap_usage_percent)})` : 'N/A', source: 'dynamic' },
             ]}
             sparkMode={sparkMode}
             trendWindow={trendWindow}
@@ -3304,8 +3307,8 @@ export default function SystemOverview({ active }: Props) {
             accent={PERF_COLORS.npu}
             value={npuValue}
             unit="%"
-            status={dynamicInfo ? (dynamicInfo.npu.npu_smi.available ? 'OK' : 'Offline') : undefined}
-            statusColor={dynamicInfo?.npu.npu_smi.available ? COLORS.green : COLORS.textMuted}
+            status={dynamicInfo ? (dynamicInfo.npu?.npu_smi?.available ? 'OK' : 'Offline') : undefined}
+            statusColor={dynamicInfo?.npu?.npu_smi?.available ? COLORS.green : COLORS.textMuted}
             series={getSeries('npu:util')}
             subtitle={npuSnapshotMeta}
             details={[
@@ -3424,15 +3427,15 @@ export default function SystemOverview({ active }: Props) {
                     <Text style={{ color: COLORS.text, fontWeight: 600 }}>{group.label}</Text>
                     {(() => {
                       const freqBounds = group.type === 'P'
-                        ? staticInfo?.cpu.freq_mhz.p_core_freq_mhz
+                        ? staticInfo?.cpu?.freq_mhz?.p_core_freq_mhz
                         : group.type === 'E'
-                          ? staticInfo?.cpu.freq_mhz.e_core_freq_mhz
+                          ? staticInfo?.cpu?.freq_mhz?.e_core_freq_mhz
                           : group.type === 'LPE'
-                            ? staticInfo?.cpu.freq_mhz.lpe_core_freq_mhz
+                            ? staticInfo?.cpu?.freq_mhz?.lpe_core_freq_mhz
                             : null
                       const txt = freqBounds
                         ? formatFreqRange(freqBounds.min_mhz, freqBounds.max_mhz)
-                        : formatFreqRange(staticInfo?.cpu.freq_mhz.min_mhz, staticInfo?.cpu.freq_mhz.max_mhz)
+                        : formatFreqRange(staticInfo?.cpu?.freq_mhz?.min_mhz, staticInfo?.cpu?.freq_mhz?.max_mhz)
                       return txt ? <Text style={{ color: COLORS.textMuted, fontSize: 10 }}>{txt}</Text> : null
                     })()}
                   </Space>
@@ -3441,9 +3444,9 @@ export default function SystemOverview({ active }: Props) {
                 {(() => {
                   const groupCores = group.indices.map((coreIndex) => ({
                     coreIndex,
-                    usage: dynamicInfo?.cpu.per_core_usage?.[coreIndex] ?? null,
-                    freq: dynamicInfo?.cpu.per_core_freq_mhz?.[coreIndex] ?? null,
-                    temp: dynamicInfo?.cpu.per_core_temperature_c?.[coreIndex] ?? null,
+                    usage: dynamicInfo?.cpu?.per_core_usage?.[coreIndex] ?? null,
+                    freq: dynamicInfo?.cpu?.per_core_freq_mhz?.[coreIndex] ?? null,
+                    temp: dynamicInfo?.cpu?.per_core_temperature_c?.[coreIndex] ?? null,
                     trend: getSeries(`cpu:core:${coreIndex}`),
                     freqTrend: getSeries(`cpu:core_freq:${coreIndex}`),
                   }))
@@ -3505,14 +3508,14 @@ export default function SystemOverview({ active }: Props) {
         <Col span={24}>
           <NpuDetailCard
             npuParsed={npuParsed}
-            npuName={staticInfo?.npu.names?.[0] || 'Intel NPU'}
+            npuName={staticInfo?.npu?.names?.[0] || 'Intel NPU'}
             npuFreqMinMhz={(() => {
-              const bounds = Object.values(staticInfo?.npu.freq_bounds_mhz || {})
+              const bounds = Object.values(staticInfo?.npu?.freq_bounds_mhz || {})
               const val = bounds[0]?.min_mhz
               return typeof val === 'number' ? val : null
             })()}
             npuFreqMaxMhz={(() => {
-              const bounds = Object.values(staticInfo?.npu.freq_bounds_mhz || {})
+              const bounds = Object.values(staticInfo?.npu?.freq_bounds_mhz || {})
               const val = bounds[0]?.max_mhz
               return typeof val === 'number' ? val : null
             })()}
