@@ -656,8 +656,10 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
       const seriesLabel = getGpuLabel(device, index)
       const integrated = isIntegratedGpu(device)
 
-      if (!seriesMap.has(id)) {
-        seriesMap.set(id, { id, label: seriesLabel, isIntegrated: integrated, points: [] })
+      let series = seriesMap.get(id)
+      if (!series) {
+        series = { id, label: seriesLabel, isIntegrated: integrated, points: [] }
+        seriesMap.set(id, series)
       }
 
       // iGPU uses system memory; dGPU uses dedicated VRAM (keyed by card index in vram map)
@@ -688,7 +690,7 @@ function buildGpuTrendSeries(items: HistorySnapshotItem[]): GpuTrendSeries[] {
         gt1Rc6: toNumber((device.freqs || []).find((f) => f.name === 'gt1')?.rc6_pct ?? null),
       }
 
-      seriesMap.get(id)?.points.push(point)
+      series.points.push(point)
     })
   }
 
