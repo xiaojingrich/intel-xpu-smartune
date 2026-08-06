@@ -15,6 +15,8 @@ from flask import Blueprint, request
 
 from utils.http_utils import RetCode, construct_response
 from utils.logger import logger
+from utils.ui_lease import get_ui_lease_manager
+from utils.web_ui import DASHBOARD_ENDPOINT
 
 # The dashboard queries /smartune/capabilities to learn whether the server it is
 # connected to provides the full balancer feature set or is a monitor-only
@@ -124,6 +126,14 @@ def _enforce_api_token():
     """
     if request.method == "OPTIONS":
         return None
+    # The dashboard static handler is served to unauthenticated browsers so the
+    # login page (and its JS/CSS bundle) can load before a token exists. This is
+    # keyed on the resolved endpoint, NOT the URL: the API routes are also mounted
+    # at the root, so exempting by path prefix would let requests like
+    # `GET /dynamic_info` bypass the token gate. request.endpoint is already set
+    # here (URL matching runs before before_request).
+    if request.endpoint == DASHBOARD_ENDPOINT:
+        return None
     if request.path in _AUTH_EXEMPT_PATHS:
         return None
 
@@ -197,3 +207,41 @@ def get_capabilities():
         data={"capabilities": 1 if _balancer_available else 0},
         retmsg="Successfully retrieved capabilities",
     )
+
+
+def _lease_session_id():
+    """Extract a non-empty session_id from the JSON body, or None."""
+    data = request.get_json(silent=True) or {}
+    sid = data.get("session_id")
+    return sid if isinstance(sid, str) and sid else None
+
+
+@smartune_bp.route('/ui/heartbeat', methods=['POST'])
+def ui_heartbeat():
+    """Renew an open-UI lease. Each dashboard tab posts this every few seconds so
+    the server knows a UI is still open; the lease lapses shortly after the posts
+    stop. Only acted on when the UI-lease watchdog is armed (packaged monitor);
+    otherwise it is recorded harmlessly. See utils.ui_lease."""
+    sid = _lease_session_id()
+    if not sid:
+        return construct_response(
+            data={"ok": False}, retcode=RetCode.ARGUMENT_ERROR,
+            retmsg="session_id is required",
+        )
+    get_ui_lease_manager().heartbeat(sid)
+    return construct_response(data={"ok": True})
+
+
+@smartune_bp.route('/ui/release', methods=['POST'])
+def ui_release():
+    """Release an open-UI lease. Sent best-effort on pagehide (keepalive fetch)
+    so closing a tab winds the lease down promptly instead of waiting for the
+    heartbeat to lapse."""
+    sid = _lease_session_id()
+    if not sid:
+        return construct_response(
+            data={"ok": False}, retcode=RetCode.ARGUMENT_ERROR,
+            retmsg="session_id is required",
+        )
+    get_ui_lease_manager().release(sid)
+    return construct_response(data={"ok": True})

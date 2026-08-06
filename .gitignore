@@ -19,3 +19,6 @@ my_database.db-wal
 logs/
 
 config/runtime_state.json
+
+# deb packaging build output
+/build/

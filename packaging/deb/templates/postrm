@@ -1,0 +1,33 @@
+#!/bin/bash
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+set -e
+
+INSTALL_DIR="/opt/intel/smartune"
+
+case "$1" in
+    remove)
+        # The venv is a derived install artifact (built from the bundled wheels),
+        # not user data — once the package files are gone it is dead weight, so
+        # remove it on plain `remove`. User state (TLS keys + api_token, logs, the
+        # database) is preserved until `purge` so a reinstall restores it.
+        rm -rf "$INSTALL_DIR/venv" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+        ;;
+    purge)
+        # Remove everything generated at runtime that dpkg does not track: the
+        # venv (if `remove` didn't run first), logs, TLS keys + token, database.
+        # Leaves nothing behind on purge.
+        rm -rf "$INSTALL_DIR/venv" \
+               "$INSTALL_DIR/logs" \
+               "$INSTALL_DIR/key" \
+               "$INSTALL_DIR"/my_database.db* 2>/dev/null || true
+        rmdir "$INSTALL_DIR" 2>/dev/null || true
+        rmdir /opt/intel 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Installed but NOT enabled: the monitor is launched on demand by the desktop
+# icon (start_gui.sh -> pkexec systemctl start), never at boot.
+
+[Unit]
+Description=Intel XPU SmarTune Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/intel/smartune
+ExecStart=/opt/intel/smartune/run_monitor.sh
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=append:/opt/intel/smartune/logs/smartune-monitor.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

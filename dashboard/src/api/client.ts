@@ -60,6 +60,21 @@ export function clearToken(): void {
   localStorage.removeItem(TOKEN_STORAGE_KEY)
 }
 
+// A one-shot bootstrap token may be passed in the URL *hash* by the desktop
+// launcher (start_gui.sh opens https://localhost:9001/#token=...). The hash is
+// used rather than a query string so the token is never sent to the server and
+// so never lands in its access log. This reads it, strips it from the URL (so
+// it does not linger in the address bar or browser history), and returns it.
+export function consumeUrlToken(): string | null {
+  const hash = window.location.hash
+  const match = /[#&]token=([^&]+)/.exec(hash)
+  if (!match) return null
+  const token = decodeURIComponent(match[1])
+  const cleaned = hash.replace(/([#&])token=[^&]*/, '$1').replace(/[#&]+$/, '')
+  history.replaceState(null, '', window.location.pathname + window.location.search + cleaned)
+  return token
+}
+
 // Registered by App so a 401 anywhere can bounce the user back to the login gate.
 let onUnauthorized: (() => void) | null = null
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
@@ -141,6 +156,37 @@ export async function login(token: string): Promise<boolean> {
 export function appEventsUrl(): string {
   const token = getToken()
   return token ? `/api/app/events?token=${encodeURIComponent(token)}` : '/api/app/events'
+}
+
+// --- UI lease (auto-shutdown of the packaged monitor) --------------------
+// Each open dashboard tab holds a "lease": it heartbeats periodically and, on
+// close, releases. The packaged monitor stops itself once the last lease is
+// gone (see utils/ui_lease.py). These calls are harmless against a server
+// without the watchdog armed (dev / balancer): the endpoints just record and
+// return ok. Failures are swallowed — a missed heartbeat only shortens a lease.
+export function sendHeartbeat(sessionId: string): void {
+  client.post('/smartune/ui/heartbeat', { session_id: sessionId }).catch(() => {})
+}
+
+// Sent on pagehide, when the page may already be unloading. keepalive lets the
+// request outlive the document, and (unlike navigator.sendBeacon) still carries
+// the X-Auth-Token header the auth gate requires. fetch talks to the same
+// origin, so the '/api' prefix is used directly (not axios' baseURL).
+export function sendUiRelease(sessionId: string): void {
+  const token = getToken()
+  try {
+    void fetch('/api/smartune/ui/release', {
+      method: 'POST',
+      keepalive: true,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { [AUTH_HEADER]: token } : {}),
+      },
+      body: JSON.stringify({ session_id: sessionId }),
+    }).catch(() => {})
+  } catch {
+    // Ignore — release is best-effort; the heartbeat lease lapse is the backstop.
+  }
 }
 
 async function get<T>(url: string): Promise<T> {
