@@ -496,6 +496,7 @@ class ResourceMonitor:
             # In default mode this is the process with the highest CPU%; in io mode it is the
             # process with the highest IO delta.  We track this so the UI shows "stress" instead
             # of an unrelated process like "vte-2.91" that happens to share the same cgroup.
+            'dominant_pid': None,
             'dominant_name': '',
             'dominant_cmdline': '',
             'dominant_metric': 0.0,  # highest individual contribution seen so far
@@ -599,6 +600,7 @@ class ResourceMonitor:
                     metric = cpu_percent if mode == 'default' else (io_read_delta + io_write_delta)
                     if metric > cgroup_data[cgroup_path]['dominant_metric'] and proc_name:
                         cgroup_data[cgroup_path]['dominant_metric'] = metric
+                        cgroup_data[cgroup_path]['dominant_pid'] = pid
                         cgroup_data[cgroup_path]['dominant_name'] = proc_name
                         cgroup_data[cgroup_path]['dominant_cmdline'] = proc_cmdline
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -671,6 +673,7 @@ class ResourceMonitor:
                     # already deterministic because primary was chosen as min(cg_list).
                     if d['dominant_metric'] > cgroup_data[primary]['dominant_metric']:
                         cgroup_data[primary]['dominant_metric'] = d['dominant_metric']
+                        cgroup_data[primary]['dominant_pid'] = d['dominant_pid']
                         cgroup_data[primary]['dominant_name'] = d['dominant_name']
                         cgroup_data[primary]['dominant_cmdline'] = d['dominant_cmdline']
                     # Attach extra cgroup paths so callers can apply limits to all of them
@@ -744,6 +747,7 @@ class ResourceMonitor:
                     'io_per_disk': self._per_disk_rates(data['io_per_device'], io_window),
                     'names': list(data['names']),
                     'cmdlines': list(data['cmdlines']),
+                    'dominant_pid': data['dominant_pid'],
                     'dominant_name': dominant_name,
                     'dominant_cmdline': dominant_cmdline,
                 })
@@ -1152,6 +1156,29 @@ class ResourceMonitor:
                         'name': dominant_name,
                     }
 
+            # A transient scope (for example tmux-spawn-<uuid>.scope) is the
+            # cgroup limit target, not the workload's identity.  Keep it as the
+            # cgroup_id downstream, but show the command-line-derived dominant
+            # process when it is available so Auto Control and Take Control agree.
+            dominant_name = process_info.get('dominant_name', '')
+            dominant_cmdline = (process_info.get('dominant_cmdline') or '').strip()
+            if dominant_name and dominant_cmdline:
+                try:
+                    cmd_tokens = shlex.split(dominant_cmdline)
+                except ValueError:
+                    cmd_tokens = dominant_cmdline.split()
+                resolved = derived_process_identity({
+                    'name': dominant_name,
+                    'exe': process_info.get('exe') or '',
+                    'cmdline': cmd_tokens,
+                }).strip()
+                if resolved:
+                    return {
+                        'type': 'process',
+                        'id': resolved,
+                        'name': resolved,
+                    }
+
             return {
                 'type': 'cgroup',
                 'id': scope_name,
@@ -1184,23 +1211,25 @@ class ResourceMonitor:
         processes = self._get_top_processes(n=1)
         logger.debug(f"Top processes: {processes}")
 
-        # Return empty list if top process doesn't meet minimum resource thresholds
+        # Return empty list if top process doesn't meet minimum resource thresholds.
+        # `mem_rss` is in GB (see _get_top_processes), so compare against total memory in GB.
         # Since the minimum thresholds is 30% for uncontrolled apps, larger for controlled apps,
         # we use 25% here to avoid false negatives.
+        mem_total_gb = psutil.virtual_memory().total / (1024 ** 3)
         if processes and (processes[0]['cpu_avg'] < 25  # if CPU usage < 25% per core
-                          and processes[0]['mem_rss'] < psutil.virtual_memory().total * 0.25):  # 25% of total memory
+                  and processes[0]['mem_rss'] < mem_total_gb * 0.25):  # 25% of total memory (GB)
             logger.info(f"Top process - {next(iter(processes[0]['names']), 'unknown')} corresponding "
                         f"app does not meet minimum resource thresholds")
             reach_threshold = False
 
         for process in processes:
-            process_name = next(iter(process['names']), "unknown")
-            process_cmdline = next(iter(process['cmdlines']), "unknown")
+            process_name = process.get('dominant_name') or next(iter(process['names']), "unknown")
+            process_cmdline = process.get('dominant_cmdline') or next(iter(process['cmdlines']), "unknown")
 
             app_info = self.try_match_app(process)
             results.append({
                 'process': {
-                    'pid': next(iter(process['pids']), None),  # Use the first PID from 'pids'
+                    'pid': process.get('dominant_pid') or next(iter(process['pids']), None),
                     'name': process_name,
                     'cmdline': process_cmdline,
                     'score': round(process['score'], 3),
@@ -1209,6 +1238,10 @@ class ResourceMonitor:
                     'io_read_rate': process['io_read_rate']
                 },
                 'app': app_info,
+                # Preserve the sampled cgroup identity separately from the app's
+                # display/process identity. Auto-limit exclusions and cgroup writes
+                # must continue to address this scope after Take Control.
+                'cgroup_id': os.path.basename(process.get('cgroup') or ''),
                 # Full PID list for the cgroup (bash already filtered upstream).
                 # The balancer snapshots these so the reaper can detect when the
                 # limited app has closed and restore its (now-stale) limit.
@@ -1250,7 +1283,7 @@ class ResourceMonitor:
             app_info = self.try_match_app(process)
             results.append({
                 'process': {
-                    'pid': next(iter(process['pids']), None),  # Use the first PID from 'pids'
+                    'pid': process.get('dominant_pid') or next(iter(process['pids']), None),
                     'name': process_name,
                     'cmdline': process_cmdline,
                     'score': round(process['score'], 3),
